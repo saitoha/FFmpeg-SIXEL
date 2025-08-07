@@ -30,17 +30,19 @@
 #include <zlib.h>
 #endif
 
-#include "libavutil/imgutils.h"
 #include "libavutil/log.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 #include "avcodec.h"
 #include "bytestream.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "encode.h"
 #include "lzw.h"
-#include "put_bits.h"
 #include "rle.h"
 #include "tiff.h"
+#include "tiff_common.h"
+#include "version.h"
 
 #define TIFF_MAX_ENTRY 32
 
@@ -205,8 +207,8 @@ static void pack_yuv(TiffEncoderContext *s, const AVFrame *p,
 {
     int i, j, k;
     int w       = (s->width - 1) / s->subsampling[0] + 1;
-    uint8_t *pu = &p->data[1][lnum / s->subsampling[1] * p->linesize[1]];
-    uint8_t *pv = &p->data[2][lnum / s->subsampling[1] * p->linesize[2]];
+    const uint8_t *pu = &p->data[1][lnum / s->subsampling[1] * p->linesize[1]];
+    const uint8_t *pv = &p->data[2][lnum / s->subsampling[1] * p->linesize[2]];
     if (s->width % s->subsampling[0] || s->height % s->subsampling[1]) {
         for (i = 0; i < w; i++) {
             for (j = 0; j < s->subsampling[1]; j++)
@@ -265,6 +267,9 @@ static int encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     s->subsampling[0] = 1;
     s->subsampling[1] = 1;
 
+    if (!desc)
+        return AVERROR(EINVAL);
+
     avctx->bits_per_coded_sample =
     s->bpp          = av_get_bits_per_pixel(desc);
     s->bpp_tab_size = desc->nb_components;
@@ -311,7 +316,7 @@ static int encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     }
 
     for (i = 0; i < s->bpp_tab_size; i++)
-        bpp_tab[i] = desc->comp[i].depth_minus1 + 1;
+        bpp_tab[i] = desc->comp[i].depth;
 
     if (s->compr == TIFF_DEFLATE       ||
         s->compr == TIFF_ADOBE_DEFLATE ||
@@ -329,9 +334,9 @@ static int encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     bytes_per_row = (((s->width - 1) / s->subsampling[0] + 1) * s->bpp *
                      s->subsampling[0] * s->subsampling[1] + 7) >> 3;
     packet_size = avctx->height * bytes_per_row * 2 +
-                  avctx->height * 4 + FF_MIN_BUFFER_SIZE;
+                  avctx->height * 4 + FF_INPUT_BUFFER_MIN_SIZE;
 
-    if ((ret = ff_alloc_packet2(avctx, pkt, packet_size)) < 0)
+    if ((ret = ff_alloc_packet(avctx, pkt, packet_size)) < 0)
         return ret;
     ptr          = pkt->data;
     s->buf_start = pkt->data;
@@ -418,7 +423,7 @@ static int encode_frame(AVCodecContext *avctx, AVPacket *pkt,
             if (s->compr == TIFF_LZW) {
                 ff_lzw_encode_init(s->lzws, ptr,
                                    s->buf_size - (*s->buf - s->buf_start),
-                                   12, FF_LZW_TIFF, put_bits);
+                                   12, FF_LZW_TIFF, 0);
             }
             s->strip_offsets[i / s->rps] = ptr - pkt->data;
         }
@@ -437,7 +442,7 @@ static int encode_frame(AVCodecContext *avctx, AVPacket *pkt,
         ptr                     += ret;
         if (s->compr == TIFF_LZW &&
             (i == s->height - 1 || i % s->rps == s->rps - 1)) {
-            ret = ff_lzw_encode_flush(s->lzws, flush_put_bits);
+            ret = ff_lzw_encode_flush(s->lzws);
             s->strip_sizes[(i / s->rps)] += ret;
             ptr                          += ret;
         }
@@ -475,7 +480,7 @@ static int encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     ADD_ENTRY(s,  TIFF_YRES,         TIFF_RATIONAL, 1,      res);
     ADD_ENTRY1(s, TIFF_RES_UNIT,     TIFF_SHORT,    2);
 
-    if (!(avctx->flags & CODEC_FLAG_BITEXACT))
+    if (!(avctx->flags & AV_CODEC_FLAG_BITEXACT))
         ADD_ENTRY(s, TIFF_SOFTWARE_NAME, TIFF_STRING,
                   strlen(LIBAVCODEC_IDENT) + 1, LIBAVCODEC_IDENT);
 
@@ -511,7 +516,6 @@ static int encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     bytestream_put_le32(&ptr, 0);
 
     pkt->size   = ptr - pkt->data;
-    pkt->flags |= AV_PKT_FLAG_KEY;
     *got_packet = 1;
 
 fail:
@@ -522,12 +526,14 @@ static av_cold int encode_init(AVCodecContext *avctx)
 {
     TiffEncoderContext *s = avctx->priv_data;
 
-    avctx->coded_frame = av_frame_alloc();
-    if (!avctx->coded_frame)
-        return AVERROR(ENOMEM);
+#if !CONFIG_ZLIB
+    if (s->compr == TIFF_DEFLATE) {
+        av_log(avctx, AV_LOG_ERROR,
+               "Deflate compression needs zlib compiled in\n");
+        return AVERROR(ENOSYS);
+    }
+#endif
 
-    avctx->coded_frame->pict_type = AV_PICTURE_TYPE_I;
-    avctx->coded_frame->key_frame = 1;
     s->avctx = avctx;
 
     return 0;
@@ -537,7 +543,6 @@ static av_cold int encode_close(AVCodecContext *avctx)
 {
     TiffEncoderContext *s = avctx->priv_data;
 
-    av_frame_free(&avctx->coded_frame);
     av_freep(&s->strip_sizes);
     av_freep(&s->strip_offsets);
     av_freep(&s->yuv_line);
@@ -549,13 +554,11 @@ static av_cold int encode_close(AVCodecContext *avctx)
 #define VE AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
 static const AVOption options[] = {
     {"dpi", "set the image resolution (in dpi)", OFFSET(dpi), AV_OPT_TYPE_INT, {.i64 = 72}, 1, 0x10000, AV_OPT_FLAG_VIDEO_PARAM|AV_OPT_FLAG_ENCODING_PARAM},
-    { "compression_algo", NULL, OFFSET(compr), AV_OPT_TYPE_INT,   { .i64 = TIFF_PACKBITS }, TIFF_RAW, TIFF_DEFLATE, VE, "compression_algo" },
-    { "packbits",         NULL, 0,             AV_OPT_TYPE_CONST, { .i64 = TIFF_PACKBITS }, 0,        0,            VE, "compression_algo" },
-    { "raw",              NULL, 0,             AV_OPT_TYPE_CONST, { .i64 = TIFF_RAW      }, 0,        0,            VE, "compression_algo" },
-    { "lzw",              NULL, 0,             AV_OPT_TYPE_CONST, { .i64 = TIFF_LZW      }, 0,        0,            VE, "compression_algo" },
-#if CONFIG_ZLIB
-    { "deflate",          NULL, 0,             AV_OPT_TYPE_CONST, { .i64 = TIFF_DEFLATE  }, 0,        0,            VE, "compression_algo" },
-#endif
+    { "compression_algo", NULL, OFFSET(compr), AV_OPT_TYPE_INT,   { .i64 = TIFF_PACKBITS }, TIFF_RAW, TIFF_DEFLATE, VE, .unit = "compression_algo" },
+    { "packbits",         NULL, 0,             AV_OPT_TYPE_CONST, { .i64 = TIFF_PACKBITS }, 0,        0,            VE, .unit = "compression_algo" },
+    { "raw",              NULL, 0,             AV_OPT_TYPE_CONST, { .i64 = TIFF_RAW      }, 0,        0,            VE, .unit = "compression_algo" },
+    { "lzw",              NULL, 0,             AV_OPT_TYPE_CONST, { .i64 = TIFF_LZW      }, 0,        0,            VE, .unit = "compression_algo" },
+    { "deflate",          NULL, 0,             AV_OPT_TYPE_CONST, { .i64 = TIFF_DEFLATE  }, 0,        0,            VE, .unit = "compression_algo" },
     { NULL },
 };
 
@@ -566,24 +569,24 @@ static const AVClass tiffenc_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-AVCodec ff_tiff_encoder = {
-    .name           = "tiff",
-    .long_name      = NULL_IF_CONFIG_SMALL("TIFF image"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_TIFF,
+const FFCodec ff_tiff_encoder = {
+    .p.name         = "tiff",
+    CODEC_LONG_NAME("TIFF image"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_TIFF,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_FRAME_THREADS |
+                      AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
     .priv_data_size = sizeof(TiffEncoderContext),
     .init           = encode_init,
     .close          = encode_close,
-    .capabilities   = CODEC_CAP_FRAME_THREADS | CODEC_CAP_INTRA_ONLY,
-    .encode2        = encode_frame,
-    .pix_fmts       = (const enum AVPixelFormat[]) {
+    FF_CODEC_ENCODE_CB(encode_frame),
+    CODEC_PIXFMTS(
         AV_PIX_FMT_RGB24, AV_PIX_FMT_RGB48LE, AV_PIX_FMT_PAL8,
         AV_PIX_FMT_RGBA, AV_PIX_FMT_RGBA64LE,
         AV_PIX_FMT_GRAY8, AV_PIX_FMT_GRAY8A, AV_PIX_FMT_GRAY16LE, AV_PIX_FMT_YA16LE,
         AV_PIX_FMT_MONOBLACK, AV_PIX_FMT_MONOWHITE,
         AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV422P, AV_PIX_FMT_YUV440P, AV_PIX_FMT_YUV444P,
-        AV_PIX_FMT_YUV410P, AV_PIX_FMT_YUV411P,
-        AV_PIX_FMT_NONE
-    },
-    .priv_class     = &tiffenc_class,
+        AV_PIX_FMT_YUV410P, AV_PIX_FMT_YUV411P),
+    .color_ranges   = AVCOL_RANGE_MPEG,
+    .p.priv_class   = &tiffenc_class,
 };

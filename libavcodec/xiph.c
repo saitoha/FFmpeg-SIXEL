@@ -18,6 +18,8 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <limits.h>
+#include "libavutil/error.h"
 #include "libavutil/intreadwrite.h"
 #include "xiph.h"
 
@@ -35,7 +37,7 @@ int avpriv_split_xiph_headers(const uint8_t *extradata, int extradata_size,
             header_start[i] = extradata;
             extradata += header_len[i];
             if (overall_len > extradata_size - header_len[i])
-                return -1;
+                return AVERROR_INVALIDDATA;
             overall_len += header_len[i];
         }
     } else if (extradata_size >= 3 && extradata_size < INT_MAX - 0x1ff && extradata[0] == 2) {
@@ -50,7 +52,7 @@ int avpriv_split_xiph_headers(const uint8_t *extradata, int extradata_size,
             header_len[i] += *extradata;
             overall_len   += *extradata;
             if (overall_len > extradata_size)
-                return -1;
+                return AVERROR_INVALIDDATA;
         }
         header_len[2] = extradata_size - overall_len;
         header_start[0] = extradata;

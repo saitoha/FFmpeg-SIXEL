@@ -19,11 +19,15 @@
  */
 
 #include "config.h"
+#include <stdio.h>
+#include <string.h>
 #if HAVE_UNISTD_H
 #include <unistd.h>             /* getopt */
 #endif
 
+#include "libavutil/error.h"
 #include "libavutil/eval.h"
+#include "libavutil/log.h"
 #include "libavutil/mem.h"
 
 #if !HAVE_GETOPT
@@ -37,7 +41,7 @@
 
 static void usage(void)
 {
-    printf("Simple expression evalutor, please *don't* turn me to a feature-complete language interpreter\n");
+    printf("Simple expression evaluator, please *don't* turn me to a feature-complete language interpreter\n");
     printf("usage: ffeval [OPTIONS]\n");
     printf("\n"
            "Options:\n"

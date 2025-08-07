@@ -25,6 +25,7 @@
  */
 
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 #include "subtitles.h"
 #include "libavutil/intreadwrite.h"
@@ -34,7 +35,7 @@ typedef struct {
     FFDemuxSubtitlesQueue q;
 } STLContext;
 
-static int stl_probe(AVProbeData *p)
+static int stl_probe(const AVProbeData *p)
 {
     char c;
     const unsigned char *ptr = p->buf;
@@ -77,8 +78,8 @@ static int stl_read_header(AVFormatContext *s)
     if (!st)
         return AVERROR(ENOMEM);
     avpriv_set_pts_info(st, 64, 1, 100);
-    st->codec->codec_type = AVMEDIA_TYPE_SUBTITLE;
-    st->codec->codec_id   = AV_CODEC_ID_STL;
+    st->codecpar->codec_type = AVMEDIA_TYPE_SUBTITLE;
+    st->codecpar->codec_id   = AV_CODEC_ID_STL;
 
     while (!avio_feof(s->pb)) {
         char line[4096];
@@ -104,38 +105,19 @@ static int stl_read_header(AVFormatContext *s)
             sub->duration = duration;
         }
     }
-    ff_subtitles_queue_finalize(&stl->q);
-    return 0;
-}
-static int stl_read_packet(AVFormatContext *s, AVPacket *pkt)
-{
-    STLContext *stl = s->priv_data;
-    return ff_subtitles_queue_read_packet(&stl->q, pkt);
-}
-
-static int stl_read_seek(AVFormatContext *s, int stream_index,
-                             int64_t min_ts, int64_t ts, int64_t max_ts, int flags)
-{
-    STLContext *stl = s->priv_data;
-    return ff_subtitles_queue_seek(&stl->q, s, stream_index,
-                                   min_ts, ts, max_ts, flags);
-}
-
-static int stl_read_close(AVFormatContext *s)
-{
-    STLContext *stl = s->priv_data;
-    ff_subtitles_queue_clean(&stl->q);
+    ff_subtitles_queue_finalize(s, &stl->q);
     return 0;
 }
 
-AVInputFormat ff_stl_demuxer = {
-    .name           = "stl",
-    .long_name      = NULL_IF_CONFIG_SMALL("Spruce subtitle format"),
+const FFInputFormat ff_stl_demuxer = {
+    .p.name         = "stl",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Spruce subtitle format"),
+    .p.extensions   = "stl",
     .priv_data_size = sizeof(STLContext),
+    .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
     .read_probe     = stl_probe,
     .read_header    = stl_read_header,
-    .read_packet    = stl_read_packet,
-    .read_seek2     = stl_read_seek,
-    .read_close     = stl_read_close,
-    .extensions     = "stl",
+    .read_packet    = ff_subtitles_read_packet,
+    .read_seek2     = ff_subtitles_read_seek,
+    .read_close     = ff_subtitles_read_close,
 };

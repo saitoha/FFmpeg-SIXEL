@@ -26,101 +26,58 @@
  * AC-3 encoder float/fixed template
  */
 
+#include "config_components.h"
+
 #include <stdint.h>
 
 #include "libavutil/attributes.h"
-#include "libavutil/internal.h"
+#include "libavutil/avassert.h"
+#include "libavutil/mem_internal.h"
 
 #include "audiodsp.h"
-#include "internal.h"
 #include "ac3enc.h"
 #include "eac3enc.h"
 
-/* prototypes for static functions in ac3enc_fixed.c and ac3enc_float.c */
-
-static void scale_coefficients(AC3EncodeContext *s);
-
-static int normalize_samples(AC3EncodeContext *s);
-
-static void clip_coefficients(AudioDSPContext *adsp, CoefType *coef,
-                              unsigned int len);
-
-static CoefType calc_cpl_coord(CoefSumType energy_ch, CoefSumType energy_cpl);
-
-static void sum_square_butterfly(AC3EncodeContext *s, CoefSumType sum[4],
-                                 const CoefType *coef0, const CoefType *coef1,
-                                 int len);
-
-int AC3_NAME(allocate_sample_buffers)(AC3EncodeContext *s)
-{
-    int ch;
-
-    FF_ALLOC_OR_GOTO(s->avctx, s->windowed_samples, AC3_WINDOW_SIZE *
-                     sizeof(*s->windowed_samples), alloc_fail);
-    FF_ALLOC_ARRAY_OR_GOTO(s->avctx, s->planar_samples, s->channels, sizeof(*s->planar_samples),
-                     alloc_fail);
-    for (ch = 0; ch < s->channels; ch++) {
-        FF_ALLOCZ_OR_GOTO(s->avctx, s->planar_samples[ch],
-                          (AC3_FRAME_SIZE+AC3_BLOCK_SIZE) * sizeof(**s->planar_samples),
-                          alloc_fail);
-    }
-
-    return 0;
-alloc_fail:
-    return AVERROR(ENOMEM);
-}
-
-
-/*
- * Copy input samples.
- * Channels are reordered from FFmpeg's default order to AC-3 order.
- */
-static void copy_input_samples(AC3EncodeContext *s, SampleType **samples)
-{
-    int ch;
-
-    /* copy and remap input samples */
-    for (ch = 0; ch < s->channels; ch++) {
-        /* copy last 256 samples of previous frame to the start of the current frame */
-        memcpy(&s->planar_samples[ch][0], &s->planar_samples[ch][AC3_BLOCK_SIZE * s->num_blocks],
-               AC3_BLOCK_SIZE * sizeof(s->planar_samples[0][0]));
-
-        /* copy new samples for current frame */
-        memcpy(&s->planar_samples[ch][AC3_BLOCK_SIZE],
-               samples[s->channel_map[ch]],
-               AC3_BLOCK_SIZE * s->num_blocks * sizeof(s->planar_samples[0][0]));
-    }
-}
-
+#if AC3ENC_FLOAT
+#define RENAME(element) element ## _float
+#else
+#define RENAME(element) element ## _fixed
+#endif
 
 /*
  * Apply the MDCT to input samples to generate frequency coefficients.
  * This applies the KBD window and normalizes the input to reduce precision
  * loss due to fixed-point calculations.
  */
-static void apply_mdct(AC3EncodeContext *s)
+static void apply_mdct(AC3EncodeContext *s, uint8_t * const *samples)
 {
-    int blk, ch;
+    av_assert1(s->num_blocks > 0);
 
-    for (ch = 0; ch < s->channels; ch++) {
-        for (blk = 0; blk < s->num_blocks; blk++) {
+    for (int ch = 0; ch < s->channels; ch++) {
+        const SampleType *input_samples0 = (const SampleType*)s->planar_samples[ch];
+        /* Reorder channels from native order to AC-3 order. */
+        const SampleType *input_samples1 = (const SampleType*)samples[s->channel_map[ch]];
+        int blk = 0;
+
+        do {
             AC3Block *block = &s->blocks[blk];
-            const SampleType *input_samples = &s->planar_samples[ch][blk * AC3_BLOCK_SIZE];
+            SampleType *windowed_samples = s->RENAME(windowed_samples);
 
-#if CONFIG_AC3ENC_FLOAT
-            s->fdsp->vector_fmul(s->windowed_samples, input_samples,
-                                s->mdct_window, AC3_WINDOW_SIZE);
-#else
-            s->ac3dsp.apply_window_int16(s->windowed_samples, input_samples,
-                                         s->mdct_window, AC3_WINDOW_SIZE);
-#endif
+            s->fdsp->vector_fmul(windowed_samples, input_samples0,
+                                 s->RENAME(mdct_window), AC3_BLOCK_SIZE);
+            s->fdsp->vector_fmul_reverse(windowed_samples + AC3_BLOCK_SIZE,
+                                         input_samples1,
+                                         s->RENAME(mdct_window), AC3_BLOCK_SIZE);
 
-            if (s->fixed_point)
-                block->coeff_shift[ch+1] = normalize_samples(s);
+            s->tx_fn(s->tx, block->mdct_coef[ch+1],
+                     windowed_samples, sizeof(*windowed_samples));
+            input_samples0  = input_samples1;
+            input_samples1 += AC3_BLOCK_SIZE;
+        } while (++blk < s->num_blocks);
 
-            s->mdct.mdct_calcw(&s->mdct, block->mdct_coef[ch+1],
-                               s->windowed_samples);
-        }
+        /* Store last 256 samples of current frame */
+        memcpy(s->planar_samples[ch], input_samples0,
+               AC3_BLOCK_SIZE * sizeof(*input_samples0));
     }
 }
 
@@ -130,9 +87,9 @@ static void apply_mdct(AC3EncodeContext *s)
  */
 static void apply_channel_coupling(AC3EncodeContext *s)
 {
-    LOCAL_ALIGNED_16(CoefType, cpl_coords,      [AC3_MAX_BLOCKS], [AC3_MAX_CHANNELS][16]);
-#if CONFIG_AC3ENC_FLOAT
-    LOCAL_ALIGNED_16(int32_t, fixed_cpl_coords, [AC3_MAX_BLOCKS], [AC3_MAX_CHANNELS][16]);
+    LOCAL_ALIGNED_32(CoefType, cpl_coords,      [AC3_MAX_BLOCKS], [AC3_MAX_CHANNELS][16]);
+#if AC3ENC_FLOAT
+    LOCAL_ALIGNED_32(int32_t, fixed_cpl_coords, [AC3_MAX_BLOCKS], [AC3_MAX_CHANNELS][16]);
 #else
     int32_t (*fixed_cpl_coords)[AC3_MAX_CHANNELS][16] = cpl_coords;
 #endif
@@ -141,7 +98,7 @@ static void apply_channel_coupling(AC3EncodeContext *s)
     int cpl_start, num_cpl_coefs;
 
     memset(cpl_coords,       0, AC3_MAX_BLOCKS * sizeof(*cpl_coords));
-#if CONFIG_AC3ENC_FLOAT
+#if AC3ENC_FLOAT
     memset(fixed_cpl_coords, 0, AC3_MAX_BLOCKS * sizeof(*cpl_coords));
 #endif
 
@@ -243,6 +200,8 @@ static void apply_channel_coupling(AC3EncodeContext *s)
         }
     }
 
+    av_assert1(s->fbw_channels > 0);
+
     /* calculate final coupling coordinates, taking into account reusing of
        coordinates in successive blocks */
     for (bnd = 0; bnd < s->num_cpl_bands; bnd++) {
@@ -282,7 +241,7 @@ static void apply_channel_coupling(AC3EncodeContext *s)
         if (!block->cpl_in_use)
             continue;
 
-#if CONFIG_AC3ENC_FLOAT
+#if AC3ENC_FLOAT
         s->ac3dsp.float_to_fixed24(fixed_cpl_coords[blk][1],
                                    cpl_coords[blk][1],
                                    s->fbw_channels * 16);
@@ -328,7 +287,7 @@ static void apply_channel_coupling(AC3EncodeContext *s)
         }
     }
 
-    if (CONFIG_EAC3_ENCODER && s->eac3)
+    if (AC3ENC_FLOAT && CONFIG_EAC3_ENCODER && s->eac3)
         ff_eac3_set_cpl_states(s);
 }
 
@@ -388,30 +347,9 @@ static void compute_rematrixing_strategy(AC3EncodeContext *s)
 }
 
 
-int AC3_NAME(encode_frame)(AVCodecContext *avctx, AVPacket *avpkt,
-                           const AVFrame *frame, int *got_packet_ptr)
+static void encode_frame(AC3EncodeContext *s, uint8_t * const *samples)
 {
-    AC3EncodeContext *s = avctx->priv_data;
-    int ret;
-
-    if (s->options.allow_per_frame_metadata) {
-        ret = ff_ac3_validate_metadata(s);
-        if (ret)
-            return ret;
-    }
-
-    if (s->bit_alloc.sr_code == 1 || s->eac3)
-        ff_ac3_adjust_frame_size(s);
-
-    copy_input_samples(s, (SampleType **)frame->extended_data);
-
-    apply_mdct(s);
-
-    if (s->fixed_point)
-        scale_coefficients(s);
-
-    clip_coefficients(&s->adsp, s->blocks[0].mdct_coef[1],
-                      AC3_MAX_COEFS * s->num_blocks * s->channels);
+    apply_mdct(s, samples);
 
     s->cpl_on = s->cpl_enabled;
     ff_ac3_compute_coupling_strategy(s);
@@ -421,30 +359,7 @@ int AC3_NAME(encode_frame)(AVCodecContext *avctx, AVPacket *avpkt,
 
     compute_rematrixing_strategy(s);
 
-    if (!s->fixed_point)
-        scale_coefficients(s);
-
-    ff_ac3_apply_rematrixing(s);
-
-    ff_ac3_process_exponents(s);
-
-    ret = ff_ac3_compute_bit_allocation(s);
-    if (ret) {
-        av_log(avctx, AV_LOG_ERROR, "Bit allocation failed. Try increasing the bitrate.\n");
-        return ret;
-    }
-
-    ff_ac3_group_exponents(s);
-
-    ff_ac3_quantize_mantissas(s);
-
-    if ((ret = ff_alloc_packet2(avctx, avpkt, s->frame_size)) < 0)
-        return ret;
-    ff_ac3_output_frame(s, avpkt->data);
-
-    if (frame->pts != AV_NOPTS_VALUE)
-        avpkt->pts = frame->pts - ff_samples_to_time_base(avctx, avctx->initial_padding);
-
-    *got_packet_ptr = 1;
-    return 0;
+#if AC3ENC_FLOAT
+    scale_coefficients(s);
+#endif
 }

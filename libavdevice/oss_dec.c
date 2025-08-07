@@ -23,25 +23,19 @@
 
 #include <stdint.h>
 
-#if HAVE_SOUNDCARD_H
-#include <soundcard.h>
-#else
-#include <sys/soundcard.h>
-#endif
-
 #if HAVE_UNISTD_H
 #include <unistd.h>
 #endif
 #include <fcntl.h>
 #include <sys/ioctl.h>
+#include <sys/soundcard.h>
 
 #include "libavutil/internal.h"
 #include "libavutil/opt.h"
 #include "libavutil/time.h"
 
-#include "libavcodec/avcodec.h"
-
 #include "avdevice.h"
+#include "libavformat/demux.h"
 #include "libavformat/internal.h"
 
 #include "oss.h"
@@ -57,16 +51,16 @@ static int audio_read_header(AVFormatContext *s1)
         return AVERROR(ENOMEM);
     }
 
-    ret = ff_oss_audio_open(s1, 0, s1->filename);
+    ret = ff_oss_audio_open(s1, 0, s1->url);
     if (ret < 0) {
         return AVERROR(EIO);
     }
 
     /* take real parameters */
-    st->codec->codec_type = AVMEDIA_TYPE_AUDIO;
-    st->codec->codec_id = s->codec_id;
-    st->codec->sample_rate = s->sample_rate;
-    st->codec->channels = s->channels;
+    st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
+    st->codecpar->codec_id = s->codec_id;
+    st->codecpar->sample_rate = s->sample_rate;
+    st->codecpar->ch_layout.nb_channels = s->channels;
 
     avpriv_set_pts_info(st, 64, 1, 1000000);  /* 64 bits pts in us */
     return 0;
@@ -84,7 +78,7 @@ static int audio_read_packet(AVFormatContext *s1, AVPacket *pkt)
 
     ret = read(s->fd, pkt->data, pkt->size);
     if (ret <= 0){
-        av_free_packet(pkt);
+        av_packet_unref(pkt);
         pkt->size = 0;
         if (ret<0)  return AVERROR(errno);
         else        return AVERROR_EOF;
@@ -98,7 +92,7 @@ static int audio_read_packet(AVFormatContext *s1, AVPacket *pkt)
         bdelay += abufi.bytes;
     }
     /* subtract time represented by the number of bytes in the audio fifo */
-    cur_time -= (bdelay * 1000000LL) / (s->sample_rate * s->channels);
+    cur_time -= (bdelay * 1000000LL) / (s->sample_rate * s->sample_size * s->channels);
 
     /* convert to wanted units */
     pkt->pts = cur_time;
@@ -130,20 +124,20 @@ static const AVOption options[] = {
 };
 
 static const AVClass oss_demuxer_class = {
-    .class_name     = "OSS demuxer",
+    .class_name     = "OSS indev",
     .item_name      = av_default_item_name,
     .option         = options,
     .version        = LIBAVUTIL_VERSION_INT,
     .category       = AV_CLASS_CATEGORY_DEVICE_AUDIO_INPUT,
 };
 
-AVInputFormat ff_oss_demuxer = {
-    .name           = "oss",
-    .long_name      = NULL_IF_CONFIG_SMALL("OSS (Open Sound System) capture"),
+const FFInputFormat ff_oss_demuxer = {
+    .p.name         = "oss",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("OSS (Open Sound System) capture"),
+    .p.flags        = AVFMT_NOFILE,
+    .p.priv_class   = &oss_demuxer_class,
     .priv_data_size = sizeof(OSSAudioData),
     .read_header    = audio_read_header,
     .read_packet    = audio_read_packet,
     .read_close     = audio_read_close,
-    .flags          = AVFMT_NOFILE,
-    .priv_class     = &oss_demuxer_class,
 };

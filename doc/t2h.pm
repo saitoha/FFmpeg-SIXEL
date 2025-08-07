@@ -20,8 +20,57 @@
 # License along with FFmpeg; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 
+# Texinfo 7.0 changed the syntax of various functions.
+# Provide a shim for older versions.
+sub ff_set_from_init_file($$) {
+    my $key = shift;
+    my $value = shift;
+    if (exists &{'texinfo_set_from_init_file'}) {
+        texinfo_set_from_init_file($key, $value);
+    } else {
+        set_from_init_file($key, $value);
+    }
+}
+
+sub ff_get_conf($) {
+    my $key = shift;
+    if (exists &{'texinfo_get_conf'}) {
+        texinfo_get_conf($key);
+    } else {
+        get_conf($key);
+    }
+}
+
+sub get_formatting_function($$) {
+    my $obj = shift;
+    my $func = shift;
+
+    my $sub = $obj->can('formatting_function');
+    if ($sub) {
+        return $obj->formatting_function($func);
+    } else {
+        return $obj->{$func};
+    }
+}
+
+# determine texinfo version
+my $package_version = ff_get_conf('PACKAGE_VERSION');
+$package_version =~ s/\+dev$//;
+my $program_version_num = version->declare($package_version)->numify;
+my $program_version_6_8 = $program_version_num >= 6.008000;
+
 # no navigation elements
-set_from_init_file('HEADERS', 0);
+ff_set_from_init_file('HEADERS', 0);
+
+my %sectioning_commands = %Texinfo::Common::sectioning_commands;
+if (scalar(keys(%sectioning_commands)) == 0) {
+  %sectioning_commands = %Texinfo::Commands::sectioning_heading_commands;
+}
+
+my %root_commands = %Texinfo::Common::root_commands;
+if (scalar(keys(%root_commands)) == 0) {
+  %root_commands = %Texinfo::Commands::root_commands;
+}
 
 sub ffmpeg_heading_command($$$$$)
 {
@@ -40,6 +89,9 @@ sub ffmpeg_heading_command($$$$$)
         return $result;
     }
 
+    # no need to set it as the $element_id is output unconditionally
+    my $heading_id;
+
     my $element_id = $self->command_id($command);
     $result .= "<a name=\"$element_id\"></a>\n"
         if (defined($element_id) and $element_id ne '');
@@ -47,24 +99,40 @@ sub ffmpeg_heading_command($$$$$)
     print STDERR "Process $command "
         .Texinfo::Structuring::_print_root_command_texi($command)."\n"
             if ($self->get_conf('DEBUG'));
-    my $element;
-    if ($Texinfo::Common::root_commands{$command->{'cmdname'}}
-        and $command->{'parent'}
-        and $command->{'parent'}->{'type'}
-        and $command->{'parent'}->{'type'} eq 'element') {
-        $element = $command->{'parent'};
+    my $output_unit;
+    if ($root_commands{$command->{'cmdname'}}) {
+        if ($command->{'associated_unit'}) {
+          $output_unit = $command->{'associated_unit'};
+        } elsif ($command->{'structure'}
+                 and $command->{'structure'}->{'associated_unit'}) {
+          $output_unit = $command->{'structure'}->{'associated_unit'};
+        } elsif ($command->{'parent'}
+                 and $command->{'parent'}->{'type'}
+                 and $command->{'parent'}->{'type'} eq 'element') {
+          $output_unit = $command->{'parent'};
+        }
     }
-    if ($element) {
-        $result .= &{$self->{'format_element_header'}}($self, $cmdname,
-                                                       $command, $element);
+
+    if ($output_unit) {
+        $result .= &{get_formatting_function($self, 'format_element_header')}($self, $cmdname,
+                                                       $command, $output_unit);
     }
 
     my $heading_level;
     # node is used as heading if there is nothing else.
     if ($cmdname eq 'node') {
-        if (!$element or (!$element->{'extra'}->{'section'}
-            and $element->{'extra'}->{'node'}
-            and $element->{'extra'}->{'node'} eq $command
+        if (!$output_unit or
+            (((!$output_unit->{'extra'}->{'section'}
+              and $output_unit->{'extra'}->{'node'}
+              and $output_unit->{'extra'}->{'node'} eq $command)
+             or
+             ((($output_unit->{'extra'}->{'unit_command'}
+                and $output_unit->{'extra'}->{'unit_command'} eq $command)
+               or
+               ($output_unit->{'unit_command'}
+                and $output_unit->{'unit_command'} eq $command))
+              and $command->{'extra'}
+              and not $command->{'extra'}->{'associated_section'}))
              # bogus node may not have been normalized
             and defined($command->{'extra'}->{'normalized'}))) {
             if ($command->{'extra'}->{'normalized'} eq 'Top') {
@@ -74,7 +142,15 @@ sub ffmpeg_heading_command($$$$$)
             }
         }
     } else {
-        $heading_level = $command->{'level'};
+        if (defined($command->{'extra'})
+            and defined($command->{'extra'}->{'section_level'})) {
+          $heading_level = $command->{'extra'}->{'section_level'};
+        } elsif ($command->{'structure'}
+                 and defined($command->{'structure'}->{'section_level'})) {
+          $heading_level = $command->{'structure'}->{'section_level'};
+        } else {
+          $heading_level = $command->{'level'};
+        }
     }
 
     my $heading = $self->command_text($command);
@@ -82,8 +158,8 @@ sub ffmpeg_heading_command($$$$$)
     # if there is an error in the node.
     if (defined($heading) and $heading ne '' and defined($heading_level)) {
 
-        if ($Texinfo::Common::root_commands{$cmdname}
-            and $Texinfo::Common::sectioning_commands{$cmdname}) {
+        if ($root_commands{$cmdname}
+            and $sectioning_commands{$cmdname}) {
             my $content_href = $self->command_contents_href($command, 'contents',
                                                             $self->{'current_filename'});
             if ($content_href) {
@@ -103,7 +179,13 @@ sub ffmpeg_heading_command($$$$$)
             }
         }
 
-        if ($self->in_preformatted()) {
+        my $in_preformatted;
+        if ($program_version_num >= 7.001090) {
+          $in_preformatted = $self->in_preformatted_context();
+        } else {
+          $in_preformatted = $self->in_preformatted();
+        }
+        if ($in_preformatted) {
             $result .= $heading."\n";
         } else {
             # if the level was changed, set the command name right
@@ -112,29 +194,41 @@ sub ffmpeg_heading_command($$$$$)
                 $cmdname
                     = $Texinfo::Common::level_to_structuring_command{$cmdname}->[$heading_level];
             }
-            $result .= &{$self->{'format_heading_text'}}(
+            if ($program_version_num >= 7.000000) {
+                $result .= &{get_formatting_function($self,'format_heading_text')}($self,
+                     $cmdname, [$cmdname], $heading,
+                     $heading_level +$self->get_conf('CHAPTER_HEADER_LEVEL') -1,
+                     $heading_id, $command);
+
+            } else {
+              $result .= &{get_formatting_function($self,'format_heading_text')}(
                         $self, $cmdname, $heading,
                         $heading_level +
                         $self->get_conf('CHAPTER_HEADER_LEVEL') - 1, $command);
+            }
         }
     }
     $result .= $content if (defined($content));
     return $result;
 }
 
-foreach my $command (keys(%Texinfo::Common::sectioning_commands), 'node') {
+foreach my $command (keys(%sectioning_commands), 'node') {
     texinfo_register_command_formatting($command, \&ffmpeg_heading_command);
 }
 
 # print the TOC where @contents is used
-set_from_init_file('INLINE_CONTENTS', 1);
+if ($program_version_6_8) {
+    ff_set_from_init_file('CONTENTS_OUTPUT_LOCATION', 'inline');
+} else {
+    ff_set_from_init_file('INLINE_CONTENTS', 1);
+}
 
 # make chapters <h2>
-set_from_init_file('CHAPTER_HEADER_LEVEL', 2);
+ff_set_from_init_file('CHAPTER_HEADER_LEVEL', 2);
 
 # Do not add <hr>
-set_from_init_file('DEFAULT_RULE', '');
-set_from_init_file('BIG_RULE', '');
+ff_set_from_init_file('DEFAULT_RULE', '');
+ff_set_from_init_file('BIG_RULE', '');
 
 # Customized file beginning
 sub ffmpeg_begin_file($$$)
@@ -143,17 +237,56 @@ sub ffmpeg_begin_file($$$)
     my $filename = shift;
     my $element = shift;
 
-    my $command;
-    if ($element and $self->get_conf('SPLIT')) {
-        $command = $self->element_command($element);
+    my ($element_command, $node_command, $command_for_title);
+    if ($element) {
+        if ($element->{'unit_command'}) {
+          $element_command = $element->{'unit_command'};
+        } elsif ($self->can('tree_unit_element_command')) {
+          $element_command = $self->tree_unit_element_command($element);
+        } elsif ($self->can('tree_unit_element_command')) {
+          $element_command = $self->element_command($element);
+        }
+
+       $node_command = $element_command;
+       if ($element_command and $element_command->{'cmdname'}
+           and $element_command->{'cmdname'} ne 'node'
+           and $element_command->{'extra'}
+           and $element_command->{'extra'}->{'associated_node'}) {
+         $node_command = $element_command->{'extra'}->{'associated_node'};
+       }
+
+       $command_for_title = $element_command if ($self->get_conf('SPLIT'));
     }
 
-    my ($title, $description, $encoding, $date, $css_lines,
-        $doctype, $bodytext, $copying_comment, $after_body_open,
-        $extra_head, $program_and_version, $program_homepage,
-        $program, $generator) = $self->_file_header_informations($command);
+    my ($title, $description, $keywords, $encoding, $date, $css_lines, $doctype,
+        $root_html_element_attributes, $body_attributes, $copying_comment,
+        $after_body_open, $extra_head, $program_and_version, $program_homepage,
+        $program, $generator);
+    if ($program_version_num >= 7.001090) {
+        ($title, $description, $keywords, $encoding, $date, $css_lines, $doctype,
+         $root_html_element_attributes, $body_attributes, $copying_comment,
+         $after_body_open, $extra_head, $program_and_version, $program_homepage,
+         $program, $generator) = $self->_file_header_information($command_for_title,
+                                                                 $filename);
+    } elsif ($program_version_num >= 7.000000) {
+        ($title, $description, $encoding, $date, $css_lines, $doctype,
+         $root_html_element_attributes, $copying_comment, $after_body_open,
+         $extra_head, $program_and_version, $program_homepage,
+         $program, $generator) = $self->_file_header_information($command_for_title,
+                                                                 $filename);
+    } else {
+        ($title, $description, $encoding, $date, $css_lines,
+         $doctype, $root_html_element_attributes, $copying_comment,
+         $after_body_open, $extra_head, $program_and_version, $program_homepage,
+         $program, $generator) = $self->_file_header_informations($command_for_title);
+    }
 
-    my $links = $self->_get_links ($filename, $element);
+    my $links;
+    if ($program_version_num >= 7.000000) {
+      $links = $self->_get_links($filename, $element, $node_command);
+    } else {
+      $links = $self->_get_links ($filename, $element);
+    }
 
     my $head1 = $ENV{"FFMPEG_HEADER1"} || <<EOT;
 <!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">
@@ -174,7 +307,7 @@ EOT
     <link rel="stylesheet" type="text/css" href="style.min.css">
   </head>
   <body>
-    <div style="width: 95%; margin: auto">
+    <div class="container">
       <h1>
 EOT
 
@@ -184,7 +317,11 @@ EOT
 
     return $head1 . $head_title . $head2 . $head_title . $head3;
 }
-texinfo_register_formatting_function('begin_file', \&ffmpeg_begin_file);
+if ($program_version_6_8) {
+    texinfo_register_formatting_function('format_begin_file', \&ffmpeg_begin_file);
+} else {
+    texinfo_register_formatting_function('begin_file', \&ffmpeg_begin_file);
+}
 
 sub ffmpeg_program_string($)
 {
@@ -192,22 +329,38 @@ sub ffmpeg_program_string($)
   if (defined($self->get_conf('PROGRAM'))
       and $self->get_conf('PROGRAM') ne ''
       and defined($self->get_conf('PACKAGE_URL'))) {
-    return $self->convert_tree(
+    if ($program_version_num >= 7.001090) {
+     return $self->convert_tree(
+      $self->cdt('This document was generated using @uref{{program_homepage}, @emph{{program}}}.',
+         { 'program_homepage' => {'text' => $self->get_conf('PACKAGE_URL')},
+           'program' => {'text' => $self->get_conf('PROGRAM') }}));
+    } else {
+     return $self->convert_tree(
       $self->gdt('This document was generated using @uref{{program_homepage}, @emph{{program}}}.',
-         { 'program_homepage' => $self->get_conf('PACKAGE_URL'),
-           'program' => $self->get_conf('PROGRAM') }));
+         { 'program_homepage' => {'text' => $self->get_conf('PACKAGE_URL')},
+           'program' => {'text' => $self->get_conf('PROGRAM') }}));
+    }
   } else {
-    return $self->convert_tree(
-      $self->gdt('This document was generated automatically.'));
+    if ($program_version_num >= 7.001090) {
+      return $self->convert_tree(
+        $self->cdt('This document was generated automatically.'));
+    } else {
+      return $self->convert_tree(
+        $self->gdt('This document was generated automatically.'));
+    }
   }
 }
-texinfo_register_formatting_function('program_string', \&ffmpeg_program_string);
+if ($program_version_6_8) {
+    texinfo_register_formatting_function('format_program_string', \&ffmpeg_program_string);
+} else {
+    texinfo_register_formatting_function('program_string', \&ffmpeg_program_string);
+}
 
 # Customized file ending
 sub ffmpeg_end_file($)
 {
     my $self = shift;
-    my $program_string = &{$self->{'format_program_string'}}($self);
+    my $program_string = &{get_formatting_function($self,'format_program_string')}($self);
     my $program_text = <<EOT;
       <p style="font-size: small;">
         $program_string
@@ -220,11 +373,15 @@ EOT
 EOT
     return $program_text . $footer;
 }
-texinfo_register_formatting_function('end_file', \&ffmpeg_end_file);
+if ($program_version_6_8) {
+    texinfo_register_formatting_function('format_end_file', \&ffmpeg_end_file);
+} else {
+    texinfo_register_formatting_function('end_file', \&ffmpeg_end_file);
+}
 
 # Dummy title command
 # Ignore title. Title is handled through ffmpeg_begin_file().
-set_from_init_file('USE_TITLEPAGE_FOR_TITLE', 1);
+ff_set_from_init_file('USE_TITLEPAGE_FOR_TITLE', 1);
 sub ffmpeg_title($$$$)
 {
     return '';
@@ -242,8 +399,14 @@ sub ffmpeg_float($$$$$)
     my $args = shift;
     my $content = shift;
 
-    my ($caption, $prepended) = Texinfo::Common::float_name_caption($self,
-                                                                $command);
+    my ($caption, $prepended);
+    if ($program_version_num >= 7.000000) {
+        ($caption, $prepended) = Texinfo::Convert::Converter::float_name_caption($self,
+                                                                                 $command);
+    } else {
+        ($caption, $prepended) = Texinfo::Common::float_name_caption($self,
+                                                                     $command);
+    }
     my $caption_text = '';
     my $prepended_text;
     my $prepended_save = '';
@@ -315,8 +478,13 @@ sub ffmpeg_float($$$$$)
             $caption->{'args'}->[0], 'float caption');
     }
     if ($prepended_text.$caption_text ne '') {
-        $prepended_text = $self->_attribute_class('div','float-caption'). '>'
-                . $prepended_text;
+        if ($program_version_num >= 7.000000) {
+            $prepended_text = $self->html_attribute_class('div',['float-caption']). '>'
+                    . $prepended_text;
+        } else {
+            $prepended_text = $self->_attribute_class('div','float-caption'). '>'
+                    . $prepended_text;
+        }
         $caption_text .= '</div>';
     }
     my $html_class = '';
@@ -329,8 +497,13 @@ sub ffmpeg_float($$$$$)
         $prepended_text = '';
         $caption_text   = '';
     }
-    return $self->_attribute_class('div', $html_class). '>' . "\n" .
-        $prepended_text . $caption_text . $content . '</div>';
+    if ($program_version_num >= 7.000000) {
+        return $self->html_attribute_class('div', [$html_class]). '>' . "\n" .
+            $prepended_text . $caption_text . $content . '</div>';
+    } else {
+        return $self->_attribute_class('div', $html_class). '>' . "\n" .
+            $prepended_text . $caption_text . $content . '</div>';
+    }
 }
 
 texinfo_register_command_formatting('float',

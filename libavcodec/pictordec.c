@@ -25,10 +25,12 @@
  */
 
 #include "libavutil/imgutils.h"
+#include "libavutil/mem.h"
 #include "avcodec.h"
 #include "bytestream.h"
 #include "cga_data.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 
 typedef struct PicContext {
     int width, height;
@@ -57,35 +59,56 @@ static void picmemset_8bpp(PicContext *s, AVFrame *frame, int value, int run,
     }
 }
 
-static void picmemset(PicContext *s, AVFrame *frame, int value, int run,
+static void picmemset(PicContext *s, AVFrame *frame, unsigned value, int run,
                       int *x, int *y, int *plane, int bits_per_plane)
 {
     uint8_t *d;
     int shift = *plane * bits_per_plane;
-    int mask  = ((1 << bits_per_plane) - 1) << shift;
+    unsigned mask  = ((1U << bits_per_plane) - 1) << shift;
+    int xl = *x;
+    int yl = *y;
+    int planel = *plane;
+    int pixels_per_value = 8/bits_per_plane;
     value   <<= shift;
 
+    d = frame->data[0] + yl * frame->linesize[0];
     while (run > 0) {
         int j;
         for (j = 8-bits_per_plane; j >= 0; j -= bits_per_plane) {
-            d = frame->data[0] + *y * frame->linesize[0];
-            d[*x] |= (value >> j) & mask;
-            *x += 1;
-            if (*x == s->width) {
-                *y -= 1;
-                *x = 0;
-                if (*y < 0) {
-                   *y = s->height - 1;
-                   *plane += 1;
+            d[xl] |= (value >> j) & mask;
+            xl += 1;
+            while (xl == s->width) {
+                yl -= 1;
+                xl = 0;
+                if (yl < 0) {
+                   yl = s->height - 1;
+                   planel += 1;
+                   if (planel >= s->nb_planes)
+                       goto end;
                    value <<= bits_per_plane;
                    mask  <<= bits_per_plane;
-                   if (*plane >= s->nb_planes)
-                       break;
+                }
+                d = frame->data[0] + yl * frame->linesize[0];
+                if (s->nb_planes == 1 &&
+                    run*pixels_per_value >= s->width &&
+                    pixels_per_value < (s->width / pixels_per_value * pixels_per_value)
+                    ) {
+                    for (; xl < pixels_per_value; xl ++) {
+                        j = (j < bits_per_plane ? 8 : j) - bits_per_plane;
+                        d[xl] |= (value >> j) & mask;
+                    }
+                    av_memcpy_backptr(d+xl, pixels_per_value, s->width - xl);
+                    run -= s->width / pixels_per_value;
+                    xl = s->width / pixels_per_value * pixels_per_value;
                 }
             }
         }
         run--;
     }
+end:
+    *x = xl;
+    *y = yl;
+    *plane = planel;
 }
 
 static const uint8_t cga_mode45_index[6][4] = {
@@ -97,12 +120,10 @@ static const uint8_t cga_mode45_index[6][4] = {
     [5] = { 0, 11, 12, 15 }, // mode5, high intensity
 };
 
-static int decode_frame(AVCodecContext *avctx,
-                        void *data, int *got_frame,
-                        AVPacket *avpkt)
+static int decode_frame(AVCodecContext *avctx, AVFrame *frame,
+                        int *got_frame, AVPacket *avpkt)
 {
     PicContext *s = avctx->priv_data;
-    AVFrame *frame = data;
     uint32_t *palette;
     int bits_per_plane, bpp, etype, esize, npal, pos_after_pal;
     int i, x, y, plane, tmp, ret, val;
@@ -142,7 +163,26 @@ static int decode_frame(AVCodecContext *avctx,
 
     if (av_image_check_size(s->width, s->height, 0, avctx) < 0)
         return -1;
-    if (s->width != avctx->width && s->height != avctx->height) {
+
+    /*
+        There are 2 coding modes, RLE and RAW.
+        Undamaged RAW should be proportional to W*H and thus bigger than RLE
+        RLE codes the most compressed runs by
+        1 byte for val (=marker)
+        1 byte run (=0)
+        2 bytes run
+        1 byte val
+        that's 5 bytes and the maximum run we can code is 65535
+
+        The RLE decoder can exit prematurly but it does not on any image available
+        Based on this the formula is assumed correct for undamaged images.
+        If an image is found which exploits the special end
+        handling and breaks this formula then this needs to be adapted.
+    */
+    if (bytestream2_get_bytes_left(&s->g) < s->width * s->height / 65535 * 5)
+        return AVERROR_INVALIDDATA;
+
+    if (s->width != avctx->width || s->height != avctx->height) {
         ret = ff_set_dimensions(avctx, s->width, s->height);
         if (ret < 0)
             return ret;
@@ -152,7 +192,6 @@ static int decode_frame(AVCodecContext *avctx,
         return ret;
     memset(frame->data[0], 0, s->height * frame->linesize[0]);
     frame->pict_type           = AV_PICTURE_TYPE_I;
-    frame->palette_has_changed = 1;
 
     pos_after_pal = bytestream2_tell(&s->g) + esize;
     palette = (uint32_t*)frame->data[1];
@@ -223,8 +262,6 @@ static int decode_frame(AVCodecContext *avctx,
                         run = bytestream2_get_le16(&s->g);
                     val = bytestream2_get_byte(&s->g);
                 }
-                if (!bytestream2_get_bytes_left(&s->g))
-                    break;
 
                 if (bits_per_plane == 8) {
                     picmemset_8bpp(s, frame, val, run, &x, &y);
@@ -236,7 +273,10 @@ static int decode_frame(AVCodecContext *avctx,
             }
         }
 
-        if (x < avctx->width) {
+        if (s->nb_planes - plane > 1)
+            return AVERROR_INVALIDDATA;
+
+        if (plane < s->nb_planes && x < avctx->width) {
             int run = (y + 1) * avctx->width - x;
             if (bits_per_plane == 8)
                 picmemset_8bpp(s, frame, val, run, &x, &y);
@@ -256,12 +296,12 @@ finish:
     return avpkt->size;
 }
 
-AVCodec ff_pictor_decoder = {
-    .name           = "pictor",
-    .long_name      = NULL_IF_CONFIG_SMALL("Pictor/PC Paint"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_PICTOR,
+const FFCodec ff_pictor_decoder = {
+    .p.name         = "pictor",
+    CODEC_LONG_NAME("Pictor/PC Paint"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_PICTOR,
+    .p.capabilities = AV_CODEC_CAP_DR1,
     .priv_data_size = sizeof(PicContext),
-    .decode         = decode_frame,
-    .capabilities   = CODEC_CAP_DR1,
+    FF_CODEC_DECODE_CB(decode_frame),
 };

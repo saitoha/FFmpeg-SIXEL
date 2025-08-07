@@ -21,6 +21,7 @@
  */
 
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 #include "subtitles.h"
 #include "libavutil/intreadwrite.h"
@@ -36,7 +37,7 @@ typedef struct {
 } MicroDVDContext;
 
 
-static int microdvd_probe(AVProbeData *p)
+static int microdvd_probe(const AVProbeData *p)
 {
     unsigned char c;
     const uint8_t *ptr = p->buf;
@@ -65,12 +66,12 @@ static int64_t get_pts(const char *buf)
     return AV_NOPTS_VALUE;
 }
 
-static int get_duration(const char *buf)
+static int64_t get_duration(const char *buf)
 {
     int frame_start, frame_end;
 
     if (sscanf(buf, "{%d}{%d}", &frame_start, &frame_end) == 2)
-        return frame_end - frame_start;
+        return frame_end - (int64_t)frame_start;
     return -1;
 }
 
@@ -81,7 +82,7 @@ static int microdvd_read_header(AVFormatContext *s)
     AVRational pts_info = (AVRational){ 2997, 125 };  /* default: 23.976 fps */
     MicroDVDContext *microdvd = s->priv_data;
     AVStream *st = avformat_new_stream(s, NULL);
-    int i = 0;
+    int i = 0, ret;
     char line_buf[MAX_LINESIZE];
     int has_real_fps = 0;
 
@@ -94,6 +95,7 @@ static int microdvd_read_header(AVFormatContext *s)
         int64_t pos = avio_tell(s->pb);
         int len = ff_get_line(s->pb, line_buf, sizeof(line_buf));
         char *line = line_buf;
+        int64_t pts;
 
         if (!strncmp(line, bom, 3))
             line += 3;
@@ -102,6 +104,8 @@ static int microdvd_read_header(AVFormatContext *s)
         if (!len)
             break;
         line[strcspn(line, "\r\n")] = 0;
+        if (!*p)
+            continue;
         if (i++ < 3) {
             int frame;
             double fps;
@@ -114,11 +118,12 @@ static int microdvd_read_header(AVFormatContext *s)
                 has_real_fps = 1;
                 continue;
             }
-            if (!st->codec->extradata && sscanf(line, "{DEFAULT}{}%c", &c) == 1) {
-                st->codec->extradata = av_strdup(line + 11);
-                if (!st->codec->extradata)
-                    return AVERROR(ENOMEM);
-                st->codec->extradata_size = strlen(st->codec->extradata) + 1;
+            if (!st->codecpar->extradata && sscanf(line, "{DEFAULT}{}%c", &c) == 1) {
+                int size = strlen(line + 11);
+                ret = ff_alloc_extradata(st->codecpar, size);
+                if (ret < 0)
+                    return ret;
+                memcpy(st->codecpar->extradata, line + 11, size);
                 continue;
             }
         }
@@ -134,14 +139,17 @@ static int microdvd_read_header(AVFormatContext *s)
         SKIP_FRAME_ID;
         if (!*p)
             continue;
+        pts = get_pts(line);
+        if (pts == AV_NOPTS_VALUE)
+            continue;
         sub = ff_subtitles_queue_insert(&microdvd->q, p, strlen(p), 0);
         if (!sub)
             return AVERROR(ENOMEM);
         sub->pos = pos;
-        sub->pts = get_pts(line);
+        sub->pts = pts;
         sub->duration = get_duration(line);
     }
-    ff_subtitles_queue_finalize(&microdvd->q);
+    ff_subtitles_queue_finalize(s, &microdvd->q);
     if (has_real_fps) {
         /* export the FPS info only if set in the file */
         microdvd->frame_rate = pts_info;
@@ -150,8 +158,8 @@ static int microdvd_read_header(AVFormatContext *s)
         pts_info = microdvd->frame_rate;
     }
     avpriv_set_pts_info(st, 64, pts_info.den, pts_info.num);
-    st->codec->codec_type = AVMEDIA_TYPE_SUBTITLE;
-    st->codec->codec_id   = AV_CODEC_ID_MICRODVD;
+    st->codecpar->codec_type = AVMEDIA_TYPE_SUBTITLE;
+    st->codecpar->codec_id   = AV_CODEC_ID_MICRODVD;
     return 0;
 }
 
@@ -191,14 +199,15 @@ static const AVClass microdvd_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-AVInputFormat ff_microdvd_demuxer = {
-    .name           = "microdvd",
-    .long_name      = NULL_IF_CONFIG_SMALL("MicroDVD subtitle format"),
+const FFInputFormat ff_microdvd_demuxer = {
+    .p.name         = "microdvd",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("MicroDVD subtitle format"),
+    .p.priv_class   = &microdvd_class,
     .priv_data_size = sizeof(MicroDVDContext),
+    .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
     .read_probe     = microdvd_probe,
     .read_header    = microdvd_read_header,
     .read_packet    = microdvd_read_packet,
     .read_seek2     = microdvd_read_seek,
     .read_close     = microdvd_read_close,
-    .priv_class     = &microdvd_class,
 };

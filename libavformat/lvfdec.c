@@ -21,9 +21,10 @@
 
 #include "libavutil/intreadwrite.h"
 #include "avformat.h"
+#include "demux.h"
 #include "riff.h"
 
-static int lvf_probe(AVProbeData *p)
+static int lvf_probe(const AVProbeData *p)
 {
     if (AV_RL32(p->buf) != MKTAG('L', 'V', 'F', 'F'))
         return 0;
@@ -62,14 +63,14 @@ static int lvf_read_header(AVFormatContext *s)
             if (!st)
                 return AVERROR(ENOMEM);
 
-            st->codec->codec_type = AVMEDIA_TYPE_VIDEO;
+            st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
             avio_skip(s->pb, 4);
-            st->codec->width      = avio_rl32(s->pb);
-            st->codec->height     = avio_rl32(s->pb);
+            st->codecpar->width      = avio_rl32(s->pb);
+            st->codecpar->height     = avio_rl32(s->pb);
             avio_skip(s->pb, 4);
-            st->codec->codec_tag  = avio_rl32(s->pb);
-            st->codec->codec_id   = ff_codec_get_id(ff_codec_bmp_tags,
-                                                    st->codec->codec_tag);
+            st->codecpar->codec_tag  = avio_rl32(s->pb);
+            st->codecpar->codec_id   = ff_codec_get_id(ff_codec_bmp_tags,
+                                                       st->codecpar->codec_tag);
             avpriv_set_pts_info(st, 32, 1, 1000);
             break;
         case MKTAG('0', '1', 'f', 'm'):
@@ -77,14 +78,14 @@ static int lvf_read_header(AVFormatContext *s)
             if (!st)
                 return AVERROR(ENOMEM);
 
-            st->codec->codec_type  = AVMEDIA_TYPE_AUDIO;
-            st->codec->codec_tag   = avio_rl16(s->pb);
-            st->codec->channels    = avio_rl16(s->pb);
-            st->codec->sample_rate = avio_rl16(s->pb);
+            st->codecpar->codec_type  = AVMEDIA_TYPE_AUDIO;
+            st->codecpar->codec_tag   = avio_rl16(s->pb);
+            st->codecpar->ch_layout.nb_channels = avio_rl16(s->pb);
+            st->codecpar->sample_rate = avio_rl16(s->pb);
             avio_skip(s->pb, 8);
-            st->codec->bits_per_coded_sample = avio_r8(s->pb);
-            st->codec->codec_id    = ff_codec_get_id(ff_codec_wav_tags,
-                                                     st->codec->codec_tag);
+            st->codecpar->bits_per_coded_sample = avio_r8(s->pb);
+            st->codecpar->codec_id    = ff_codec_get_id(ff_codec_wav_tags,
+                                                        st->codecpar->codec_tag);
             avpriv_set_pts_info(st, 32, 1, 1000);
             break;
         case 0:
@@ -106,6 +107,7 @@ static int lvf_read_packet(AVFormatContext *s, AVPacket *pkt)
     unsigned size, flags, timestamp, id;
     int64_t pos;
     int ret, is_video = 0;
+    int stream_index;
 
     pos = avio_tell(s->pb);
     while (!avio_feof(s->pb)) {
@@ -121,12 +123,15 @@ static int lvf_read_packet(AVFormatContext *s, AVPacket *pkt)
         case MKTAG('0', '1', 'w', 'b'):
             if (size < 8)
                 return AVERROR_INVALIDDATA;
+            stream_index = is_video ? 0 : 1;
+            if (stream_index >= s->nb_streams)
+                return AVERROR_INVALIDDATA;
             timestamp = avio_rl32(s->pb);
             flags = avio_rl32(s->pb);
             ret = av_get_packet(s->pb, pkt, size - 8);
             if (flags & (1 << 12))
                 pkt->flags |= AV_PKT_FLAG_KEY;
-            pkt->stream_index = is_video ? 0 : 1;
+            pkt->stream_index = stream_index;
             pkt->pts          = timestamp;
             pkt->pos          = pos;
             return ret;
@@ -141,12 +146,12 @@ static int lvf_read_packet(AVFormatContext *s, AVPacket *pkt)
     return AVERROR_EOF;
 }
 
-AVInputFormat ff_lvf_demuxer = {
-    .name        = "lvf",
-    .long_name   = NULL_IF_CONFIG_SMALL("LVF"),
+const FFInputFormat ff_lvf_demuxer = {
+    .p.name         = "lvf",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("LVF"),
+    .p.extensions   = "lvf",
+    .p.flags        = AVFMT_GENERIC_INDEX,
     .read_probe  = lvf_probe,
     .read_header = lvf_read_header,
     .read_packet = lvf_read_packet,
-    .extensions  = "lvf",
-    .flags       = AVFMT_GENERIC_INDEX,
 };

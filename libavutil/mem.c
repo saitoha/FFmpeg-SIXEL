@@ -31,16 +31,19 @@
 #include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 #if HAVE_MALLOC_H
 #include <malloc.h>
 #endif
 
+#include "attributes.h"
 #include "avassert.h"
-#include "avutil.h"
-#include "common.h"
 #include "dynarray.h"
+#include "error.h"
+#include "internal.h"
 #include "intreadwrite.h"
+#include "macros.h"
 #include "mem.h"
 
 #ifdef MALLOC_PREFIX
@@ -59,38 +62,47 @@ void  free(void *ptr);
 
 #endif /* MALLOC_PREFIX */
 
-#define ALIGN (HAVE_AVX ? 32 : 16)
+#define ALIGN (HAVE_SIMD_ALIGN_64 ? 64 : (HAVE_SIMD_ALIGN_32 ? 32 : 16))
+
+#define FF_MEMORY_POISON 0x2a
 
 /* NOTE: if you want to override these functions with your own
  * implementations (not recommended) you have to link libav* as
  * dynamic libraries and remove -Wl,-Bsymbolic from the linker flags.
  * Note that this will cost performance. */
 
-static size_t max_alloc_size= INT_MAX;
+static atomic_size_t max_alloc_size = INT_MAX;
 
 void av_max_alloc(size_t max){
-    max_alloc_size = max;
+    atomic_store_explicit(&max_alloc_size, max, memory_order_relaxed);
+}
+
+static int size_mult(size_t a, size_t b, size_t *r)
+{
+    size_t t;
+
+#if (!defined(__INTEL_COMPILER) && AV_GCC_VERSION_AT_LEAST(5,1)) || AV_HAS_BUILTIN(__builtin_mul_overflow)
+    if (__builtin_mul_overflow(a, b, &t))
+        return AVERROR(EINVAL);
+#else
+    t = a * b;
+    /* Hack inspired from glibc: don't try the division if nelem and elsize
+     * are both less than sqrt(SIZE_MAX). */
+    if ((a | b) >= ((size_t)1 << (sizeof(size_t) * 4)) && a && t / a != b)
+        return AVERROR(EINVAL);
+#endif
+    *r = t;
+    return 0;
 }
 
 void *av_malloc(size_t size)
 {
     void *ptr = NULL;
-#if CONFIG_MEMALIGN_HACK
-    long diff;
-#endif
 
-    /* let's disallow possibly ambiguous cases */
-    if (size > (max_alloc_size - 32))
+    if (size > atomic_load_explicit(&max_alloc_size, memory_order_relaxed))
         return NULL;
 
-#if CONFIG_MEMALIGN_HACK
-    ptr = malloc(size + ALIGN);
-    if (!ptr)
-        return ptr;
-    diff              = ((~(long)ptr)&(ALIGN - 1)) + 1;
-    ptr               = (char *)ptr + diff;
-    ((char *)ptr)[-1] = diff;
-#elif HAVE_POSIX_MEMALIGN
+#if HAVE_POSIX_MEMALIGN
     if (size) //OS X on SDK 10.6 has a broken posix_memalign implementation
     if (posix_memalign(&ptr, ALIGN, size))
         ptr = NULL;
@@ -142,29 +154,20 @@ void *av_malloc(size_t size)
 
 void *av_realloc(void *ptr, size_t size)
 {
-#if CONFIG_MEMALIGN_HACK
-    int diff;
-#endif
-
-    /* let's disallow possibly ambiguous cases */
-    if (size > (max_alloc_size - 32))
+    void *ret;
+    if (size > atomic_load_explicit(&max_alloc_size, memory_order_relaxed))
         return NULL;
 
-#if CONFIG_MEMALIGN_HACK
-    //FIXME this isn't aligned correctly, though it probably isn't needed
-    if (!ptr)
-        return av_malloc(size);
-    diff = ((char *)ptr)[-1];
-    av_assert0(diff>0 && diff<=ALIGN);
-    ptr = realloc((char *)ptr - diff, size + diff);
-    if (ptr)
-        ptr = (char *)ptr + diff;
-    return ptr;
-#elif HAVE_ALIGNED_MALLOC
-    return _aligned_realloc(ptr, size + !size, ALIGN);
+#if HAVE_ALIGNED_MALLOC
+    ret = _aligned_realloc(ptr, size + !size, ALIGN);
 #else
-    return realloc(ptr, size + !size);
+    ret = realloc(ptr, size + !size);
 #endif
+#if CONFIG_MEMORY_POISONING
+    if (ret && !ptr)
+        memset(ret, FF_MEMORY_POISON, size);
+#endif
+    return ret;
 }
 
 void *av_realloc_f(void *ptr, size_t nelem, size_t elsize)
@@ -172,12 +175,12 @@ void *av_realloc_f(void *ptr, size_t nelem, size_t elsize)
     size_t size;
     void *r;
 
-    if (av_size_mult(elsize, nelem, &size)) {
+    if (size_mult(elsize, nelem, &size)) {
         av_free(ptr);
         return NULL;
     }
     r = av_realloc(ptr, size);
-    if (!r && size)
+    if (!r)
         av_free(ptr);
     return r;
 }
@@ -203,11 +206,20 @@ int av_reallocp(void *ptr, size_t size)
     return 0;
 }
 
+void *av_malloc_array(size_t nmemb, size_t size)
+{
+    size_t result;
+    if (size_mult(nmemb, size, &result) < 0)
+        return NULL;
+    return av_malloc(result);
+}
+
 void *av_realloc_array(void *ptr, size_t nmemb, size_t size)
 {
-    if (!size || nmemb >= INT_MAX / size)
+    size_t result;
+    if (size_mult(nmemb, size, &result) < 0)
         return NULL;
-    return av_realloc(ptr, nmemb * size);
+    return av_realloc(ptr, result);
 }
 
 int av_reallocp_array(void *ptr, size_t nmemb, size_t size)
@@ -225,13 +237,7 @@ int av_reallocp_array(void *ptr, size_t nmemb, size_t size)
 
 void av_free(void *ptr)
 {
-#if CONFIG_MEMALIGN_HACK
-    if (ptr) {
-        int v= ((char *)ptr)[-1];
-        av_assert0(v>0 && v<=ALIGN);
-        free((char *)ptr - v);
-    }
-#elif HAVE_ALIGNED_MALLOC
+#if HAVE_ALIGNED_MALLOC
     _aligned_free(ptr);
 #else
     free(ptr);
@@ -257,9 +263,10 @@ void *av_mallocz(size_t size)
 
 void *av_calloc(size_t nmemb, size_t size)
 {
-    if (size <= 0 || nmemb >= INT_MAX / size)
+    size_t result;
+    if (size_mult(nmemb, size, &result) < 0)
         return NULL;
-    return av_mallocz(nmemb * size);
+    return av_mallocz(result);
 }
 
 char *av_strdup(const char *s)
@@ -310,7 +317,7 @@ int av_dynarray_add_nofree(void *tab_ptr, int *nb_ptr, void *elem)
     void **tab;
     memcpy(&tab, tab_ptr, sizeof(tab));
 
-    AV_DYNARRAY_ADD(INT_MAX, sizeof(*tab), tab, *nb_ptr, {
+    FF_DYNARRAY_ADD(INT_MAX, sizeof(*tab), tab, *nb_ptr, {
         tab[*nb_ptr] = elem;
         memcpy(tab_ptr, &tab, sizeof(tab));
     }, {
@@ -324,7 +331,7 @@ void av_dynarray_add(void *tab_ptr, int *nb_ptr, void *elem)
     void **tab;
     memcpy(&tab, tab_ptr, sizeof(tab));
 
-    AV_DYNARRAY_ADD(INT_MAX, sizeof(*tab), tab, *nb_ptr, {
+    FF_DYNARRAY_ADD(INT_MAX, sizeof(*tab), tab, *nb_ptr, {
         tab[*nb_ptr] = elem;
         memcpy(tab_ptr, &tab, sizeof(tab));
     }, {
@@ -338,7 +345,7 @@ void *av_dynarray2_add(void **tab_ptr, int *nb_ptr, size_t elem_size,
 {
     uint8_t *tab_elem_data = NULL;
 
-    AV_DYNARRAY_ADD(INT_MAX, elem_size, *tab_ptr, *nb_ptr, {
+    FF_DYNARRAY_ADD(INT_MAX, elem_size, *tab_ptr, *nb_ptr, {
         tab_elem_data = (uint8_t *)*tab_ptr + (*nb_ptr) * elem_size;
         if (elem_data)
             memcpy(tab_elem_data, elem_data, elem_size);
@@ -413,6 +420,18 @@ static void fill32(uint8_t *dst, int len)
 {
     uint32_t v = AV_RN32(dst - 4);
 
+#if HAVE_FAST_64BIT
+    uint64_t v2= v + ((uint64_t)v<<32);
+    while (len >= 32) {
+        AV_WN64(dst   , v2);
+        AV_WN64(dst+ 8, v2);
+        AV_WN64(dst+16, v2);
+        AV_WN64(dst+24, v2);
+        dst += 32;
+        len -= 32;
+    }
+#endif
+
     while (len >= 4) {
         AV_WN32(dst, v);
         dst += 4;
@@ -477,10 +496,21 @@ void av_memcpy_backptr(uint8_t *dst, int back, int cnt)
 
 void *av_fast_realloc(void *ptr, unsigned int *size, size_t min_size)
 {
-    if (min_size < *size)
+    size_t max_size;
+
+    if (min_size <= *size)
         return ptr;
 
-    min_size = FFMAX(17 * min_size / 16 + 32, min_size);
+    max_size = atomic_load_explicit(&max_alloc_size, memory_order_relaxed);
+    /* *size is an unsigned, so the real maximum is <= UINT_MAX. */
+    max_size = FFMIN(max_size, UINT_MAX);
+
+    if (min_size > max_size) {
+        *size = 0;
+        return NULL;
+    }
+
+    min_size = FFMIN(max_size, FFMAX(min_size + min_size / 16 + 32, min_size));
 
     ptr = av_realloc(ptr, min_size);
     /* we could set this to the unmodified min_size but this is safer
@@ -494,24 +524,47 @@ void *av_fast_realloc(void *ptr, unsigned int *size, size_t min_size)
     return ptr;
 }
 
-static inline int ff_fast_malloc(void *ptr, unsigned int *size, size_t min_size, int zero_realloc)
+static inline void fast_malloc(void *ptr, unsigned int *size, size_t min_size, int zero_realloc)
 {
+    size_t max_size;
     void *val;
 
-    if (min_size < *size)
-        return 0;
-    min_size = FFMAX(17 * min_size / 16 + 32, min_size);
+    memcpy(&val, ptr, sizeof(val));
+    if (min_size <= *size) {
+        av_assert0(val || !min_size);
+        return;
+    }
+
+    max_size = atomic_load_explicit(&max_alloc_size, memory_order_relaxed);
+    /* *size is an unsigned, so the real maximum is <= UINT_MAX. */
+    max_size = FFMIN(max_size, UINT_MAX);
+
+    if (min_size > max_size) {
+        av_freep(ptr);
+        *size = 0;
+        return;
+    }
+    min_size = FFMIN(max_size, FFMAX(min_size + min_size / 16 + 32, min_size));
     av_freep(ptr);
     val = zero_realloc ? av_mallocz(min_size) : av_malloc(min_size);
     memcpy(ptr, &val, sizeof(val));
     if (!val)
         min_size = 0;
     *size = min_size;
-    return 1;
+    return;
 }
 
 void av_fast_malloc(void *ptr, unsigned int *size, size_t min_size)
 {
-    ff_fast_malloc(ptr, size, min_size, 0);
+    fast_malloc(ptr, size, min_size, 0);
 }
 
+void av_fast_mallocz(void *ptr, unsigned int *size, size_t min_size)
+{
+    fast_malloc(ptr, size, min_size, 1);
+}
+
+int av_size_mult(size_t a, size_t b, size_t *r)
+{
+    return size_mult(a, b, r);
+}

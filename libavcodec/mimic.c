@@ -19,21 +19,26 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include <stdlib.h>
-#include <string.h>
 #include <stdint.h>
+
+#include "libavutil/mem.h"
+#include "libavutil/mem_internal.h"
+#include "libavutil/thread.h"
 
 #include "avcodec.h"
 #include "blockdsp.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include "get_bits.h"
 #include "bytestream.h"
 #include "bswapdsp.h"
 #include "hpeldsp.h"
 #include "idctdsp.h"
+#include "progressframe.h"
 #include "thread.h"
 
 #define MIMIC_HEADER_SIZE   20
+#define MIMIC_VLC_BITS      11
 
 typedef struct MimicContext {
     AVCodecContext *avctx;
@@ -47,61 +52,43 @@ typedef struct MimicContext {
     int             cur_index;
     int             prev_index;
 
-    ThreadFrame     frames     [16];
-    AVPicture       flipped_ptrs[16];
+    ProgressFrame   frames[16];
 
-    DECLARE_ALIGNED(16, int16_t, dct_block)[64];
+    DECLARE_ALIGNED(32, int16_t, dct_block)[64];
 
     GetBitContext   gb;
-    ScanTable       scantable;
+    uint8_t         permutated_scantable[64];
     BlockDSPContext bdsp;
     BswapDSPContext bbdsp;
     HpelDSPContext  hdsp;
     IDCTDSPContext  idsp;
-    VLC             vlc;
 
     /* Kept in the context so multithreading can have a constant to read from */
     int             next_cur_index;
     int             next_prev_index;
 } MimicContext;
 
-static const uint32_t huffcodes[] = {
-    0x0000000a, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x0000000b,
-    0x0000001b, 0x00000038, 0x00000078, 0x00000079, 0x0000007a, 0x000000f9,
-    0x000000fa, 0x000003fb, 0x000007f8, 0x000007f9, 0x000007fa, 0x000007fb,
-    0x00000ff8, 0x00000ff9, 0x00000001, 0x00000039, 0x0000007b, 0x000000fb,
-    0x000001f8, 0x000001f9, 0x00000ffa, 0x00000ffb, 0x00001ff8, 0x00001ff9,
-    0x00001ffa, 0x00001ffb, 0x00003ff8, 0x00003ff9, 0x00003ffa, 0x00000000,
-    0x00000004, 0x0000003a, 0x000001fa, 0x00003ffb, 0x00007ff8, 0x00007ff9,
-    0x00007ffa, 0x00007ffb, 0x0000fff8, 0x0000fff9, 0x0000fffa, 0x0000fffb,
-    0x0001fff8, 0x0001fff9, 0x0001fffa, 0x00000000, 0x0000000c, 0x000000f8,
-    0x000001fb, 0x0001fffb, 0x0003fff8, 0x0003fff9, 0x0003fffa, 0x0003fffb,
-    0x0007fff8, 0x0007fff9, 0x0007fffa, 0x0007fffb, 0x000ffff8, 0x000ffff9,
-    0x000ffffa, 0x00000000, 0x0000001a, 0x000003f8, 0x000ffffb, 0x001ffff8,
-    0x001ffff9, 0x001ffffa, 0x001ffffb, 0x003ffff8, 0x003ffff9, 0x003ffffa,
-    0x003ffffb, 0x007ffff8, 0x007ffff9, 0x007ffffa, 0x007ffffb, 0x00000000,
-    0x0000003b, 0x000003f9, 0x00fffff8, 0x00fffff9, 0x00fffffa, 0x00fffffb,
-    0x01fffff8, 0x01fffff9, 0x01fffffa, 0x01fffffb, 0x03fffff8, 0x03fffff9,
-    0x03fffffa, 0x03fffffb, 0x07fffff8, 0x00000000, 0x000003fa, 0x07fffff9,
-    0x07fffffa, 0x07fffffb, 0x0ffffff8, 0x0ffffff9, 0x0ffffffa, 0x0ffffffb,
-    0x1ffffff8, 0x1ffffff9, 0x1ffffffa, 0x1ffffffb, 0x3ffffff8, 0x3ffffff9,
-    0x3ffffffa,
+static VLCElem block_vlc[4368];
+
+static const uint8_t huffsyms[] = {
+    0x10, 0x20, 0x30, 0x00, 0x11, 0x40, 0x50, 0x12, 0x13, 0x21, 0x31, 0x60,
+    0x14, 0x15, 0x16, 0x22, 0x41, 0x17, 0x18, 0x23, 0x24, 0x25, 0x32, 0x42,
+    0x51, 0x61, 0x70, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x26, 0x27,
+    0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x33, 0x34, 0x35, 0x36, 0x37,
+    0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x43, 0x44, 0x45, 0x46, 0x47,
+    0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x52, 0x53, 0x54, 0x55, 0x56,
+    0x57, 0x58, 0x59, 0x5A, 0x5B, 0x5C, 0x5D, 0x5E, 0x62, 0x63, 0x64, 0x65,
+    0x66, 0x67, 0x68, 0x69, 0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x71, 0x72, 0x73,
+    0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x7B, 0x7C, 0x7D, 0x7E,
 };
 
 static const uint8_t huffbits[] = {
-     4,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
-     0,  0,  0,  0,  2,  4,  5,  6,  7,  7,  7,  8,
-     8, 10, 11, 11, 11, 11, 12, 12,  2,  6,  7,  8,
-     9,  9, 12, 12, 13, 13, 13, 13, 14, 14, 14,  0,
-     3,  6,  9, 14, 15, 15, 15, 15, 16, 16, 16, 16,
-    17, 17, 17,  0,  4,  8,  9, 17, 18, 18, 18, 18,
-    19, 19, 19, 19, 20, 20, 20,  0,  5, 10, 20, 21,
-    21, 21, 21, 22, 22, 22, 22, 23, 23, 23, 23,  0,
-     6, 10, 24, 24, 24, 24, 25, 25, 25, 25, 26, 26,
-    26, 26, 27,  0, 10, 27, 27, 27, 28, 28, 28, 28,
-    29, 29, 29, 29, 30, 30, 30,
+     2,  2,  3,  4,  4,  4,  5,  5,  6,  6,  6,  6,  7,  7,  7,  7,  8,  8,
+     8,  8,  9,  9,  9,  9, 10, 10, 10, 10, 11, 11, 11, 11, 12, 12, 12, 12,
+    13, 13, 13, 13, 14, 14, 14, 14, 15, 15, 15, 15, 16, 16, 16, 16, 17, 17,
+    17, 17, 18, 18, 18, 18, 19, 19, 19, 19, 20, 20, 20, 20, 21, 21, 21, 21,
+    22, 22, 22, 22, 23, 23, 23, 23, 24, 24, 24, 24, 25, 25, 25, 25, 26, 26,
+    26, 26, 27, 27, 27, 27, 28, 28, 28, 28, 29, 29, 29, 29, 30, 30, 30,
 };
 
 static const uint8_t col_zag[64] = {
@@ -118,59 +105,46 @@ static const uint8_t col_zag[64] = {
 static av_cold int mimic_decode_end(AVCodecContext *avctx)
 {
     MimicContext *ctx = avctx->priv_data;
-    int i;
 
     av_freep(&ctx->swap_buf);
     ctx->swap_buf_size = 0;
 
-    for (i = 0; i < FF_ARRAY_ELEMS(ctx->frames); i++) {
-        if (ctx->frames[i].f)
-            ff_thread_release_buffer(avctx, &ctx->frames[i]);
-        av_frame_free(&ctx->frames[i].f);
-    }
-
-    if (!avctx->internal->is_copy)
-        ff_free_vlc(&ctx->vlc);
+    for (int i = 0; i < FF_ARRAY_ELEMS(ctx->frames); i++)
+        ff_progress_frame_unref(&ctx->frames[i]);
 
     return 0;
+}
+
+static av_cold void mimic_init_static(void)
+{
+    VLC_INIT_STATIC_TABLE_FROM_LENGTHS(block_vlc, MIMIC_VLC_BITS,
+                                       FF_ARRAY_ELEMS(huffbits),
+                                       huffbits, 1, huffsyms, 1, 1, 0, 0);
 }
 
 static av_cold int mimic_decode_init(AVCodecContext *avctx)
 {
+    static AVOnce init_static_once = AV_ONCE_INIT;
     MimicContext *ctx = avctx->priv_data;
-    int ret, i;
-
-    avctx->internal->allocate_progress = 1;
 
     ctx->prev_index = 0;
     ctx->cur_index  = 15;
 
-    if ((ret = init_vlc(&ctx->vlc, 11, FF_ARRAY_ELEMS(huffbits),
-                        huffbits, 1, 1, huffcodes, 4, 4, 0)) < 0) {
-        av_log(avctx, AV_LOG_ERROR, "error initializing vlc table\n");
-        return ret;
-    }
-    ff_blockdsp_init(&ctx->bdsp, avctx);
+    ff_blockdsp_init(&ctx->bdsp);
     ff_bswapdsp_init(&ctx->bbdsp);
     ff_hpeldsp_init(&ctx->hdsp, avctx->flags);
     ff_idctdsp_init(&ctx->idsp, avctx);
-    ff_init_scantable(ctx->idsp.idct_permutation, &ctx->scantable, col_zag);
+    ff_permute_scantable(ctx->permutated_scantable, col_zag, ctx->idsp.idct_permutation);
 
-    for (i = 0; i < FF_ARRAY_ELEMS(ctx->frames); i++) {
-        ctx->frames[i].f = av_frame_alloc();
-        if (!ctx->frames[i].f) {
-            mimic_decode_end(avctx);
-            return AVERROR(ENOMEM);
-        }
-    }
+    ff_thread_once(&init_static_once, mimic_init_static);
 
     return 0;
 }
 
+#if HAVE_THREADS
 static int mimic_decode_update_thread_context(AVCodecContext *avctx, const AVCodecContext *avctx_from)
 {
     MimicContext *dst = avctx->priv_data, *src = avctx_from->priv_data;
-    int i, ret;
 
     if (avctx == avctx_from)
         return 0;
@@ -178,19 +152,15 @@ static int mimic_decode_update_thread_context(AVCodecContext *avctx, const AVCod
     dst->cur_index  = src->next_cur_index;
     dst->prev_index = src->next_prev_index;
 
-    memcpy(dst->flipped_ptrs, src->flipped_ptrs, sizeof(src->flipped_ptrs));
-
-    for (i = 0; i < FF_ARRAY_ELEMS(dst->frames); i++) {
-        ff_thread_release_buffer(avctx, &dst->frames[i]);
-        if (i != src->next_cur_index && src->frames[i].f->data[0]) {
-            ret = ff_thread_ref_frame(&dst->frames[i], &src->frames[i]);
-            if (ret < 0)
-                return ret;
-        }
+    for (int i = 0; i < FF_ARRAY_ELEMS(dst->frames); i++) {
+        ff_progress_frame_unref(&dst->frames[i]);
+        if (i != src->next_cur_index && src->frames[i].f)
+            ff_progress_frame_ref(&dst->frames[i], &src->frames[i]);
     }
 
     return 0;
 }
+#endif
 
 static const int8_t vlcdec_lookup[9][64] = {
     {    0, },
@@ -243,7 +213,7 @@ static int vlc_decode_block(MimicContext *ctx, int num_coeffs, int qscale)
         int value;
         int coeff;
 
-        vlc = get_vlc2(&ctx->gb, ctx->vlc.table, ctx->vlc.bits, 3);
+        vlc = get_vlc2(&ctx->gb, block_vlc, MIMIC_VLC_BITS, 3);
         if (!vlc) /* end-of-block code */
             return 0;
         if (vlc == -1)
@@ -261,13 +231,13 @@ static int vlc_decode_block(MimicContext *ctx, int num_coeffs, int qscale)
         /* FFmpeg's IDCT behaves somewhat different from the original code, so
          * a factor of 4 was added to the input */
 
-        coeff = vlcdec_lookup[num_bits][value];
+        coeff = ((int8_t*)vlcdec_lookup[num_bits])[value];
         if (pos < 3)
-            coeff <<= 4;
+            coeff *= 16;
         else /* TODO Use >> 10 instead of / 1001 */
             coeff = (coeff * qscale) / 1001;
 
-        block[ctx->scantable.permutated[pos]] = coeff;
+        block[ctx->permutated_scantable[pos]] = coeff;
     }
 
     return 0;
@@ -282,9 +252,10 @@ static int decode(MimicContext *ctx, int quality, int num_coeffs,
         const int is_chroma = !!plane;
         const int qscale    = av_clip(10000 - quality, is_chroma ? 1000 : 2000,
                                       10000) << 2;
-        const int stride    = ctx->flipped_ptrs[ctx->cur_index ].linesize[plane];
-        const uint8_t *src  = ctx->flipped_ptrs[ctx->prev_index].data[plane];
-        uint8_t       *dst  = ctx->flipped_ptrs[ctx->cur_index ].data[plane];
+        const int stride    = ctx->frames[ctx->cur_index ].f->linesize[plane];
+        uint8_t       *dst  = ctx->frames[ctx->cur_index ].f->data[plane];
+        /* src is unused for I frames; set to avoid UB pointer arithmetic. */
+        const uint8_t *src  = is_iframe ? dst : ctx->frames[ctx->prev_index].f->data[plane];
 
         for (y = 0; y < ctx->num_vblocks[plane]; y++) {
             for (x = 0; x < ctx->num_hblocks[plane]; x++) {
@@ -307,13 +278,12 @@ static int decode(MimicContext *ctx, int quality, int num_coeffs,
                     } else {
                         unsigned int backref = get_bits(&ctx->gb, 4);
                         int index            = (ctx->cur_index + backref) & 15;
-                        uint8_t *p           = ctx->flipped_ptrs[index].data[0];
 
-                        if (index != ctx->cur_index && p) {
-                            ff_thread_await_progress(&ctx->frames[index],
-                                                     cur_row, 0);
+                        if (index != ctx->cur_index && ctx->frames[index].f) {
+                            const uint8_t *p = ctx->frames[index].f->data[0];
+                            ff_progress_frame_await(&ctx->frames[index], cur_row);
                             p += src -
-                                 ctx->flipped_ptrs[ctx->prev_index].data[plane];
+                                 ctx->frames[ctx->prev_index].f->data[plane];
                             ctx->hdsp.put_pixels_tab[1][0](dst, p, stride, 8);
                         } else {
                             av_log(ctx->avctx, AV_LOG_ERROR,
@@ -321,8 +291,7 @@ static int decode(MimicContext *ctx, int quality, int num_coeffs,
                         }
                     }
                 } else {
-                    ff_thread_await_progress(&ctx->frames[ctx->prev_index],
-                                             cur_row, 0);
+                    ff_progress_frame_await(&ctx->frames[ctx->prev_index], cur_row);
                     ctx->hdsp.put_pixels_tab[1][0](dst, src, stride, 8);
                 }
                 src += 8;
@@ -331,8 +300,7 @@ static int decode(MimicContext *ctx, int quality, int num_coeffs,
             src += (stride - ctx->num_hblocks[plane]) << 3;
             dst += (stride - ctx->num_hblocks[plane]) << 3;
 
-            ff_thread_report_progress(&ctx->frames[ctx->cur_index],
-                                      cur_row++, 0);
+            ff_progress_frame_report(&ctx->frames[ctx->cur_index], cur_row++);
         }
     }
 
@@ -340,20 +308,21 @@ static int decode(MimicContext *ctx, int quality, int num_coeffs,
 }
 
 /**
- * Flip the buffer upside-down and put it in the YVU order to match the
+ * Flip the buffer upside-down and put it in the YVU order to revert the
  * way Mimic encodes frames.
  */
-static void prepare_avpic(MimicContext *ctx, AVPicture *dst, AVFrame *src)
+static void flip_swap_frame(AVFrame *f)
 {
     int i;
-    dst->data[0] = src->data[0] + ( ctx->avctx->height       - 1) * src->linesize[0];
-    dst->data[1] = src->data[2] + ((ctx->avctx->height >> 1) - 1) * src->linesize[2];
-    dst->data[2] = src->data[1] + ((ctx->avctx->height >> 1) - 1) * src->linesize[1];
+    uint8_t *data_1 = f->data[1];
+    f->data[0] = f->data[0] + ( f->height       - 1) * f->linesize[0];
+    f->data[1] = f->data[2] + ((f->height >> 1) - 1) * f->linesize[2];
+    f->data[2] = data_1     + ((f->height >> 1) - 1) * f->linesize[1];
     for (i = 0; i < 3; i++)
-        dst->linesize[i] = -src->linesize[i];
+        f->linesize[i] *= -1;
 }
 
-static int mimic_decode_frame(AVCodecContext *avctx, void *data,
+static int mimic_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
                               int *got_frame, AVPacket *avpkt)
 {
     const uint8_t *buf = avpkt->data;
@@ -390,12 +359,14 @@ static int mimic_decode_frame(AVCodecContext *avctx, void *data,
             return AVERROR_INVALIDDATA;
         }
 
+        res = ff_set_dimensions(avctx, width, height);
+        if (res < 0)
+            return res;
+
         ctx->avctx     = avctx;
-        avctx->width   = width;
-        avctx->height  = height;
         avctx->pix_fmt = AV_PIX_FMT_YUV420P;
         for (i = 0; i < 3; i++) {
-            ctx->num_vblocks[i] = FF_CEIL_RSHIFT(height,   3 + !!i);
+            ctx->num_vblocks[i] = AV_CEIL_RSHIFT(height,   3 + !!i);
             ctx->num_hblocks[i] =                width >> (3 + !!i);
         }
     } else if (width != ctx->avctx->width || height != ctx->avctx->height) {
@@ -403,23 +374,21 @@ static int mimic_decode_frame(AVCodecContext *avctx, void *data,
         return AVERROR_PATCHWELCOME;
     }
 
-    if (is_pframe && !ctx->frames[ctx->prev_index].f->data[0]) {
+    if (is_pframe && !ctx->frames[ctx->prev_index].f) {
         av_log(avctx, AV_LOG_ERROR, "decoding must start with keyframe\n");
         return AVERROR_INVALIDDATA;
     }
 
-    ff_thread_release_buffer(avctx, &ctx->frames[ctx->cur_index]);
+    ff_progress_frame_unref(&ctx->frames[ctx->cur_index]);
+    res = ff_progress_frame_get_buffer(avctx, &ctx->frames[ctx->cur_index],
+                                       AV_GET_BUFFER_FLAG_REF);
+    if (res < 0)
+        return res;
     ctx->frames[ctx->cur_index].f->pict_type = is_pframe ? AV_PICTURE_TYPE_P :
                                                            AV_PICTURE_TYPE_I;
-    if ((res = ff_thread_get_buffer(avctx, &ctx->frames[ctx->cur_index],
-                                    AV_GET_BUFFER_FLAG_REF)) < 0)
-        return res;
 
     ctx->next_prev_index = ctx->cur_index;
     ctx->next_cur_index  = (ctx->cur_index - 1) & 15;
-
-    prepare_avpic(ctx, &ctx->flipped_ptrs[ctx->cur_index],
-                  ctx->frames[ctx->cur_index].f);
 
     ff_thread_finish_setup(avctx);
 
@@ -433,53 +402,36 @@ static int mimic_decode_frame(AVCodecContext *avctx, void *data,
     init_get_bits(&ctx->gb, ctx->swap_buf, swap_buf_size << 3);
 
     res = decode(ctx, quality, num_coeffs, !is_pframe);
-    ff_thread_report_progress(&ctx->frames[ctx->cur_index], INT_MAX, 0);
+    ff_progress_frame_report(&ctx->frames[ctx->cur_index], INT_MAX);
     if (res < 0) {
-        if (!(avctx->active_thread_type & FF_THREAD_FRAME)) {
-            ff_thread_release_buffer(avctx, &ctx->frames[ctx->cur_index]);
-            return res;
-        }
+        if (!(avctx->active_thread_type & FF_THREAD_FRAME))
+            ff_progress_frame_unref(&ctx->frames[ctx->cur_index]);
+        return res;
     }
 
-    if ((res = av_frame_ref(data, ctx->frames[ctx->cur_index].f)) < 0)
+    if ((res = av_frame_ref(rframe, ctx->frames[ctx->cur_index].f)) < 0)
         return res;
     *got_frame      = 1;
+
+    flip_swap_frame(rframe);
 
     ctx->prev_index = ctx->next_prev_index;
     ctx->cur_index  = ctx->next_cur_index;
 
-    /* Only release frames that aren't used for backreferences anymore */
-    ff_thread_release_buffer(avctx, &ctx->frames[ctx->cur_index]);
-
     return buf_size;
 }
 
-static av_cold int mimic_init_thread_copy(AVCodecContext *avctx)
-{
-    MimicContext *ctx = avctx->priv_data;
-    int i;
-
-    for (i = 0; i < FF_ARRAY_ELEMS(ctx->frames); i++) {
-        ctx->frames[i].f = av_frame_alloc();
-        if (!ctx->frames[i].f) {
-            mimic_decode_end(avctx);
-            return AVERROR(ENOMEM);
-        }
-    }
-
-    return 0;
-}
-
-AVCodec ff_mimic_decoder = {
-    .name                  = "mimic",
-    .long_name             = NULL_IF_CONFIG_SMALL("Mimic"),
-    .type                  = AVMEDIA_TYPE_VIDEO,
-    .id                    = AV_CODEC_ID_MIMIC,
+const FFCodec ff_mimic_decoder = {
+    .p.name                = "mimic",
+    CODEC_LONG_NAME("Mimic"),
+    .p.type                = AVMEDIA_TYPE_VIDEO,
+    .p.id                  = AV_CODEC_ID_MIMIC,
     .priv_data_size        = sizeof(MimicContext),
     .init                  = mimic_decode_init,
     .close                 = mimic_decode_end,
-    .decode                = mimic_decode_frame,
-    .capabilities          = CODEC_CAP_DR1 | CODEC_CAP_FRAME_THREADS,
-    .update_thread_context = ONLY_IF_THREADS_ENABLED(mimic_decode_update_thread_context),
-    .init_thread_copy      = ONLY_IF_THREADS_ENABLED(mimic_init_thread_copy),
+    FF_CODEC_DECODE_CB(mimic_decode_frame),
+    .p.capabilities        = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_FRAME_THREADS,
+    UPDATE_THREAD_CONTEXT(mimic_decode_update_thread_context),
+    .caps_internal         = FF_CODEC_CAP_USES_PROGRESSFRAMES |
+                             FF_CODEC_CAP_INIT_CLEANUP,
 };

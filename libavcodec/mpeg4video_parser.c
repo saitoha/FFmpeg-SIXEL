@@ -1,5 +1,5 @@
 /*
- * MPEG4 Video frame extraction
+ * MPEG-4 video frame extraction
  * Copyright (c) 2003 Fabrice Bellard
  * Copyright (c) 2003 Michael Niedermayer
  *
@@ -22,11 +22,11 @@
 
 #define UNCHECKED_BITSTREAM_READER 1
 
-#include "internal.h"
+#include "decode.h"
 #include "parser.h"
 #include "mpegvideo.h"
-#include "mpeg4video.h"
-#include "mpeg4video_parser.h"
+#include "mpeg4videodec.h"
+#include "mpeg4videodefs.h"
 
 struct Mp4vParseContext {
     ParseContext pc;
@@ -34,7 +34,11 @@ struct Mp4vParseContext {
     int first_picture;
 };
 
-int ff_mpeg4_find_frame_end(ParseContext *pc, const uint8_t *buf, int buf_size)
+/**
+ * Find the end of the current frame in the bitstream.
+ * @return the position of the first byte of the next frame, or -1
+ */
+static int mpeg4_find_frame_end(ParseContext *pc, const uint8_t *buf, int buf_size)
 {
     int vop_found, i;
     uint32_t state;
@@ -46,7 +50,7 @@ int ff_mpeg4_find_frame_end(ParseContext *pc, const uint8_t *buf, int buf_size)
     if (!vop_found) {
         for (i = 0; i < buf_size; i++) {
             state = (state << 8) | buf[i];
-            if (state == 0x1B6) {
+            if (state == VOP_STARTCODE) {
                 i++;
                 vop_found = 1;
                 break;
@@ -61,6 +65,8 @@ int ff_mpeg4_find_frame_end(ParseContext *pc, const uint8_t *buf, int buf_size)
         for (; i < buf_size; i++) {
             state = (state << 8) | buf[i];
             if ((state & 0xFFFFFF00) == 0x100) {
+                if (state == SLICE_STARTCODE || state == EXT_STARTCODE)
+                    continue;
                 pc->frame_start_found = 0;
                 pc->state             = -1;
                 return i - 3;
@@ -78,33 +84,33 @@ static int mpeg4_decode_header(AVCodecParserContext *s1, AVCodecContext *avctx,
 {
     struct Mp4vParseContext *pc = s1->priv_data;
     Mpeg4DecContext *dec_ctx = &pc->dec_ctx;
-    MpegEncContext *s = &dec_ctx->m;
+    MPVContext *const s = &dec_ctx->h.c;
     GetBitContext gb1, *gb = &gb1;
     int ret;
 
     s->avctx               = avctx;
-    s->current_picture_ptr = &s->current_picture;
 
     if (avctx->extradata_size && pc->first_picture) {
         init_get_bits(gb, avctx->extradata, avctx->extradata_size * 8);
-        ret = ff_mpeg4_decode_picture_header(dec_ctx, gb);
-        if (ret < -1)
+        ret = ff_mpeg4_parse_picture_header(dec_ctx, gb, 1, 1);
+        if (ret < 0)
             av_log(avctx, AV_LOG_WARNING, "Failed to parse extradata\n");
     }
 
     init_get_bits(gb, buf, 8 * buf_size);
-    ret = ff_mpeg4_decode_picture_header(dec_ctx, gb);
+    ret = ff_mpeg4_parse_picture_header(dec_ctx, gb, 0, 1);
+    avctx->has_b_frames = !s->low_delay;
     if (s->width && (!avctx->width || !avctx->height ||
                      !avctx->coded_width || !avctx->coded_height)) {
         ret = ff_set_dimensions(avctx, s->width, s->height);
         if (ret < 0)
             return ret;
     }
-    if((s1->flags & PARSER_FLAG_USE_CODEC_TS) && s->avctx->time_base.den>0 && ret>=0){
+    if((s1->flags & PARSER_FLAG_USE_CODEC_TS) && s->avctx->framerate.num>0 && ret>=0){
         av_assert1(s1->pts == AV_NOPTS_VALUE);
         av_assert1(s1->dts == AV_NOPTS_VALUE);
 
-        s1->pts = av_rescale_q(s->time, (AVRational){1, s->avctx->time_base.den}, (AVRational){1, 1200000});
+        s1->pts = av_rescale_q(s->time, (AVRational){1, s->avctx->framerate.num}, (AVRational){1, 1200000});
     }
 
     s1->pict_type     = s->pict_type;
@@ -116,11 +122,9 @@ static av_cold int mpeg4video_parse_init(AVCodecParserContext *s)
 {
     struct Mp4vParseContext *pc = s->priv_data;
 
-    ff_mpeg4videodec_static_init();
-
     pc->first_picture           = 1;
-    pc->dec_ctx.m.quant_precision     = 5;
-    pc->dec_ctx.m.slice_context_count = 1;
+    pc->dec_ctx.quant_precision       = 5;
+    pc->dec_ctx.h.c.slice_context_count = 1;
     pc->dec_ctx.showed_packed_warning = 1;
     return 0;
 }
@@ -136,7 +140,7 @@ static int mpeg4video_parse(AVCodecParserContext *s,
     if (s->flags & PARSER_FLAG_COMPLETE_FRAMES) {
         next = buf_size;
     } else {
-        next = ff_mpeg4_find_frame_end(pc, buf, buf_size);
+        next = mpeg4_find_frame_end(pc, buf, buf_size);
 
         if (ff_combine_frame(pc, next, &buf, &buf_size) < 0) {
             *poutbuf      = NULL;
@@ -151,11 +155,10 @@ static int mpeg4video_parse(AVCodecParserContext *s,
     return next;
 }
 
-AVCodecParser ff_mpeg4video_parser = {
+const AVCodecParser ff_mpeg4video_parser = {
     .codec_ids      = { AV_CODEC_ID_MPEG4 },
     .priv_data_size = sizeof(struct Mp4vParseContext),
     .parser_init    = mpeg4video_parse_init,
     .parser_parse   = mpeg4video_parse,
     .parser_close   = ff_parse_close,
-    .split          = ff_mpeg4video_split,
 };

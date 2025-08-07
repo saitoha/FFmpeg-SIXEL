@@ -18,12 +18,12 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "libavutil/avstring.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/samplefmt.h"
 #include "avfilter.h"
 #include "audio.h"
-#include "internal.h"
+#include "filters.h"
 #include "generate_wave_table.h"
 
 #define INTERPOLATION_LINEAR    0
@@ -58,21 +58,21 @@ static const AVOption flanger_options[] = {
     { "regen", "percentage regeneration (delayed signal feedback)", OFFSET(feedback_gain), AV_OPT_TYPE_DOUBLE, {.dbl=0}, -95, 95, A },
     { "width", "percentage of delayed signal mixed with original", OFFSET(delay_gain), AV_OPT_TYPE_DOUBLE, {.dbl=71}, 0, 100, A },
     { "speed", "sweeps per second (Hz)", OFFSET(speed), AV_OPT_TYPE_DOUBLE, {.dbl=0.5}, 0.1, 10, A },
-    { "shape", "swept wave shape", OFFSET(wave_shape), AV_OPT_TYPE_INT, {.i64=WAVE_SIN}, WAVE_SIN, WAVE_NB-1, A, "type" },
-    { "triangular",  NULL, 0, AV_OPT_TYPE_CONST,  {.i64=WAVE_TRI}, 0, 0, A, "type" },
-    { "t",           NULL, 0, AV_OPT_TYPE_CONST,  {.i64=WAVE_TRI}, 0, 0, A, "type" },
-    { "sinusoidal",  NULL, 0, AV_OPT_TYPE_CONST,  {.i64=WAVE_SIN}, 0, 0, A, "type" },
-    { "s",           NULL, 0, AV_OPT_TYPE_CONST,  {.i64=WAVE_SIN}, 0, 0, A, "type" },
+    { "shape", "swept wave shape", OFFSET(wave_shape), AV_OPT_TYPE_INT, {.i64=WAVE_SIN}, WAVE_SIN, WAVE_NB-1, A, .unit = "type" },
+    { "triangular",  NULL, 0, AV_OPT_TYPE_CONST,  {.i64=WAVE_TRI}, 0, 0, A, .unit = "type" },
+    { "t",           NULL, 0, AV_OPT_TYPE_CONST,  {.i64=WAVE_TRI}, 0, 0, A, .unit = "type" },
+    { "sinusoidal",  NULL, 0, AV_OPT_TYPE_CONST,  {.i64=WAVE_SIN}, 0, 0, A, .unit = "type" },
+    { "s",           NULL, 0, AV_OPT_TYPE_CONST,  {.i64=WAVE_SIN}, 0, 0, A, .unit = "type" },
     { "phase", "swept wave percentage phase-shift for multi-channel", OFFSET(channel_phase), AV_OPT_TYPE_DOUBLE, {.dbl=25}, 0, 100, A },
-    { "interp", "delay-line interpolation", OFFSET(interpolation), AV_OPT_TYPE_INT, {.i64=0}, 0, 1, A, "itype" },
-    { "linear",     NULL, 0, AV_OPT_TYPE_CONST,  {.i64=INTERPOLATION_LINEAR},    0, 0, A, "itype" },
-    { "quadratic",  NULL, 0, AV_OPT_TYPE_CONST,  {.i64=INTERPOLATION_QUADRATIC}, 0, 0, A, "itype" },
+    { "interp", "delay-line interpolation", OFFSET(interpolation), AV_OPT_TYPE_INT, {.i64=0}, 0, 1, A, .unit = "itype" },
+    { "linear",     NULL, 0, AV_OPT_TYPE_CONST,  {.i64=INTERPOLATION_LINEAR},    0, 0, A, .unit = "itype" },
+    { "quadratic",  NULL, 0, AV_OPT_TYPE_CONST,  {.i64=INTERPOLATION_QUADRATIC}, 0, 0, A, .unit = "itype" },
     { NULL }
 };
 
 AVFILTER_DEFINE_CLASS(flanger);
 
-static int init(AVFilterContext *ctx)
+static av_cold int init(AVFilterContext *ctx)
 {
     FlangerContext *s = ctx->priv;
 
@@ -88,35 +88,6 @@ static int init(AVFilterContext *ctx)
     return 0;
 }
 
-static int query_formats(AVFilterContext *ctx)
-{
-    AVFilterChannelLayouts *layouts;
-    AVFilterFormats *formats;
-    static const enum AVSampleFormat sample_fmts[] = {
-        AV_SAMPLE_FMT_DBLP, AV_SAMPLE_FMT_NONE
-    };
-    int ret;
-
-    layouts = ff_all_channel_layouts();
-    if (!layouts)
-        return AVERROR(ENOMEM);
-    ret = ff_set_common_channel_layouts(ctx, layouts);
-    if (ret < 0)
-        return ret;
-
-    formats = ff_make_format_list(sample_fmts);
-    if (!formats)
-        return AVERROR(ENOMEM);
-    ret = ff_set_common_formats(ctx, formats);
-    if (ret < 0)
-        return ret;
-
-    formats = ff_all_samplerates();
-    if (!formats)
-        return AVERROR(ENOMEM);
-    return ff_set_common_samplerates(ctx, formats);
-}
-
 static int config_input(AVFilterLink *inlink)
 {
     AVFilterContext *ctx = inlink->dst;
@@ -124,17 +95,17 @@ static int config_input(AVFilterLink *inlink)
 
     s->max_samples = (s->delay_min + s->delay_depth) * inlink->sample_rate + 2.5;
     s->lfo_length  = inlink->sample_rate / s->speed;
-    s->delay_last  = av_calloc(inlink->channels, sizeof(*s->delay_last));
+    s->delay_last  = av_calloc(inlink->ch_layout.nb_channels, sizeof(*s->delay_last));
     s->lfo         = av_calloc(s->lfo_length, sizeof(*s->lfo));
     if (!s->lfo || !s->delay_last)
         return AVERROR(ENOMEM);
 
     ff_generate_wave_table(s->wave_shape, AV_SAMPLE_FMT_FLT, s->lfo, s->lfo_length,
-                           floor(s->delay_min * inlink->sample_rate + 0.5),
+                           rint(s->delay_min * inlink->sample_rate),
                            s->max_samples - 2., 3 * M_PI_2);
 
     return av_samples_alloc_array_and_samples(&s->delay_buffer, NULL,
-                                              inlink->channels, s->max_samples,
+                                              inlink->ch_layout.nb_channels, s->max_samples,
                                               inlink->format, 0);
 }
 
@@ -148,9 +119,11 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
     if (av_frame_is_writable(frame)) {
         out_frame = frame;
     } else {
-        out_frame = ff_get_audio_buffer(inlink, frame->nb_samples);
-        if (!out_frame)
+        out_frame = ff_get_audio_buffer(ctx->outputs[0], frame->nb_samples);
+        if (!out_frame) {
+            av_frame_free(&frame);
             return AVERROR(ENOMEM);
+        }
         av_frame_copy_props(out_frame, frame);
     }
 
@@ -158,7 +131,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
 
         s->delay_buf_pos = (s->delay_buf_pos + s->max_samples - 1) % s->max_samples;
 
-        for (chan = 0; chan < inlink->channels; chan++) {
+        for (chan = 0; chan < inlink->ch_layout.nb_channels; chan++) {
             double *src = (double *)frame->extended_data[chan];
             double *dst = (double *)out_frame->extended_data[chan];
             double delayed_0, delayed_1;
@@ -220,25 +193,16 @@ static const AVFilterPad flanger_inputs[] = {
         .config_props = config_input,
         .filter_frame = filter_frame,
     },
-    { NULL }
 };
 
-static const AVFilterPad flanger_outputs[] = {
-    {
-        .name          = "default",
-        .type          = AVMEDIA_TYPE_AUDIO,
-    },
-    { NULL }
-};
-
-AVFilter ff_af_flanger = {
-    .name          = "flanger",
-    .description   = NULL_IF_CONFIG_SMALL("Apply a flanging effect to the audio."),
-    .query_formats = query_formats,
+const FFFilter ff_af_flanger = {
+    .p.name        = "flanger",
+    .p.description = NULL_IF_CONFIG_SMALL("Apply a flanging effect to the audio."),
+    .p.priv_class  = &flanger_class,
     .priv_size     = sizeof(FlangerContext),
-    .priv_class    = &flanger_class,
     .init          = init,
     .uninit        = uninit,
-    .inputs        = flanger_inputs,
-    .outputs       = flanger_outputs,
+    FILTER_INPUTS(flanger_inputs),
+    FILTER_OUTPUTS(ff_audio_default_filterpad),
+    FILTER_SINGLE_SAMPLEFMT(AV_SAMPLE_FMT_DBLP),
 };

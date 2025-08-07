@@ -21,7 +21,7 @@
 
 /**
  * @file
- * H.264 / AVC / MPEG4 part10 prediction functions.
+ * H.264 / AVC / MPEG-4 part10 prediction functions.
  * @author Michael Niedermayer <michaelni@gmx.at>
  */
 
@@ -104,32 +104,6 @@ static void FUNCC(pred4x4_128_dc)(uint8_t *_src, const uint8_t *topright,
     pixel *src = (pixel*)_src;
     int stride = _stride>>(sizeof(pixel)-1);
     const pixel4 a = PIXEL_SPLAT_X4(1<<(BIT_DEPTH-1));
-
-    AV_WN4PA(src+0*stride, a);
-    AV_WN4PA(src+1*stride, a);
-    AV_WN4PA(src+2*stride, a);
-    AV_WN4PA(src+3*stride, a);
-}
-
-static void FUNCC(pred4x4_127_dc)(uint8_t *_src, const uint8_t *topright,
-                                  ptrdiff_t _stride)
-{
-    pixel *src = (pixel*)_src;
-    int stride = _stride>>(sizeof(pixel)-1);
-    const pixel4 a = PIXEL_SPLAT_X4((1<<(BIT_DEPTH-1))-1);
-
-    AV_WN4PA(src+0*stride, a);
-    AV_WN4PA(src+1*stride, a);
-    AV_WN4PA(src+2*stride, a);
-    AV_WN4PA(src+3*stride, a);
-}
-
-static void FUNCC(pred4x4_129_dc)(uint8_t *_src, const uint8_t *topright,
-                                  ptrdiff_t _stride)
-{
-    pixel *src = (pixel*)_src;
-    int stride = _stride>>(sizeof(pixel)-1);
-    const pixel4 a = PIXEL_SPLAT_X4((1<<(BIT_DEPTH-1))+1);
 
     AV_WN4PA(src+0*stride, a);
     AV_WN4PA(src+1*stride, a);
@@ -427,9 +401,11 @@ static void FUNCC(pred16x16_##n##_dc)(uint8_t *_src, ptrdiff_t stride)\
     PREDICT_16x16_DC(PIXEL_SPLAT_X4(v));\
 }
 
-PRED16x16_X(127, (1<<(BIT_DEPTH-1))-1)
 PRED16x16_X(128, (1<<(BIT_DEPTH-1))+0)
+#if BIT_DEPTH == 8
+PRED16x16_X(127, (1<<(BIT_DEPTH-1))-1)
 PRED16x16_X(129, (1<<(BIT_DEPTH-1))+1)
+#endif
 
 static inline void FUNCC(pred16x16_plane_compat)(uint8_t *_src,
                                                  ptrdiff_t _stride,
@@ -438,7 +414,6 @@ static inline void FUNCC(pred16x16_plane_compat)(uint8_t *_src,
 {
   int i, j, k;
   int a;
-  INIT_CLIP
   pixel *src = (pixel*)_src;
   int stride = _stride>>(sizeof(pixel)-1);
   const pixel * const src0 = src +7-stride;
@@ -551,9 +526,11 @@ static void FUNCC(pred8x8_##n##_dc)(uint8_t *_src, ptrdiff_t stride)\
     }\
 }
 
-PRED8x8_X(127, (1<<(BIT_DEPTH-1))-1)
 PRED8x8_X(128, (1<<(BIT_DEPTH-1))+0)
+#if BIT_DEPTH == 8
+PRED8x8_X(127, (1<<(BIT_DEPTH-1))-1)
 PRED8x8_X(129, (1<<(BIT_DEPTH-1))+1)
+#endif
 
 static void FUNCC(pred8x16_128_dc)(uint8_t *_src, ptrdiff_t stride)
 {
@@ -770,7 +747,6 @@ static void FUNCC(pred8x8_plane)(uint8_t *_src, ptrdiff_t _stride)
 {
   int j, k;
   int a;
-  INIT_CLIP
   pixel *src = (pixel*)_src;
   int stride = _stride>>(sizeof(pixel)-1);
   const pixel * const src0 = src +3-stride;
@@ -806,7 +782,6 @@ static void FUNCC(pred8x16_plane)(uint8_t *_src, ptrdiff_t _stride)
 {
   int j, k;
   int a;
-  INIT_CLIP
   pixel *src = (pixel*)_src;
   int stride = _stride>>(sizeof(pixel)-1);
   const pixel * const src0 = src +3-stride;

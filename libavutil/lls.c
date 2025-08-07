@@ -28,8 +28,9 @@
 #include <math.h>
 #include <string.h>
 
+#include "config.h"
 #include "attributes.h"
-#include "version.h"
+#include "float_dsp.h"
 #include "lls.h"
 
 static void update_lls(LLSModel *m, const double *var)
@@ -55,7 +56,7 @@ void avpriv_solve_lls(LLSModel *m, double threshold, unsigned short min_order)
         for (j = i; j < count; j++) {
             double sum = covar[i][j];
 
-            for (k = i - 1; k >= 0; k--)
+            for (k = 0; k <= i-1; k++)
                 sum -= factor[i][k] * factor[j][k];
 
             if (i == j) {
@@ -71,7 +72,7 @@ void avpriv_solve_lls(LLSModel *m, double threshold, unsigned short min_order)
     for (i = 0; i < count; i++) {
         double sum = covar_y[i + 1];
 
-        for (k = i - 1; k >= 0; k--)
+        for (k = 0; k <= i-1; k++)
             sum -= factor[i][k] * m->coeff[0][k];
 
         m->coeff[0][i] = sum / factor[i][i];
@@ -102,13 +103,7 @@ void avpriv_solve_lls(LLSModel *m, double threshold, unsigned short min_order)
 
 static double evaluate_lls(LLSModel *m, const double *param, int order)
 {
-    int i;
-    double out = 0;
-
-    for (i = 0; i <= order; i++)
-        out += param[i] * m->coeff[order][i];
-
-    return out;
+    return ff_scalarproduct_double_c(m->coeff[order], param, order + 1);
 }
 
 av_cold void avpriv_init_lls(LLSModel *m, int indep_count)
@@ -117,44 +112,9 @@ av_cold void avpriv_init_lls(LLSModel *m, int indep_count)
     m->indep_count = indep_count;
     m->update_lls = update_lls;
     m->evaluate_lls = evaluate_lls;
-    if (ARCH_X86)
-        ff_init_lls_x86(m);
-}
-
-#ifdef TEST
-
-#include <stdio.h>
-#include <limits.h>
-#include "lfg.h"
-
-int main(void)
-{
-    LLSModel m;
-    int i, order;
-    AVLFG lfg;
-
-    av_lfg_init(&lfg, 1);
-    avpriv_init_lls(&m, 3);
-
-    for (i = 0; i < 100; i++) {
-        LOCAL_ALIGNED(32, double, var, [4]);
-        double eval;
-
-        var[0] = (av_lfg_get(&lfg) / (double) UINT_MAX - 0.5) * 2;
-        var[1] = var[0] + av_lfg_get(&lfg) / (double) UINT_MAX - 0.5;
-        var[2] = var[1] + av_lfg_get(&lfg) / (double) UINT_MAX - 0.5;
-        var[3] = var[2] + av_lfg_get(&lfg) / (double) UINT_MAX - 0.5;
-        m.update_lls(&m, var);
-        avpriv_solve_lls(&m, 0.001, 0);
-        for (order = 0; order < 3; order++) {
-            eval = m.evaluate_lls(&m, var + 1, order);
-            printf("real:%9f order:%d pred:%9f var:%f coeffs:%f %9f %9f\n",
-                   var[0], order, eval, sqrt(m.variance[order] / (i + 1)),
-                   m.coeff[order][0], m.coeff[order][1],
-                   m.coeff[order][2]);
-        }
-    }
-    return 0;
-}
-
+#if ARCH_RISCV
+    ff_init_lls_riscv(m);
+#elif ARCH_X86
+    ff_init_lls_x86(m);
 #endif
+}

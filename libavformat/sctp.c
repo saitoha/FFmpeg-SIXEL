@@ -116,7 +116,7 @@ static int ff_sctp_recvmsg(int s, void *msg, size_t len, struct sockaddr *from,
 static int ff_sctp_send(int s, const void *msg, size_t len,
                         const struct sctp_sndrcvinfo *sinfo, int flags)
 {
-    struct msghdr outmsg;
+    struct msghdr outmsg = { 0 };
     struct iovec iov;
 
     outmsg.msg_name       = NULL;
@@ -161,7 +161,7 @@ typedef struct SCTPContext {
 #define D AV_OPT_FLAG_DECODING_PARAM
 #define E AV_OPT_FLAG_ENCODING_PARAM
 static const AVOption options[] = {
-    { "listen",          "Listen for incoming connections",  OFFSET(listen),         AV_OPT_TYPE_INT, { .i64 = 0 },     0,       1,         .flags = D|E },
+    { "listen",          "Listen for incoming connections",  OFFSET(listen),         AV_OPT_TYPE_BOOL,{ .i64 = 0 },     0,       1,         .flags = D|E },
     { "timeout",         "Connection timeout (in milliseconds)", OFFSET(timeout),    AV_OPT_TYPE_INT, { .i64 = 10000 }, INT_MIN, INT_MAX,   .flags = D|E },
     { "listen_timeout",  "Bind timeout (in milliseconds)",   OFFSET(listen_timeout), AV_OPT_TYPE_INT, { .i64 = -1 },    INT_MIN, INT_MAX,   .flags = D|E },
     { "max_streams",     "Max stream to allocate",           OFFSET(max_streams), AV_OPT_TYPE_INT, { .i64 = 0 },              0, INT16_MAX, .flags = D|E },
@@ -220,7 +220,7 @@ static int sctp_open(URLContext *h, const char *uri, int flags)
     cur_ai = ai;
 
 restart:
-    fd = ff_socket(cur_ai->ai_family, SOCK_STREAM, IPPROTO_SCTP);
+    fd = ff_socket(cur_ai->ai_family, SOCK_STREAM, IPPROTO_SCTP, h);
     if (fd < 0) {
         ret = ff_neterrno();
         goto fail;
@@ -282,6 +282,8 @@ fail:
         goto restart;
     }
 fail1:
+    if (fd >= 0)
+        closesocket(fd);
     ret = AVERROR(EIO);
     freeaddrinfo(ai);
     return ret;
@@ -359,7 +361,7 @@ static int sctp_get_file_handle(URLContext *h)
     return s->fd;
 }
 
-URLProtocol ff_sctp_protocol = {
+const URLProtocol ff_sctp_protocol = {
     .name                = "sctp",
     .url_open            = sctp_open,
     .url_read            = sctp_read,

@@ -24,7 +24,7 @@
 #define WFRAC_BITS  16   // fractional bits for window
 #define OUT_SHIFT (WFRAC_BITS + FRAC_BITS - 15)
 
-const   tbl_rev128.s, align=4
+const   tbl_rev128_s, align=4
         .byte           12, 13, 14, 15
         .byte            8,  9, 10, 11
         .byte            4,  5,  6,  7
@@ -34,13 +34,12 @@ endconst
 .macro   apply_window   type, st
 function ff_mpadsp_apply_window_\type\()_neon, export=1
         mov             x7,  x0
-        sxtw            x4,  w4  // incr
         add             x8,  x0,  #512<<2
         ld1             {v0.4s,v1.4s,v2.4s,v3.4s},  [x7],  #64
         ld1             {v4.4s,v5.4s,v6.4s,v7.4s},  [x7],  #64
         st1             {v0.4s,v1.4s,v2.4s,v3.4s},  [x8],  #64
         st1             {v4.4s,v5.4s,v6.4s,v7.4s},  [x8],  #64
-        movrel          x15, tbl_rev128.s
+        movrel          x15, tbl_rev128_s
         ld1             {v27.4s}, [x15]
 .ifc \type, fixed
         lsl             x4,  x4,  #1
@@ -57,7 +56,7 @@ function ff_mpadsp_apply_window_\type\()_neon, export=1
 .ifc \type, fixed
         ld1r            {v16.2s}, [x2]          // dither_state
         sxtl            v16.2d, v16.2s
-        movi            v29.2d, #0
+        movi            v29.16b, #0
         movi            v30.2d, #(1<<OUT_SHIFT)-1
         trn1            v31.2d, v29.2d, v30.2d
         trn2            v30.2d, v30.2d, v29.2d
@@ -75,9 +74,9 @@ function ff_mpadsp_apply_window_\type\()_neon, export=1
         add             x11, x6, #(32)<<2      // w  + 32
         add             x12, x7, #(32)<<2      // w2 + 32
         mov             x15, #8
-        movi            v17.2d, #0
-        movi            v18.2d, #0
-        movi            v19.2d, #0
+        movi            v17.16b, #0
+        movi            v18.16b, #0
+        movi            v19.16b, #0
 2:
         subs            x15, x15, #1
         ld1             {v0.4s},  [x8],  x9
@@ -142,7 +141,7 @@ function ff_mpadsp_apply_window_\type\()_neon, export=1
         sub             x10, x10, #4<<2
         b.gt            1b
 
-// comuting samples[16]
+// computing samples[16]
         add             x6,  x1,  #32<<2
         ld1             {v0.2s},  [x6],  x9
         ld1             {v1.2s},  [x0],  x9

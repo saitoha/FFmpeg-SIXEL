@@ -22,6 +22,7 @@
 #include <string.h>
 
 #include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
 #include "avformat.h"
 #include "internal.h"
 #include "oggdec.h"
@@ -37,6 +38,7 @@ static int celt_header(AVFormatContext *s, int idx)
     AVStream *st = s->streams[idx];
     struct oggcelt_private *priv = os->private;
     uint8_t *p = os->buf + os->pstart;
+    int ret;
 
     if (os->psize == 60 &&
         !memcmp(p, ff_celt_codec.magic, ff_celt_codec.magicsize)) {
@@ -48,9 +50,10 @@ static int celt_header(AVFormatContext *s, int idx)
         priv = av_malloc(sizeof(struct oggcelt_private));
         if (!priv)
             return AVERROR(ENOMEM);
-        if (ff_alloc_extradata(st->codec, 2 * sizeof(uint32_t)) < 0) {
+        ret = ff_alloc_extradata(st->codecpar, 2 * sizeof(uint32_t));
+        if (ret < 0) {
             av_free(priv);
-            return AVERROR(ENOMEM);
+            return ret;
         }
         version          = AV_RL32(p + 28);
         /* unused header size field skipped */
@@ -59,17 +62,22 @@ static int celt_header(AVFormatContext *s, int idx)
         overlap          = AV_RL32(p + 48);
         /* unused bytes per packet field skipped */
         extra_headers    = AV_RL32(p + 56);
-        st->codec->codec_type     = AVMEDIA_TYPE_AUDIO;
-        st->codec->codec_id       = AV_CODEC_ID_CELT;
-        st->codec->sample_rate    = sample_rate;
-        st->codec->channels       = nb_channels;
+        st->codecpar->codec_type     = AVMEDIA_TYPE_AUDIO;
+        st->codecpar->codec_id       = AV_CODEC_ID_CELT;
+        st->codecpar->sample_rate    = sample_rate;
+        st->codecpar->ch_layout.nb_channels = nb_channels;
         if (sample_rate)
             avpriv_set_pts_info(st, 64, 1, sample_rate);
-        priv->extra_headers_left  = 1 + extra_headers;
-        av_free(os->private);
+
+        if (os->private) {
+            av_free(priv);
+            priv = os->private;
+        }
         os->private = priv;
-        AV_WL32(st->codec->extradata + 0, overlap);
-        AV_WL32(st->codec->extradata + 4, version);
+        priv->extra_headers_left  = 1 + extra_headers;
+
+        AV_WL32(st->codecpar->extradata + 0, overlap);
+        AV_WL32(st->codecpar->extradata + 4, version);
         return 1;
     } else if (priv && priv->extra_headers_left) {
         /* Extra headers (vorbiscomment) */

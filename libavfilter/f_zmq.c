@@ -23,17 +23,18 @@
  * receive commands through libzeromq and broker them to filters
  */
 
+#include "config_components.h"
+
 #include <zmq.h>
 #include "libavutil/avstring.h"
-#include "libavutil/bprint.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "avfilter.h"
-#include "internal.h"
-#include "avfiltergraph.h"
+#include "filters.h"
 #include "audio.h"
 #include "video.h"
 
-typedef struct {
+typedef struct ZMQContext {
     const AVClass *class;
     void *zmq;
     void *responder;
@@ -86,7 +87,7 @@ static void av_cold uninit(AVFilterContext *ctx)
     zmq_ctx_destroy(zmq->zmq);
 }
 
-typedef struct {
+typedef struct Command {
     char *target, *command, *arg;
 } Command;
 
@@ -140,7 +141,7 @@ static int recv_msg(AVFilterContext *ctx, char **buf, int *buf_size)
         ret = AVERROR(ENOMEM);
         goto end;
     }
-    memcpy(*buf, zmq_msg_data(&msg), *buf_size);
+    memcpy(*buf, zmq_msg_data(&msg), *buf_size - 1);
     (*buf)[*buf_size-1] = 0;
 
 end:
@@ -175,7 +176,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *ref)
         av_log(ctx, AV_LOG_VERBOSE,
                "Processing command #%d target:%s command:%s arg:%s\n",
                zmq->command_count, cmd.target, cmd.command, cmd.arg);
-        ret = avfilter_graph_send_command(inlink->graph,
+        ret = avfilter_graph_send_command(ff_filter_link(inlink)->graph,
                                           cmd.target, cmd.command, cmd.arg,
                                           cmd_buf, sizeof(cmd_buf),
                                           AVFILTER_CMD_FLAG_ONE);
@@ -204,10 +205,9 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *ref)
     return ff_filter_frame(ctx->outputs[0], ref);
 }
 
-#if CONFIG_ZMQ_FILTER
+AVFILTER_DEFINE_CLASS_EXT(zmq, "(a)zmq", options);
 
-#define zmq_options options
-AVFILTER_DEFINE_CLASS(zmq);
+#if CONFIG_ZMQ_FILTER
 
 static const AVFilterPad zmq_inputs[] = {
     {
@@ -215,34 +215,22 @@ static const AVFilterPad zmq_inputs[] = {
         .type         = AVMEDIA_TYPE_VIDEO,
         .filter_frame = filter_frame,
     },
-    { NULL }
 };
 
-static const AVFilterPad zmq_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-    { NULL }
-};
-
-AVFilter ff_vf_zmq = {
-    .name        = "zmq",
-    .description = NULL_IF_CONFIG_SMALL("Receive commands through ZMQ and broker them to filters."),
+const FFFilter ff_vf_zmq = {
+    .p.name        = "zmq",
+    .p.description = NULL_IF_CONFIG_SMALL("Receive commands through ZMQ and broker them to filters."),
+    .p.priv_class  = &zmq_class,
     .init        = init,
     .uninit      = uninit,
     .priv_size   = sizeof(ZMQContext),
-    .inputs      = zmq_inputs,
-    .outputs     = zmq_outputs,
-    .priv_class  = &zmq_class,
+    FILTER_INPUTS(zmq_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
 };
 
 #endif
 
 #if CONFIG_AZMQ_FILTER
-
-#define azmq_options options
-AVFILTER_DEFINE_CLASS(azmq);
 
 static const AVFilterPad azmq_inputs[] = {
     {
@@ -250,26 +238,17 @@ static const AVFilterPad azmq_inputs[] = {
         .type         = AVMEDIA_TYPE_AUDIO,
         .filter_frame = filter_frame,
     },
-    { NULL }
 };
 
-static const AVFilterPad azmq_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_AUDIO,
-    },
-    { NULL }
-};
-
-AVFilter ff_af_azmq = {
-    .name        = "azmq",
-    .description = NULL_IF_CONFIG_SMALL("Receive commands through ZMQ and broker them to filters."),
+const FFFilter ff_af_azmq = {
+    .p.name        = "azmq",
+    .p.description = NULL_IF_CONFIG_SMALL("Receive commands through ZMQ and broker them to filters."),
+    .p.priv_class  = &zmq_class,
     .init        = init,
     .uninit      = uninit,
     .priv_size   = sizeof(ZMQContext),
-    .inputs      = azmq_inputs,
-    .outputs     = azmq_outputs,
-    .priv_class  = &azmq_class,
+    FILTER_INPUTS(azmq_inputs),
+    FILTER_OUTPUTS(ff_audio_default_filterpad),
 };
 
 #endif

@@ -26,11 +26,13 @@
 
 #include <twolame.h>
 
+#include "libavutil/channel_layout.h"
 #include "libavutil/common.h"
 #include "libavutil/opt.h"
 
 #include "avcodec.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "encode.h"
 #include "mpegaudio.h"
 
 typedef struct TWOLAMEContext {
@@ -74,14 +76,18 @@ static av_cold int twolame_encode_init(AVCodecContext *avctx)
     twolame_set_copyright(s->glopts, s->copyright);
     twolame_set_original(s->glopts, s->original);
 
-    twolame_set_num_channels(s->glopts, avctx->channels);
+    twolame_set_num_channels(s->glopts, avctx->ch_layout.nb_channels);
     twolame_set_in_samplerate(s->glopts, avctx->sample_rate);
     twolame_set_out_samplerate(s->glopts, avctx->sample_rate);
 
-    if (!avctx->bit_rate)
-        avctx->bit_rate = avctx->sample_rate < 28000 ? 160000 : 384000;
+    if (!avctx->bit_rate) {
+        if ((s->mode == TWOLAME_AUTO_MODE && avctx->ch_layout.nb_channels == 1) || s->mode == TWOLAME_MONO)
+            avctx->bit_rate = avctx->sample_rate < 28000 ? 80000 : 192000;
+        else
+            avctx->bit_rate = avctx->sample_rate < 28000 ? 160000 : 384000;
+    }
 
-    if (avctx->flags & CODEC_FLAG_QSCALE || !avctx->bit_rate) {
+    if (avctx->flags & AV_CODEC_FLAG_QSCALE || !avctx->bit_rate) {
         twolame_set_VBR(s->glopts, TRUE);
         twolame_set_VBR_level(s->glopts,
                               avctx->global_quality / (float) FF_QP2LAMBDA);
@@ -106,7 +112,7 @@ static int twolame_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
     TWOLAMEContext *s = avctx->priv_data;
     int ret;
 
-    if ((ret = ff_alloc_packet2(avctx, avpkt, MPA_MAX_CODED_FRAME_SIZE)) < 0)
+    if ((ret = ff_alloc_packet(avctx, avpkt, MPA_MAX_CODED_FRAME_SIZE)) < 0)
         return ret;
 
     if (frame) {
@@ -171,12 +177,12 @@ static int twolame_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
 #define OFFSET(x) offsetof(TWOLAMEContext, x)
 #define AE AV_OPT_FLAG_AUDIO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
 static const AVOption options[] = {
-    { "mode", "Mpeg Mode", OFFSET(mode), AV_OPT_TYPE_INT, { .i64 = TWOLAME_AUTO_MODE }, TWOLAME_AUTO_MODE, TWOLAME_MONO, AE, "mode"},
-        { "auto", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = TWOLAME_AUTO_MODE }, 0, 0, AE, "mode" },
-        { "stereo", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = TWOLAME_STEREO }, 0, 0, AE, "mode" },
-        { "joint_stereo", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = TWOLAME_JOINT_STEREO }, 0, 0, AE, "mode" },
-        { "dual_channel", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = TWOLAME_DUAL_CHANNEL }, 0, 0, AE, "mode" },
-        { "mono", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = TWOLAME_MONO }, 0, 0, AE, "mode" },
+    { "mode", "Mpeg Mode", OFFSET(mode), AV_OPT_TYPE_INT, { .i64 = TWOLAME_AUTO_MODE }, TWOLAME_AUTO_MODE, TWOLAME_MONO, AE, .unit = "mode"},
+        { "auto", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = TWOLAME_AUTO_MODE }, 0, 0, AE, .unit = "mode" },
+        { "stereo", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = TWOLAME_STEREO }, 0, 0, AE, .unit = "mode" },
+        { "joint_stereo", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = TWOLAME_JOINT_STEREO }, 0, 0, AE, .unit = "mode" },
+        { "dual_channel", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = TWOLAME_DUAL_CHANNEL }, 0, 0, AE, .unit = "mode" },
+        { "mono", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = TWOLAME_MONO }, 0, 0, AE, .unit = "mode" },
     { "psymodel", "Psychoacoustic Model", OFFSET(psymodel), AV_OPT_TYPE_INT, { .i64 = 3 }, -1, 4, AE},
     { "energy_levels","enable energy levels", OFFSET(energy), AV_OPT_TYPE_INT, { .i64 = 0 },  0, 1, AE},
     { "error_protection","enable CRC error protection", OFFSET(error_protection), AV_OPT_TYPE_INT, { .i64 = 0 },  0, 1, AE},
@@ -193,7 +199,7 @@ static const AVClass twolame_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-static const AVCodecDefault twolame_defaults[] = {
+static const FFCodecDefault twolame_defaults[] = {
     { "b", "0" },
     { NULL },
 };
@@ -202,28 +208,22 @@ static const int twolame_samplerates[] = {
     16000, 22050, 24000, 32000, 44100, 48000, 0
 };
 
-AVCodec ff_libtwolame_encoder = {
-    .name           = "libtwolame",
-    .long_name      = NULL_IF_CONFIG_SMALL("libtwolame MP2 (MPEG audio layer 2)"),
-    .type           = AVMEDIA_TYPE_AUDIO,
-    .id             = AV_CODEC_ID_MP2,
+const FFCodec ff_libtwolame_encoder = {
+    .p.name         = "libtwolame",
+    CODEC_LONG_NAME("libtwolame MP2 (MPEG audio layer 2)"),
+    .p.type         = AVMEDIA_TYPE_AUDIO,
+    .p.id           = AV_CODEC_ID_MP2,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY,
+    .caps_internal  = FF_CODEC_CAP_NOT_INIT_THREADSAFE,
     .priv_data_size = sizeof(TWOLAMEContext),
     .init           = twolame_encode_init,
-    .encode2        = twolame_encode_frame,
+    FF_CODEC_ENCODE_CB(twolame_encode_frame),
     .close          = twolame_encode_close,
-    .capabilities   = CODEC_CAP_DELAY,
     .defaults       = twolame_defaults,
-    .priv_class     = &twolame_class,
-    .sample_fmts    = (const enum AVSampleFormat[]) {
-        AV_SAMPLE_FMT_FLT,
-        AV_SAMPLE_FMT_FLTP,
-        AV_SAMPLE_FMT_S16,
-        AV_SAMPLE_FMT_S16P,
-        AV_SAMPLE_FMT_NONE
-    },
-    .channel_layouts = (const uint64_t[]) {
-        AV_CH_LAYOUT_MONO,
-        AV_CH_LAYOUT_STEREO,
-        0 },
-    .supported_samplerates = twolame_samplerates,
+    .p.priv_class   = &twolame_class,
+    CODEC_SAMPLEFMTS(AV_SAMPLE_FMT_FLT, AV_SAMPLE_FMT_FLTP,
+                     AV_SAMPLE_FMT_S16, AV_SAMPLE_FMT_S16P),
+    CODEC_CH_LAYOUTS(AV_CHANNEL_LAYOUT_MONO, AV_CHANNEL_LAYOUT_STEREO),
+    CODEC_SAMPLERATES_ARRAY(twolame_samplerates),
+    .p.wrapper_name = "libtwolame",
 };

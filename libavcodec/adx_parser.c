@@ -73,6 +73,16 @@ static int adx_parse(AVCodecParserContext *s1,
             s->remaining = 0;
         } else
             s->remaining -= buf_size;
+    } else if (avctx->ch_layout.nb_channels > 0) {
+        if (!s->block_size)
+            s->block_size = avctx->ch_layout.nb_channels * BLOCK_SIZE;
+        if (!s->remaining)
+            s->remaining = s->block_size;
+        if (s->remaining <= buf_size) {
+            next = s->remaining;
+            s->remaining = 0;
+        } else
+            s->remaining -= buf_size;
     }
 
     if (ff_combine_frame(pc, next, &buf, &buf_size) < 0 || !buf_size) {
@@ -88,7 +98,7 @@ static int adx_parse(AVCodecParserContext *s1,
     return next;
 }
 
-AVCodecParser ff_adx_parser = {
+const AVCodecParser ff_adx_parser = {
     .codec_ids      = { AV_CODEC_ID_ADPCM_ADX },
     .priv_data_size = sizeof(ADXParseContext),
     .parser_parse   = adx_parse,

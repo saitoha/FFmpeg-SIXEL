@@ -19,24 +19,24 @@
  */
 
 #include "config.h"
-#if HAVE_ALTIVEC_H
-#include <altivec.h>
-#endif
+
 #include "libavutil/attributes.h"
 #include "libavutil/cpu.h"
 #include "libavutil/ppc/cpu.h"
+#include "libavutil/ppc/util_altivec.h"
+
 #include "libavcodec/vorbisdsp.h"
 
 #if HAVE_ALTIVEC
 static void vorbis_inverse_coupling_altivec(float *mag, float *ang,
-                                            intptr_t blocksize)
+                                            ptrdiff_t blocksize)
 {
-    int i;
     vector float m, a;
     vector bool int t0, t1;
     const vector unsigned int v_31 = //XXX
         vec_add(vec_add(vec_splat_u32(15),vec_splat_u32(15)),vec_splat_u32(1));
-    for (i = 0; i < blocksize; i += 4) {
+
+    for (ptrdiff_t i = 0; i < blocksize; i += 4) {
         m = vec_ld(0, mag+i);
         a = vec_ld(0, ang+i);
         t0 = vec_cmple(m, (vector float)vec_splat_u32(0));

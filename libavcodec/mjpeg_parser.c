@@ -50,7 +50,7 @@ static int find_frame_end(MJPEGParserContext *m, const uint8_t *buf, int buf_siz
         for(i=0; i<buf_size;){
             state= (state<<8) | buf[i];
             if(state>=0xFFC00000 && state<=0xFFFEFFFF){
-                if(state>=0xFFD80000 && state<=0xFFD8FFFF){
+                if(state>=0xFFD8FFC0 && state<=0xFFD8FFFF){
                     i++;
                     vop_found=1;
                     break;
@@ -76,10 +76,12 @@ static int find_frame_end(MJPEGParserContext *m, const uint8_t *buf, int buf_siz
         for(; i<buf_size;){
             state= (state<<8) | buf[i];
             if(state>=0xFFC00000 && state<=0xFFFEFFFF){
-                if(state>=0xFFD80000 && state<=0xFFD8FFFF){
+                if(state>=0xFFD8FFC0 && state<=0xFFD8FFFF){
                     pc->frame_start_found=0;
                     pc->state=0;
                     return i-3;
+                } else if((state>>16)==0xFFD9 && (state&0xFFFF)!=0xFFD8){
+                    state= 0xFFD900|(state&0xFF);
                 } else if(state<0xFFD00000 || state>0xFFD9FFFF){
                     m->size= (state&0xFFFF)-1;
                 }
@@ -126,8 +128,8 @@ static int jpeg_parse(AVCodecParserContext *s,
 }
 
 
-AVCodecParser ff_mjpeg_parser = {
-    .codec_ids      = { AV_CODEC_ID_MJPEG },
+const AVCodecParser ff_mjpeg_parser = {
+    .codec_ids      = { AV_CODEC_ID_MJPEG, AV_CODEC_ID_JPEGLS },
     .priv_data_size = sizeof(MJPEGParserContext),
     .parser_parse   = jpeg_parse,
     .parser_close   = ff_parse_close,

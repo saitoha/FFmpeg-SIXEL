@@ -30,8 +30,12 @@
 
 #include "libavutil/avassert.h"
 #include "libavutil/eval.h"
+#include "libavutil/mem.h"
+#include "libavutil/mem_internal.h"
 #include "libavutil/opt.h"
-#include "internal.h"
+
+#include "filters.h"
+#include "video.h"
 
 static const char *const var_names[] = { "c", NULL };
 enum { VAR_C, VAR_VARS_NB };
@@ -63,9 +67,9 @@ typedef struct DCTdnoizContext {
                              float *dst, int dst_linesize,
                              int thread_id);
     void (*color_decorrelation)(float **dst, int dst_linesize,
-                                const uint8_t *src, int src_linesize,
+                                const uint8_t **src, int src_linesize,
                                 int w, int h);
-    void (*color_correlation)(uint8_t *dst, int dst_linesize,
+    void (*color_correlation)(uint8_t **dst, int dst_linesize,
                               float **src, int src_linesize,
                               int w, int h);
 } DCTdnoizContext;
@@ -367,10 +371,10 @@ static av_always_inline void filter_freq_##bsize(const float *src, int src_lines
         float *b = &tmp_block2[i];                                                          \
         /* frequency filtering */                                                           \
         if (expr) {                                                                         \
-            var_values[VAR_C] = FFABS(*b);                                                  \
+            var_values[VAR_C] = fabsf(*b);                                                  \
             *b *= av_expr_eval(expr, var_values, NULL);                                     \
         } else {                                                                            \
-            if (FFABS(*b) < sigma_th)                                                       \
+            if (fabsf(*b) < sigma_th)                                                       \
                 *b = 0;                                                                     \
         }                                                                                   \
     }                                                                                       \
@@ -408,7 +412,7 @@ DEF_FILTER_FREQ_FUNCS(16)
 #define DCT3X3_2_2  0.4082482904638631f /*  1/sqrt(6) */
 
 static av_always_inline void color_decorrelation(float **dst, int dst_linesize,
-                                                 const uint8_t *src, int src_linesize,
+                                                 const uint8_t **src, int src_linesize,
                                                  int w, int h,
                                                  int r, int g, int b)
 {
@@ -416,24 +420,23 @@ static av_always_inline void color_decorrelation(float **dst, int dst_linesize,
     float *dstp_r = dst[0];
     float *dstp_g = dst[1];
     float *dstp_b = dst[2];
+    const uint8_t *srcp = src[0];
 
     for (y = 0; y < h; y++) {
-        const uint8_t *srcp = src;
-
         for (x = 0; x < w; x++) {
             dstp_r[x] = srcp[r] * DCT3X3_0_0 + srcp[g] * DCT3X3_0_1 + srcp[b] * DCT3X3_0_2;
             dstp_g[x] = srcp[r] * DCT3X3_1_0 +                        srcp[b] * DCT3X3_1_2;
             dstp_b[x] = srcp[r] * DCT3X3_2_0 + srcp[g] * DCT3X3_2_1 + srcp[b] * DCT3X3_2_2;
             srcp += 3;
         }
-        src += src_linesize;
+        srcp   += src_linesize - w * 3;
         dstp_r += dst_linesize;
         dstp_g += dst_linesize;
         dstp_b += dst_linesize;
     }
 }
 
-static av_always_inline void color_correlation(uint8_t *dst, int dst_linesize,
+static av_always_inline void color_correlation(uint8_t **dst, int dst_linesize,
                                                float **src, int src_linesize,
                                                int w, int h,
                                                int r, int g, int b)
@@ -442,17 +445,16 @@ static av_always_inline void color_correlation(uint8_t *dst, int dst_linesize,
     const float *src_r = src[0];
     const float *src_g = src[1];
     const float *src_b = src[2];
+    uint8_t *dstp = dst[0];
 
     for (y = 0; y < h; y++) {
-        uint8_t *dstp = dst;
-
         for (x = 0; x < w; x++) {
             dstp[r] = av_clip_uint8(src_r[x] * DCT3X3_0_0 + src_g[x] * DCT3X3_1_0 + src_b[x] * DCT3X3_2_0);
             dstp[g] = av_clip_uint8(src_r[x] * DCT3X3_0_1 +                         src_b[x] * DCT3X3_2_1);
             dstp[b] = av_clip_uint8(src_r[x] * DCT3X3_0_2 + src_g[x] * DCT3X3_1_2 + src_b[x] * DCT3X3_2_2);
             dstp += 3;
         }
-        dst += dst_linesize;
+        dstp  += dst_linesize - w * 3;
         src_r += src_linesize;
         src_g += src_linesize;
         src_b += src_linesize;
@@ -461,13 +463,13 @@ static av_always_inline void color_correlation(uint8_t *dst, int dst_linesize,
 
 #define DECLARE_COLOR_FUNCS(name, r, g, b)                                          \
 static void color_decorrelation_##name(float **dst, int dst_linesize,               \
-                                       const uint8_t *src, int src_linesize,        \
+                                       const uint8_t **src, int src_linesize,       \
                                        int w, int h)                                \
 {                                                                                   \
     color_decorrelation(dst, dst_linesize, src, src_linesize, w, h, r, g, b);       \
 }                                                                                   \
                                                                                     \
-static void color_correlation_##name(uint8_t *dst, int dst_linesize,                \
+static void color_correlation_##name(uint8_t **dst, int dst_linesize,               \
                                      float **src, int src_linesize,                 \
                                      int w, int h)                                  \
 {                                                                                   \
@@ -476,6 +478,60 @@ static void color_correlation_##name(uint8_t *dst, int dst_linesize,            
 
 DECLARE_COLOR_FUNCS(rgb, 0, 1, 2)
 DECLARE_COLOR_FUNCS(bgr, 2, 1, 0)
+
+static av_always_inline void color_decorrelation_gbrp(float **dst, int dst_linesize,
+                                                      const uint8_t **src, int src_linesize,
+                                                      int w, int h)
+{
+    int x, y;
+    float *dstp_r = dst[0];
+    float *dstp_g = dst[1];
+    float *dstp_b = dst[2];
+    const uint8_t *srcp_r = src[2];
+    const uint8_t *srcp_g = src[0];
+    const uint8_t *srcp_b = src[1];
+
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            dstp_r[x] = srcp_r[x] * DCT3X3_0_0 + srcp_g[x] * DCT3X3_0_1 + srcp_b[x] * DCT3X3_0_2;
+            dstp_g[x] = srcp_r[x] * DCT3X3_1_0 +                          srcp_b[x] * DCT3X3_1_2;
+            dstp_b[x] = srcp_r[x] * DCT3X3_2_0 + srcp_g[x] * DCT3X3_2_1 + srcp_b[x] * DCT3X3_2_2;
+        }
+        srcp_r += src_linesize;
+        srcp_g += src_linesize;
+        srcp_b += src_linesize;
+        dstp_r += dst_linesize;
+        dstp_g += dst_linesize;
+        dstp_b += dst_linesize;
+    }
+}
+
+static av_always_inline void color_correlation_gbrp(uint8_t **dst, int dst_linesize,
+                                                    float **src, int src_linesize,
+                                                    int w, int h)
+{
+    int x, y;
+    const float *src_r = src[0];
+    const float *src_g = src[1];
+    const float *src_b = src[2];
+    uint8_t *dstp_r = dst[2];
+    uint8_t *dstp_g = dst[0];
+    uint8_t *dstp_b = dst[1];
+
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            dstp_r[x] = av_clip_uint8(src_r[x] * DCT3X3_0_0 + src_g[x] * DCT3X3_1_0 + src_b[x] * DCT3X3_2_0);
+            dstp_g[x] = av_clip_uint8(src_r[x] * DCT3X3_0_1 +                         src_b[x] * DCT3X3_2_1);
+            dstp_b[x] = av_clip_uint8(src_r[x] * DCT3X3_0_2 + src_g[x] * DCT3X3_1_2 + src_b[x] * DCT3X3_2_2);
+        }
+        dstp_r += dst_linesize;
+        dstp_g += dst_linesize;
+        dstp_b += dst_linesize;
+        src_r += src_linesize;
+        src_g += src_linesize;
+        src_b += src_linesize;
+    }
+}
 
 static int config_input(AVFilterLink *inlink)
 {
@@ -493,6 +549,10 @@ static int config_input(AVFilterLink *inlink)
         s->color_decorrelation = color_decorrelation_rgb;
         s->color_correlation   = color_correlation_rgb;
         break;
+    case AV_PIX_FMT_GBRP:
+        s->color_decorrelation = color_decorrelation_gbrp;
+        s->color_correlation   = color_correlation_gbrp;
+        break;
     default:
         av_assert0(0);
     }
@@ -507,9 +567,12 @@ static int config_input(AVFilterLink *inlink)
                inlink->h - s->pr_height);
 
     max_slice_h = s->pr_height / ((s->bsize - 1) * 2);
-    s->nb_threads = FFMIN3(MAX_THREADS, ctx->graph->nb_threads, max_slice_h);
+    if (max_slice_h == 0)
+        return AVERROR(EINVAL);
+
+    s->nb_threads = FFMIN3(MAX_THREADS, ff_filter_get_nb_threads(ctx), max_slice_h);
     av_log(ctx, AV_LOG_DEBUG, "threads: [max=%d hmax=%d user=%d] => %d\n",
-           MAX_THREADS, max_slice_h, ctx->graph->nb_threads, s->nb_threads);
+           MAX_THREADS, max_slice_h, ff_filter_get_nb_threads(ctx), s->nb_threads);
 
     s->p_linesize = linesize = FFALIGN(s->pr_width, 32);
     for (i = 0; i < 2; i++) {
@@ -594,17 +657,11 @@ static av_cold int init(AVFilterContext *ctx)
     return 0;
 }
 
-static int query_formats(AVFilterContext *ctx)
-{
-    static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_BGR24, AV_PIX_FMT_RGB24,
-        AV_PIX_FMT_NONE
-    };
-    AVFilterFormats *fmts_list = ff_make_format_list(pix_fmts);
-    if (!fmts_list)
-        return AVERROR(ENOMEM);
-    return ff_set_common_formats(ctx, fmts_list);
-}
+static const enum AVPixelFormat pix_fmts[] = {
+    AV_PIX_FMT_BGR24, AV_PIX_FMT_RGB24,
+    AV_PIX_FMT_GBRP,
+    AV_PIX_FMT_NONE
+};
 
 typedef struct ThreadData {
     float *src, *dst;
@@ -680,16 +737,16 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     }
 
     s->color_decorrelation(s->cbuf[0], s->p_linesize,
-                           in->data[0], in->linesize[0],
+                           (const uint8_t **)in->data, in->linesize[0],
                            s->pr_width, s->pr_height);
     for (plane = 0; plane < 3; plane++) {
         ThreadData td = {
             .src = s->cbuf[0][plane],
             .dst = s->cbuf[1][plane],
         };
-        ctx->internal->execute(ctx, filter_slice, &td, NULL, s->nb_threads);
+        ff_filter_execute(ctx, filter_slice, &td, NULL, s->nb_threads);
     }
-    s->color_correlation(out->data[0], out->linesize[0],
+    s->color_correlation(out->data, out->linesize[0],
                          s->cbuf[1], s->p_linesize,
                          s->pr_width, s->pr_height);
 
@@ -753,26 +810,17 @@ static const AVFilterPad dctdnoiz_inputs[] = {
         .filter_frame = filter_frame,
         .config_props = config_input,
     },
-    { NULL }
 };
 
-static const AVFilterPad dctdnoiz_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-    { NULL }
-};
-
-AVFilter ff_vf_dctdnoiz = {
-    .name          = "dctdnoiz",
-    .description   = NULL_IF_CONFIG_SMALL("Denoise frames using 2D DCT."),
+const FFFilter ff_vf_dctdnoiz = {
+    .p.name        = "dctdnoiz",
+    .p.description = NULL_IF_CONFIG_SMALL("Denoise frames using 2D DCT."),
+    .p.priv_class  = &dctdnoiz_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(DCTdnoizContext),
     .init          = init,
     .uninit        = uninit,
-    .query_formats = query_formats,
-    .inputs        = dctdnoiz_inputs,
-    .outputs       = dctdnoiz_outputs,
-    .priv_class    = &dctdnoiz_class,
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
+    FILTER_INPUTS(dctdnoiz_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_PIXFMTS_ARRAY(pix_fmts),
 };

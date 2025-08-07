@@ -20,192 +20,273 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "avassert.h"
-#include "common.h"
-#include "fifo.h"
+#include <stdint.h>
+#include <string.h>
 
-static AVFifoBuffer *fifo_alloc_common(void *buffer, size_t size)
+#include "avassert.h"
+#include "error.h"
+#include "fifo.h"
+#include "macros.h"
+#include "mem.h"
+
+// by default the FIFO can be auto-grown to 1MB
+#define AUTO_GROW_DEFAULT_BYTES (1024 * 1024)
+
+struct AVFifo {
+    uint8_t *buffer;
+
+    size_t elem_size, nb_elems;
+    size_t offset_r, offset_w;
+    // distinguishes the ambiguous situation offset_r == offset_w
+    int    is_empty;
+
+    unsigned int flags;
+    size_t       auto_grow_limit;
+};
+
+AVFifo *av_fifo_alloc2(size_t nb_elems, size_t elem_size,
+                       unsigned int flags)
 {
-    AVFifoBuffer *f;
-    if (!buffer)
+    AVFifo *f;
+    void *buffer = NULL;
+
+    if (!elem_size)
         return NULL;
-    f = av_mallocz(sizeof(AVFifoBuffer));
+
+    if (nb_elems) {
+        buffer = av_realloc_array(NULL, nb_elems, elem_size);
+        if (!buffer)
+            return NULL;
+    }
+    f = av_mallocz(sizeof(*f));
     if (!f) {
         av_free(buffer);
         return NULL;
     }
-    f->buffer = buffer;
-    f->end    = f->buffer + size;
-    av_fifo_reset(f);
+    f->buffer    = buffer;
+    f->nb_elems  = nb_elems;
+    f->elem_size = elem_size;
+    f->is_empty  = 1;
+
+    f->flags           = flags;
+    f->auto_grow_limit = FFMAX(AUTO_GROW_DEFAULT_BYTES / elem_size, 1);
+
     return f;
 }
 
-AVFifoBuffer *av_fifo_alloc(unsigned int size)
+void av_fifo_auto_grow_limit(AVFifo *f, size_t max_elems)
 {
-    void *buffer = av_malloc(size);
-    return fifo_alloc_common(buffer, size);
+    f->auto_grow_limit = max_elems;
 }
 
-AVFifoBuffer *av_fifo_alloc_array(size_t nmemb, size_t size)
+size_t av_fifo_elem_size(const AVFifo *f)
 {
-    void *buffer = av_malloc_array(nmemb, size);
-    return fifo_alloc_common(buffer, nmemb * size);
+    return f->elem_size;
 }
 
-void av_fifo_free(AVFifoBuffer *f)
+size_t av_fifo_can_read(const AVFifo *f)
 {
-    if (f) {
-        av_freep(&f->buffer);
-        av_free(f);
-    }
+    if (f->offset_w <= f->offset_r && !f->is_empty)
+        return f->nb_elems - f->offset_r + f->offset_w;
+    return f->offset_w - f->offset_r;
 }
 
-void av_fifo_freep(AVFifoBuffer **f)
+size_t av_fifo_can_write(const AVFifo *f)
 {
-    if (f) {
-        av_fifo_free(*f);
-        *f = NULL;
-    }
+    return f->nb_elems - av_fifo_can_read(f);
 }
 
-void av_fifo_reset(AVFifoBuffer *f)
+int av_fifo_grow2(AVFifo *f, size_t inc)
 {
-    f->wptr = f->rptr = f->buffer;
-    f->wndx = f->rndx = 0;
-}
+    uint8_t *tmp;
 
-int av_fifo_size(const AVFifoBuffer *f)
-{
-    return (uint32_t)(f->wndx - f->rndx);
-}
-
-int av_fifo_space(const AVFifoBuffer *f)
-{
-    return f->end - f->buffer - av_fifo_size(f);
-}
-
-int av_fifo_realloc2(AVFifoBuffer *f, unsigned int new_size)
-{
-    unsigned int old_size = f->end - f->buffer;
-
-    if (old_size < new_size) {
-        int len          = av_fifo_size(f);
-        AVFifoBuffer *f2 = av_fifo_alloc(new_size);
-
-        if (!f2)
-            return AVERROR(ENOMEM);
-        av_fifo_generic_read(f, f2->buffer, len, NULL);
-        f2->wptr += len;
-        f2->wndx += len;
-        av_free(f->buffer);
-        *f = *f2;
-        av_free(f2);
-    }
-    return 0;
-}
-
-int av_fifo_grow(AVFifoBuffer *f, unsigned int size)
-{
-    unsigned int old_size = f->end - f->buffer;
-    if(size + (unsigned)av_fifo_size(f) < size)
+    if (inc > SIZE_MAX - f->nb_elems)
         return AVERROR(EINVAL);
 
-    size += av_fifo_size(f);
+    tmp = av_realloc_array(f->buffer, f->nb_elems + inc, f->elem_size);
+    if (!tmp)
+        return AVERROR(ENOMEM);
+    f->buffer = tmp;
 
-    if (old_size < size)
-        return av_fifo_realloc2(f, FFMAX(size, 2*size));
+    // move the data from the beginning of the ring buffer
+    // to the newly allocated space
+    if (f->offset_w <= f->offset_r && !f->is_empty) {
+        const size_t copy = FFMIN(inc, f->offset_w);
+        memcpy(tmp + f->nb_elems * f->elem_size, tmp, copy * f->elem_size);
+        if (copy < f->offset_w) {
+            memmove(tmp, tmp + copy * f->elem_size,
+                    (f->offset_w - copy) * f->elem_size);
+            f->offset_w -= copy;
+        } else
+            f->offset_w = copy == inc ? 0 : f->nb_elems + copy;
+    }
+
+    f->nb_elems += inc;
+
     return 0;
 }
 
-/* src must NOT be const as it can be a context for func that may need
- * updating (like a pointer or byte counter) */
-int av_fifo_generic_write(AVFifoBuffer *f, void *src, int size,
-                          int (*func)(void *, void *, int))
+static int fifo_check_space(AVFifo *f, size_t to_write)
 {
-    int total = size;
-    uint32_t wndx= f->wndx;
-    uint8_t *wptr= f->wptr;
+    const size_t can_write = av_fifo_can_write(f);
+    const size_t need_grow = to_write > can_write ? to_write - can_write : 0;
+    size_t can_grow;
 
-    do {
-        int len = FFMIN(f->end - wptr, size);
-        if (func) {
-            if (func(src, wptr, len) <= 0)
+    if (!need_grow)
+        return 0;
+
+    can_grow = f->auto_grow_limit > f->nb_elems ?
+               f->auto_grow_limit - f->nb_elems : 0;
+    if ((f->flags & AV_FIFO_FLAG_AUTO_GROW) && need_grow <= can_grow) {
+        // allocate a bit more than necessary, if we can
+        const size_t inc = (need_grow < can_grow / 2 ) ? need_grow * 2 : can_grow;
+        return av_fifo_grow2(f, inc);
+    }
+
+    return AVERROR(ENOSPC);
+}
+
+static int fifo_write_common(AVFifo *f, const uint8_t *buf, size_t *nb_elems,
+                             AVFifoCB read_cb, void *opaque)
+{
+    size_t to_write = *nb_elems;
+    size_t offset_w;
+    int         ret = 0;
+
+    ret = fifo_check_space(f, to_write);
+    if (ret < 0)
+        return ret;
+
+    offset_w = f->offset_w;
+
+    while (to_write > 0) {
+        size_t    len = FFMIN(f->nb_elems - offset_w, to_write);
+        uint8_t *wptr = f->buffer + offset_w * f->elem_size;
+
+        if (read_cb) {
+            ret = read_cb(opaque, wptr, &len);
+            if (ret < 0 || len == 0)
                 break;
         } else {
-            memcpy(wptr, src, len);
-            src = (uint8_t *)src + len;
+            memcpy(wptr, buf, len * f->elem_size);
+            buf += len * f->elem_size;
         }
-// Write memory barrier needed for SMP here in theory
-        wptr += len;
-        if (wptr >= f->end)
-            wptr = f->buffer;
-        wndx    += len;
-        size    -= len;
-    } while (size > 0);
-    f->wndx= wndx;
-    f->wptr= wptr;
-    return total - size;
+        offset_w += len;
+        if (offset_w >= f->nb_elems)
+            offset_w = 0;
+        to_write -= len;
+    }
+    f->offset_w = offset_w;
+
+    if (*nb_elems != to_write)
+        f->is_empty = 0;
+    *nb_elems -= to_write;
+
+    return ret;
 }
 
-int av_fifo_generic_read(AVFifoBuffer *f, void *dest, int buf_size,
-                         void (*func)(void *, void *, int))
+int av_fifo_write(AVFifo *f, const void *buf, size_t nb_elems)
 {
-// Read memory barrier needed for SMP here in theory
-    do {
-        int len = FFMIN(f->end - f->rptr, buf_size);
-        if (func)
-            func(dest, f->rptr, len);
-        else {
-            memcpy(dest, f->rptr, len);
-            dest = (uint8_t *)dest + len;
+    return fifo_write_common(f, buf, &nb_elems, NULL, NULL);
+}
+
+int av_fifo_write_from_cb(AVFifo *f, AVFifoCB read_cb,
+                          void *opaque, size_t *nb_elems)
+{
+    return fifo_write_common(f, NULL, nb_elems, read_cb, opaque);
+}
+
+static int fifo_peek_common(const AVFifo *f, uint8_t *buf, size_t *nb_elems,
+                            size_t offset, AVFifoCB write_cb, void *opaque)
+{
+    size_t  to_read = *nb_elems;
+    size_t offset_r = f->offset_r;
+    size_t can_read = av_fifo_can_read(f);
+    int         ret = 0;
+
+    if (offset > can_read || to_read > can_read - offset) {
+        *nb_elems = 0;
+        return AVERROR(EINVAL);
+    }
+
+    if (offset_r >= f->nb_elems - offset)
+        offset_r -= f->nb_elems - offset;
+    else
+        offset_r += offset;
+
+    while (to_read > 0) {
+        size_t    len = FFMIN(f->nb_elems - offset_r, to_read);
+        uint8_t *rptr = f->buffer + offset_r * f->elem_size;
+
+        if (write_cb) {
+            ret = write_cb(opaque, rptr, &len);
+            if (ret < 0 || len == 0)
+                break;
+        } else {
+            memcpy(buf, rptr, len * f->elem_size);
+            buf += len * f->elem_size;
         }
-// memory barrier needed for SMP here in theory
-        av_fifo_drain(f, len);
-        buf_size -= len;
-    } while (buf_size > 0);
-    return 0;
-}
-
-/** Discard data from the FIFO. */
-void av_fifo_drain(AVFifoBuffer *f, int size)
-{
-    av_assert2(av_fifo_size(f) >= size);
-    f->rptr += size;
-    if (f->rptr >= f->end)
-        f->rptr -= f->end - f->buffer;
-    f->rndx += size;
-}
-
-#ifdef TEST
-
-int main(void)
-{
-    /* create a FIFO buffer */
-    AVFifoBuffer *fifo = av_fifo_alloc(13 * sizeof(int));
-    int i, j, n;
-
-    /* fill data */
-    for (i = 0; av_fifo_space(fifo) >= sizeof(int); i++)
-        av_fifo_generic_write(fifo, &i, sizeof(int), NULL);
-
-    /* peek at FIFO */
-    n = av_fifo_size(fifo) / sizeof(int);
-    for (i = -n + 1; i < n; i++) {
-        int *v = (int *)av_fifo_peek2(fifo, i * sizeof(int));
-        printf("%d: %d\n", i, *v);
+        offset_r += len;
+        if (offset_r >= f->nb_elems)
+            offset_r = 0;
+        to_read -= len;
     }
-    printf("\n");
 
-    /* read data */
-    for (i = 0; av_fifo_size(fifo) >= sizeof(int); i++) {
-        av_fifo_generic_read(fifo, &j, sizeof(int), NULL);
-        printf("%d ", j);
-    }
-    printf("\n");
+    *nb_elems -= to_read;
 
-    av_fifo_free(fifo);
-
-    return 0;
+    return ret;
 }
 
-#endif
+int av_fifo_read(AVFifo *f, void *buf, size_t nb_elems)
+{
+    int ret = fifo_peek_common(f, buf, &nb_elems, 0, NULL, NULL);
+    av_fifo_drain2(f, nb_elems);
+    return ret;
+}
+
+int av_fifo_read_to_cb(AVFifo *f, AVFifoCB write_cb,
+                       void *opaque, size_t *nb_elems)
+{
+    int ret = fifo_peek_common(f, NULL, nb_elems, 0, write_cb, opaque);
+    av_fifo_drain2(f, *nb_elems);
+    return ret;
+}
+
+int av_fifo_peek(const AVFifo *f, void *buf, size_t nb_elems, size_t offset)
+{
+    return fifo_peek_common(f, buf, &nb_elems, offset, NULL, NULL);
+}
+
+int av_fifo_peek_to_cb(const AVFifo *f, AVFifoCB write_cb, void *opaque,
+                       size_t *nb_elems, size_t offset)
+{
+    return fifo_peek_common(f, NULL, nb_elems, offset, write_cb, opaque);
+}
+
+void av_fifo_drain2(AVFifo *f, size_t size)
+{
+    const size_t cur_size = av_fifo_can_read(f);
+
+    av_assert0(cur_size >= size);
+    if (cur_size == size)
+        f->is_empty = 1;
+
+    if (f->offset_r >= f->nb_elems - size)
+        f->offset_r -= f->nb_elems - size;
+    else
+        f->offset_r += size;
+}
+
+void av_fifo_reset2(AVFifo *f)
+{
+    f->offset_r = f->offset_w = 0;
+    f->is_empty = 1;
+}
+
+void av_fifo_freep2(AVFifo **f)
+{
+    if (*f) {
+        av_freep(&(*f)->buffer);
+        av_freep(f);
+    }
+}

@@ -23,11 +23,12 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <linux/fb.h>
+#include "libavutil/file_open.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/log.h"
-#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavformat/avformat.h"
+#include "libavformat/mux.h"
 #include "fbdev_common.h"
 #include "avdevice.h"
 
@@ -48,13 +49,13 @@ static av_cold int fbdev_write_header(AVFormatContext *h)
     int ret, flags = O_RDWR;
     const char* device;
 
-    if (h->nb_streams != 1 || h->streams[0]->codec->codec_type != AVMEDIA_TYPE_VIDEO) {
+    if (h->nb_streams != 1 || h->streams[0]->codecpar->codec_type != AVMEDIA_TYPE_VIDEO) {
         av_log(fbdev, AV_LOG_ERROR, "Only a single video stream is supported.\n");
         return AVERROR(EINVAL);
     }
 
-    if (h->filename[0])
-        device = h->filename;
+    if (h->url[0])
+        device = h->url;
     else
         device = ff_fbdev_default_device();
 
@@ -101,15 +102,16 @@ static av_cold int fbdev_write_header(AVFormatContext *h)
 static int fbdev_write_packet(AVFormatContext *h, AVPacket *pkt)
 {
     FBDevContext *fbdev = h->priv_data;
-    uint8_t *pin, *pout;
+    const uint8_t *pin;
+    uint8_t *pout;
     enum AVPixelFormat fb_pix_fmt;
     int disp_height;
     int bytes_to_copy;
-    AVCodecContext *codec_ctx = h->streams[0]->codec;
-    enum AVPixelFormat video_pix_fmt = codec_ctx->pix_fmt;
-    int video_width = codec_ctx->width;
-    int video_height = codec_ctx->height;
-    int bytes_per_pixel = ((codec_ctx->bits_per_coded_sample + 7) >> 3);
+    AVCodecParameters *par = h->streams[0]->codecpar;
+    enum AVPixelFormat video_pix_fmt = par->format;
+    int video_width = par->width;
+    int video_height = par->height;
+    int bytes_per_pixel = ((par->bits_per_coded_sample + 7) >> 3);
     int src_line_size = video_width * bytes_per_pixel;
     int i;
 
@@ -205,16 +207,16 @@ static const AVClass fbdev_class = {
     .category   = AV_CLASS_CATEGORY_DEVICE_VIDEO_OUTPUT,
 };
 
-AVOutputFormat ff_fbdev_muxer = {
-    .name           = "fbdev",
-    .long_name      = NULL_IF_CONFIG_SMALL("Linux framebuffer"),
+const FFOutputFormat ff_fbdev_muxer = {
+    .p.name         = "fbdev",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Linux framebuffer"),
     .priv_data_size = sizeof(FBDevContext),
-    .audio_codec    = AV_CODEC_ID_NONE,
-    .video_codec    = AV_CODEC_ID_RAWVIDEO,
+    .p.audio_codec  = AV_CODEC_ID_NONE,
+    .p.video_codec  = AV_CODEC_ID_RAWVIDEO,
     .write_header   = fbdev_write_header,
     .write_packet   = fbdev_write_packet,
     .write_trailer  = fbdev_write_trailer,
     .get_device_list = fbdev_get_device_list,
-    .flags          = AVFMT_NOFILE | AVFMT_VARIABLE_FPS | AVFMT_NOTIMESTAMPS,
-    .priv_class     = &fbdev_class,
+    .p.flags        = AVFMT_NOFILE | AVFMT_VARIABLE_FPS | AVFMT_NOTIMESTAMPS,
+    .p.priv_class   = &fbdev_class,
 };

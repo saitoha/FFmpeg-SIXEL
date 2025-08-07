@@ -22,11 +22,12 @@
 
 #include "libavutil/intreadwrite.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
 #define NC_VIDEO_FLAG 0x1A5
 
-static int nc_probe(AVProbeData *probe_packet)
+static int nc_probe(const AVProbeData *probe_packet)
 {
     int size;
 
@@ -51,9 +52,9 @@ static int nc_read_header(AVFormatContext *s)
     if (!st)
         return AVERROR(ENOMEM);
 
-    st->codec->codec_type = AVMEDIA_TYPE_VIDEO;
-    st->codec->codec_id   = AV_CODEC_ID_MPEG4;
-    st->need_parsing      = AVSTREAM_PARSE_FULL;
+    st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+    st->codecpar->codec_id   = AV_CODEC_ID_MPEG4;
+    ffstream(st)->need_parsing = AVSTREAM_PARSE_FULL;
 
     avpriv_set_pts_info(st, 64, 1, 100);
 
@@ -83,7 +84,6 @@ static int nc_read_packet(AVFormatContext *s, AVPacket *pkt)
 
     ret = av_get_packet(s->pb, pkt, size);
     if (ret != size) {
-        if (ret > 0) av_free_packet(pkt);
         return AVERROR(EIO);
     }
 
@@ -91,11 +91,11 @@ static int nc_read_packet(AVFormatContext *s, AVPacket *pkt)
     return size;
 }
 
-AVInputFormat ff_nc_demuxer = {
-    .name           = "nc",
-    .long_name      = NULL_IF_CONFIG_SMALL("NC camera feed"),
+const FFInputFormat ff_nc_demuxer = {
+    .p.name         = "nc",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("NC camera feed"),
+    .p.extensions   = "v",
     .read_probe     = nc_probe,
     .read_header    = nc_read_header,
     .read_packet    = nc_read_packet,
-    .extensions     = "v",
 };

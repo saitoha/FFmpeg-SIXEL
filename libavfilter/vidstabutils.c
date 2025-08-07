@@ -18,7 +18,16 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/mem.h"
 #include "vidstabutils.h"
+
+const enum AVPixelFormat ff_vidstab_pix_fmts[] =  {
+    AV_PIX_FMT_YUV444P,  AV_PIX_FMT_YUV422P, AV_PIX_FMT_YUV420P,
+    AV_PIX_FMT_YUV411P,  AV_PIX_FMT_YUV410P, AV_PIX_FMT_YUVA420P,
+    AV_PIX_FMT_YUV440P,  AV_PIX_FMT_GRAY8,
+    AV_PIX_FMT_RGB24,    AV_PIX_FMT_BGR24,   AV_PIX_FMT_RGBA,
+    AV_PIX_FMT_NONE
+};
 
 /** convert AV's pixelformat to vid.stab pixelformat */
 VSPixelFormat ff_av2vs_pixfmt(AVFilterContext *ctx, enum AVPixelFormat pf)
@@ -42,7 +51,7 @@ VSPixelFormat ff_av2vs_pixfmt(AVFilterContext *ctx, enum AVPixelFormat pf)
 }
 
 /** struct to hold a valid context for logging from within vid.stab lib */
-typedef struct {
+typedef struct VS2AVLogCtx {
     const AVClass *class;
 } VS2AVLogCtx;
 

@@ -20,8 +20,8 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#ifndef AACPS_TABLEGEN_H
-#define AACPS_TABLEGEN_H
+#ifndef AVCODEC_AACPS_TABLEGEN_H
+#define AVCODEC_AACPS_TABLEGEN_H
 
 #include <math.h>
 #include <stdint.h>
@@ -34,7 +34,7 @@
 #include "libavutil/common.h"
 #include "libavutil/libm.h"
 #include "libavutil/mathematics.h"
-#include "libavutil/mem.h"
+#include "libavutil/mem_internal.h"
 #define NR_ALLPASS_BANDS20 30
 #define NR_ALLPASS_BANDS34 50
 #define PS_AP_LINKS 3
@@ -136,7 +136,7 @@ static av_cold void ps_tableinit(void)
                 float pd2_im = ipdopd_sin[pd2];
                 float re_smooth = 0.25f * pd0_re + 0.5f * pd1_re + pd2_re;
                 float im_smooth = 0.25f * pd0_im + 0.5f * pd1_im + pd2_im;
-                float pd_mag = 1 / sqrt(im_smooth * im_smooth + re_smooth * re_smooth);
+                float pd_mag = 1 / hypot(im_smooth, re_smooth);
                 pd_re_smooth[pd0*64+pd1*8+pd2] = re_smooth * pd_mag;
                 pd_im_smooth[pd0*64+pd1*8+pd2] = im_smooth * pd_mag;
             }
@@ -214,4 +214,4 @@ static av_cold void ps_tableinit(void)
 }
 #endif /* CONFIG_HARDCODED_TABLES */
 
-#endif /* AACPS_TABLEGEN_H */
+#endif /* AVCODEC_AACPS_TABLEGEN_H */

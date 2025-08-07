@@ -23,6 +23,7 @@
 
 #include "avformat.h"
 #include "avio.h"
+#include "demux.h"
 #include "internal.h"
 
 typedef struct SMUSHContext {
@@ -31,7 +32,7 @@ typedef struct SMUSHContext {
     int video_stream_index;
 } SMUSHContext;
 
-static int smush_read_probe(AVProbeData *p)
+static int smush_read_probe(const AVProbeData *p)
 {
     if (((AV_RL32(p->buf)     == MKTAG('S', 'A', 'N', 'M') &&
           AV_RL32(p->buf + 8) == MKTAG('S', 'H', 'D', 'R')) ||
@@ -50,7 +51,8 @@ static int smush_read_header(AVFormatContext *ctx)
     AVStream *vst, *ast;
     uint32_t magic, nframes, size, subversion, i;
     uint32_t width = 0, height = 0, got_audio = 0, read = 0;
-    uint32_t sample_rate, channels, palette[256];
+    uint32_t sample_rate, channels, palette[256], frame_rate = 15;
+    int ret;
 
     magic = avio_rb32(pb);
     avio_skip(pb, 4); // skip movie size
@@ -62,6 +64,7 @@ static int smush_read_header(AVFormatContext *ctx)
         size = avio_rb32(pb);
         if (size < 3 * 256 + 6)
             return AVERROR_INVALIDDATA;
+        size -= 3 * 256 + 6;
 
         smush->version = 0;
         subversion     = avio_rl16(pb);
@@ -74,7 +77,17 @@ static int smush_read_header(AVFormatContext *ctx)
         for (i = 0; i < 256; i++)
             palette[i] = avio_rb24(pb);
 
-        avio_skip(pb, size - (3 * 256 + 6));
+        if (subversion > 1) {
+            if (size < 12)
+                return AVERROR_INVALIDDATA;
+            size -= 12;
+            frame_rate = avio_rl32(pb);
+            avio_skip(pb, 4);            // max size of FRME chunk in file
+            sample_rate = avio_rl32(pb);
+            if (frame_rate < 1 || frame_rate > 70)
+                frame_rate = 12;
+        }
+        avio_skip(pb, size);
     } else if (magic == MKBETAG('S', 'A', 'N', 'M')) {
         if (avio_rb32(pb) != MKBETAG('S', 'H', 'D', 'R'))
             return AVERROR_INVALIDDATA;
@@ -129,7 +142,6 @@ static int smush_read_header(AVFormatContext *ctx)
                 break;
             default:
                 return AVERROR_INVALIDDATA;
-                break;
             }
         }
 
@@ -145,25 +157,25 @@ static int smush_read_header(AVFormatContext *ctx)
 
     smush->video_stream_index = vst->index;
 
-    avpriv_set_pts_info(vst, 64, 1, 15);
+    avpriv_set_pts_info(vst, 64, 1, frame_rate);
 
     vst->start_time        = 0;
     vst->duration          =
     vst->nb_frames         = nframes;
     vst->avg_frame_rate    = av_inv_q(vst->time_base);
-    vst->codec->codec_type = AVMEDIA_TYPE_VIDEO;
-    vst->codec->codec_id   = AV_CODEC_ID_SANM;
-    vst->codec->codec_tag  = 0;
-    vst->codec->width      = width;
-    vst->codec->height     = height;
+    vst->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+    vst->codecpar->codec_id   = AV_CODEC_ID_SANM;
+    vst->codecpar->codec_tag  = 0;
+    vst->codecpar->width      = width;
+    vst->codecpar->height     = height;
 
     if (!smush->version) {
-        if (ff_alloc_extradata(vst->codec, 1024 + 2))
-            return AVERROR(ENOMEM);
+        if ((ret = ff_alloc_extradata(vst->codecpar, 1024 + 2)) < 0)
+            return ret;
 
-        AV_WL16(vst->codec->extradata, subversion);
+        AV_WL16(vst->codecpar->extradata, subversion);
         for (i = 0; i < 256; i++)
-            AV_WL32(vst->codec->extradata + 2 + i * 4, palette[i]);
+            AV_WL32(vst->codecpar->extradata + 2 + i * 4, palette[i]);
     }
 
     if (got_audio) {
@@ -174,13 +186,12 @@ static int smush_read_header(AVFormatContext *ctx)
         smush->audio_stream_index = ast->index;
 
         ast->start_time         = 0;
-        ast->codec->codec_type  = AVMEDIA_TYPE_AUDIO;
-        ast->codec->codec_id    = AV_CODEC_ID_ADPCM_VIMA;
-        ast->codec->codec_tag   = 0;
-        ast->codec->sample_rate = sample_rate;
-        ast->codec->channels    = channels;
-
-        avpriv_set_pts_info(ast, 64, 1, ast->codec->sample_rate);
+        ast->codecpar->codec_type  = AVMEDIA_TYPE_AUDIO;
+        ast->codecpar->codec_id    = AV_CODEC_ID_ADPCM_VIMA;
+        ast->codecpar->codec_tag   = 0;
+        ast->codecpar->sample_rate = sample_rate;
+        ast->codecpar->ch_layout.nb_channels = channels;
+        avpriv_set_pts_info(ast, 64, 1, ast->codecpar->sample_rate);
     }
 
     return 0;
@@ -242,9 +253,9 @@ static int smush_read_packet(AVFormatContext *ctx, AVPacket *pkt)
     return 0;
 }
 
-AVInputFormat ff_smush_demuxer = {
-    .name           = "smush",
-    .long_name      = NULL_IF_CONFIG_SMALL("LucasArts Smush"),
+const FFInputFormat ff_smush_demuxer = {
+    .p.name         = "smush",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("LucasArts Smush"),
     .priv_data_size = sizeof(SMUSHContext),
     .read_probe     = smush_read_probe,
     .read_header    = smush_read_header,

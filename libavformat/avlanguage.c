@@ -19,8 +19,7 @@
  */
 
 #include "avlanguage.h"
-#include "libavutil/avstring.h"
-#include "libavutil/common.h"
+#include "libavutil/macros.h"
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
@@ -30,7 +29,7 @@ typedef struct LangEntry {
     uint16_t next_equivalent;
 } LangEntry;
 
-static const uint16_t lang_table_counts[] = { 484, 20, 184 };
+static const uint16_t lang_table_counts[] = { 484, 20, 190 };
 static const uint16_t lang_table_offsets[] = { 0, 484, 504 };
 
 static const LangEntry lang_table[] = {
@@ -540,7 +539,7 @@ static const LangEntry lang_table[] = {
     /*0501*/ { "slk",  647 },
     /*0502*/ { "sqi",  652 },
     /*0503*/ { "zho",  686 },
-    /*----- AV_LANG_ISO639_1 entries (184) -----*/
+    /*----- AV_LANG_ISO639_1 entries (190) -----*/
     /*0504*/ { "aa" ,    0 },
     /*0505*/ { "ab" ,    1 },
     /*0506*/ { "ae" ,   33 },
@@ -725,6 +724,12 @@ static const LangEntry lang_table[] = {
     /*0685*/ { "za" ,  478 },
     /*0686*/ { "zh" ,   78 },
     /*0687*/ { "zu" ,  480 },
+    /*0688*/ { "in" ,  195 }, /* deprecated */
+    /*0689*/ { "iw" ,  172 }, /* deprecated */
+    /*0690*/ { "ji" ,  472 }, /* deprecated */
+    /*0691*/ { "jw" ,  202 }, /* deprecated */
+    /*0692*/ { "mo" ,  358 }, /* deprecated */
+    /*0693*/ { "sh" ,  693 }, /* deprecated (no equivalent) */
     { "", 0 }
 };
 
@@ -733,7 +738,7 @@ static int lang_table_compare(const void *lhs, const void *rhs)
     return strcmp(lhs, ((const LangEntry *)rhs)->str);
 }
 
-const char *av_convert_lang_to(const char *lang, enum AVLangCodespace target_codespace)
+const char *ff_convert_lang_to(const char *lang, enum AVLangCodespace target_codespace)
 {
     int i;
     const LangEntry *entry = NULL;
@@ -759,7 +764,7 @@ const char *av_convert_lang_to(const char *lang, enum AVLangCodespace target_cod
             entry = lang_table + entry->next_equivalent;
 
     if (target_codespace == AV_LANG_ISO639_2_TERM)
-        return av_convert_lang_to(lang, AV_LANG_ISO639_2_BIBL);
+        return ff_convert_lang_to(lang, AV_LANG_ISO639_2_BIBL);
 
     return NULL;
 }

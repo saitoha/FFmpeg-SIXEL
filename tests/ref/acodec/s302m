@@ -1,4 +1,4 @@
-2d1494ad78292dca556fd079ec27f28d *tests/data/fate/acodec-s302m.mpegts
-1589164 tests/data/fate/acodec-s302m.mpegts
-f9b6528eee1aea04640ee83400c78689 *tests/data/fate/acodec-s302m.out.wav
-stddev:  986.97 PSNR: 36.44 MAXDIFF:18642 bytes:  1058400/  1056708
+08a3bec0e1626ad8c8a13b181ee1afb5 *tests/data/fate/acodec-s302m.mpegts
+1496104 tests/data/fate/acodec-s302m.mpegts
+abc1b26737c8103c3f122539d239f6be *tests/data/fate/acodec-s302m.out.wav
+stddev:  986.15 PSNR: 36.45 MAXDIFF:18571 bytes:  1058400/  1058400

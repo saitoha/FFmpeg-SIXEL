@@ -18,8 +18,13 @@
  * License along with FFmpeg; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
+
+#include "config_components.h"
+
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
+#include "mux.h"
 #include "libavcodec/get_bits.h"
 #include "libavcodec/put_bits.h"
 
@@ -29,22 +34,26 @@
 #define BIT_0      0x7f
 #define BIT_1      0x81
 
-static int probe(AVProbeData *p)
+#if CONFIG_BIT_DEMUXER
+static int probe(const AVProbeData *p)
 {
-    int i, j;
+    int i = 0, j, valid = 0;
 
-    if(p->buf_size < 0x40)
-        return 0;
-
-    for(i=0; i+3<p->buf_size && i< 10*0x50; ){
-        if(AV_RL16(&p->buf[0]) != SYNC_WORD)
+    while (2 * i + 3 < p->buf_size){
+        if (AV_RL16(&p->buf[2 * i++]) != SYNC_WORD)
             return 0;
-        j=AV_RL16(&p->buf[2]);
-        if(j!=0x40 && j!=0x50)
+        j = AV_RL16(&p->buf[2 * i++]);
+        if (j != 0 && j != 0x10 && j != 0x40 && j != 0x50 && j != 0x76)
             return 0;
-        i+=j;
+        if (j)
+            valid++;
+        i += j;
     }
-    return AVPROBE_SCORE_EXTENSION;
+    if (valid > 10)
+        return AVPROBE_SCORE_MAX;
+    if (valid > 2)
+        return AVPROBE_SCORE_EXTENSION - 1;
+    return 0;
 }
 
 static int read_header(AVFormatContext *s)
@@ -55,11 +64,11 @@ static int read_header(AVFormatContext *s)
     if (!st)
         return AVERROR(ENOMEM);
 
-    st->codec->codec_type = AVMEDIA_TYPE_AUDIO;
-    st->codec->codec_id=AV_CODEC_ID_G729;
-    st->codec->sample_rate=8000;
-    st->codec->block_align = 16;
-    st->codec->channels=1;
+    st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
+    st->codecpar->codec_id=AV_CODEC_ID_G729;
+    st->codecpar->sample_rate=8000;
+    st->codecpar->block_align = 16;
+    st->codecpar->ch_layout.nb_channels = 1;
 
     avpriv_set_pts_info(st, 64, 1, 100);
     return 0;
@@ -90,8 +99,8 @@ static int read_packet(AVFormatContext *s,
     if(ret != 8 * packet_size * sizeof(uint16_t))
         return AVERROR(EIO);
 
-    if (av_new_packet(pkt, packet_size) < 0)
-        return AVERROR(ENOMEM);
+    if ((ret = av_new_packet(pkt, packet_size)) < 0)
+        return ret;
 
     init_put_bits(&pbo, pkt->data, packet_size);
     for(j=0; j < packet_size; j++)
@@ -105,28 +114,29 @@ static int read_packet(AVFormatContext *s,
     return 0;
 }
 
-AVInputFormat ff_bit_demuxer = {
-    .name        = "bit",
-    .long_name   = NULL_IF_CONFIG_SMALL("G.729 BIT file format"),
+const FFInputFormat ff_bit_demuxer = {
+    .p.name       = "bit",
+    .p.long_name  = NULL_IF_CONFIG_SMALL("G.729 BIT file format"),
+    .p.extensions = "bit",
     .read_probe  = probe,
     .read_header = read_header,
     .read_packet = read_packet,
-    .extensions  = "bit",
 };
+#endif
 
-#if CONFIG_MUXERS
-static int write_header(AVFormatContext *s)
+#if CONFIG_BIT_MUXER
+static av_cold int init(AVFormatContext *s)
 {
-    AVCodecContext *enc = s->streams[0]->codec;
+    AVCodecParameters *par = s->streams[0]->codecpar;
 
-    if ((enc->codec_id != AV_CODEC_ID_G729) || enc->channels != 1) {
+    if (par->ch_layout.nb_channels != 1) {
         av_log(s, AV_LOG_ERROR,
                "only codec g729 with 1 channel is supported by this format\n");
         return AVERROR(EINVAL);
     }
 
-    enc->bits_per_coded_sample = 16;
-    enc->block_align = (enc->bits_per_coded_sample * enc->channels) >> 3;
+    par->bits_per_coded_sample = 16;
+    par->block_align = (par->bits_per_coded_sample * par->ch_layout.nb_channels) >> 3;
 
     return 0;
 }
@@ -141,23 +151,26 @@ static int write_packet(AVFormatContext *s, AVPacket *pkt)
         return AVERROR(EINVAL);
 
     avio_wl16(pb, SYNC_WORD);
-    avio_wl16(pb, 8 * 10);
+    avio_wl16(pb, 8 * pkt->size);
 
-    init_get_bits(&gb, pkt->data, 8*10);
-    for(i=0; i< 8 * 10; i++)
+    init_get_bits(&gb, pkt->data, 8 * pkt->size);
+    for (i = 0; i < 8 * pkt->size; i++)
         avio_wl16(pb, get_bits1(&gb) ? BIT_1 : BIT_0);
 
     return 0;
 }
 
-AVOutputFormat ff_bit_muxer = {
-    .name         = "bit",
-    .long_name    = NULL_IF_CONFIG_SMALL("G.729 BIT file format"),
-    .mime_type    = "audio/bit",
-    .extensions   = "bit",
-    .audio_codec  = AV_CODEC_ID_G729,
-    .video_codec  = AV_CODEC_ID_NONE,
-    .write_header = write_header,
+const FFOutputFormat ff_bit_muxer = {
+    .p.name         = "bit",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("G.729 BIT file format"),
+    .p.mime_type    = "audio/bit",
+    .p.extensions   = "bit",
+    .p.audio_codec  = AV_CODEC_ID_G729,
+    .p.video_codec  = AV_CODEC_ID_NONE,
+    .p.subtitle_codec = AV_CODEC_ID_NONE,
+    .flags_internal   = FF_OFMT_FLAG_MAX_ONE_OF_EACH |
+                        FF_OFMT_FLAG_ONLY_DEFAULT_CODECS,
+    .init             = init,
     .write_packet = write_packet,
 };
 #endif

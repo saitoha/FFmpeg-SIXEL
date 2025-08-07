@@ -22,11 +22,11 @@
 #include "httpauth.h"
 #include "libavutil/base64.h"
 #include "libavutil/avstring.h"
+#include "libavutil/mem.h"
 #include "internal.h"
 #include "libavutil/random_seed.h"
 #include "libavutil/md5.h"
 #include "urldecode.h"
-#include "avformat.h"
 
 static void handle_basic_params(HTTPAuthState *state, const char *key,
                                 int key_len, char **dest, int *dest_len)
@@ -90,7 +90,7 @@ static void choose_qop(char *qop, int size)
 void ff_http_auth_handle_header(HTTPAuthState *state, const char *key,
                                 const char *value)
 {
-    if (!strcmp(key, "WWW-Authenticate") || !strcmp(key, "Proxy-Authenticate")) {
+    if (!av_strcasecmp(key, "WWW-Authenticate") || !av_strcasecmp(key, "Proxy-Authenticate")) {
         const char *p;
         if (av_stristart(value, "Basic ", &p) &&
             state->auth_type <= HTTP_AUTH_BASIC) {
@@ -112,7 +112,7 @@ void ff_http_auth_handle_header(HTTPAuthState *state, const char *key,
             if (!av_strcasecmp(state->digest_params.stale, "true"))
                 state->stale = 1;
         }
-    } else if (!strcmp(key, "Authentication-Info")) {
+    } else if (!av_strcasecmp(key, "Authentication-Info")) {
         ff_parse_key_value(value, (ff_parse_key_val_cb) handle_digest_update,
                            state);
     }
@@ -156,7 +156,6 @@ static char *make_digest_auth(HTTPAuthState *state, const char *username,
     for (i = 0; i < 2; i++)
         cnonce_buf[i] = av_get_random_seed();
     ff_data_to_hex(cnonce, (const uint8_t*) cnonce_buf, sizeof(cnonce_buf), 1);
-    cnonce[2*sizeof(cnonce_buf)] = 0;
 
     md5ctx = av_md5_alloc();
     if (!md5ctx)
@@ -166,7 +165,6 @@ static char *make_digest_auth(HTTPAuthState *state, const char *username,
     update_md5_strings(md5ctx, username, ":", state->realm, ":", password, NULL);
     av_md5_final(md5ctx, hash);
     ff_data_to_hex(A1hash, hash, 16, 1);
-    A1hash[32] = 0;
 
     if (!strcmp(digest->algorithm, "") || !strcmp(digest->algorithm, "MD5")) {
     } else if (!strcmp(digest->algorithm, "MD5-sess")) {
@@ -174,7 +172,6 @@ static char *make_digest_auth(HTTPAuthState *state, const char *username,
         update_md5_strings(md5ctx, A1hash, ":", digest->nonce, ":", cnonce, NULL);
         av_md5_final(md5ctx, hash);
         ff_data_to_hex(A1hash, hash, 16, 1);
-        A1hash[32] = 0;
     } else {
         /* Unsupported algorithm */
         av_free(md5ctx);
@@ -185,7 +182,6 @@ static char *make_digest_auth(HTTPAuthState *state, const char *username,
     update_md5_strings(md5ctx, method, ":", uri, NULL);
     av_md5_final(md5ctx, hash);
     ff_data_to_hex(A2hash, hash, 16, 1);
-    A2hash[32] = 0;
 
     av_md5_init(md5ctx);
     update_md5_strings(md5ctx, A1hash, ":", digest->nonce, NULL);
@@ -195,7 +191,6 @@ static char *make_digest_auth(HTTPAuthState *state, const char *username,
     update_md5_strings(md5ctx, ":", A2hash, NULL);
     av_md5_final(md5ctx, hash);
     ff_data_to_hex(response, hash, 16, 1);
-    response[32] = 0;
 
     av_free(md5ctx);
 
@@ -220,21 +215,21 @@ static char *make_digest_auth(HTTPAuthState *state, const char *username,
 
     /* TODO: Escape the quoted strings properly. */
     av_strlcatf(authstr, len, "username=\"%s\"",   username);
-    av_strlcatf(authstr, len, ",realm=\"%s\"",     state->realm);
-    av_strlcatf(authstr, len, ",nonce=\"%s\"",     digest->nonce);
-    av_strlcatf(authstr, len, ",uri=\"%s\"",       uri);
-    av_strlcatf(authstr, len, ",response=\"%s\"",  response);
+    av_strlcatf(authstr, len, ", realm=\"%s\"",     state->realm);
+    av_strlcatf(authstr, len, ", nonce=\"%s\"",     digest->nonce);
+    av_strlcatf(authstr, len, ", uri=\"%s\"",       uri);
+    av_strlcatf(authstr, len, ", response=\"%s\"",  response);
 
     // we are violating the RFC and use "" because all others seem to do that too.
     if (digest->algorithm[0])
-        av_strlcatf(authstr, len, ",algorithm=\"%s\"",  digest->algorithm);
+        av_strlcatf(authstr, len, ", algorithm=\"%s\"",  digest->algorithm);
 
     if (digest->opaque[0])
-        av_strlcatf(authstr, len, ",opaque=\"%s\"", digest->opaque);
+        av_strlcatf(authstr, len, ", opaque=\"%s\"", digest->opaque);
     if (digest->qop[0]) {
-        av_strlcatf(authstr, len, ",qop=\"%s\"",    digest->qop);
-        av_strlcatf(authstr, len, ",cnonce=\"%s\"", cnonce);
-        av_strlcatf(authstr, len, ",nc=%s",         nc);
+        av_strlcatf(authstr, len, ", qop=\"%s\"",    digest->qop);
+        av_strlcatf(authstr, len, ", cnonce=\"%s\"", cnonce);
+        av_strlcatf(authstr, len, ", nc=%s",         nc);
     }
 
     av_strlcatf(authstr, len, "\r\n");
@@ -255,7 +250,7 @@ char *ff_http_auth_create_response(HTTPAuthState *state, const char *auth,
 
     if (state->auth_type == HTTP_AUTH_BASIC) {
         int auth_b64_len, len;
-        char *ptr, *decoded_auth = ff_urldecode(auth);
+        char *ptr, *decoded_auth = ff_urldecode(auth, 0);
 
         if (!decoded_auth)
             return NULL;
@@ -275,7 +270,7 @@ char *ff_http_auth_create_response(HTTPAuthState *state, const char *auth,
         av_strlcat(ptr, "\r\n", len - (ptr - authstr));
         av_free(decoded_auth);
     } else if (state->auth_type == HTTP_AUTH_DIGEST) {
-        char *username = ff_urldecode(auth), *password;
+        char *username = ff_urldecode(auth, 0), *password;
 
         if (!username)
             return NULL;

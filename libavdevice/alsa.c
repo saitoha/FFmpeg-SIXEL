@@ -28,10 +28,13 @@
  * @author Nicolas George ( nicolas george normalesup org )
  */
 
+#include "config_components.h"
+
 #include <alsa/asoundlib.h>
 #include "avdevice.h"
 #include "libavutil/avassert.h"
 #include "libavutil/channel_layout.h"
+#include "libavutil/mem.h"
 
 #include "alsa.h"
 
@@ -89,7 +92,7 @@ MAKE_REORDER_FUNCS(5, out_50, \
         out[2] = in[3]; \
         out[3] = in[4]; \
         out[4] = in[2]; \
-        );
+        )
 
 MAKE_REORDER_FUNCS(6, out_51, \
         out[0] = in[0]; \
@@ -98,7 +101,7 @@ MAKE_REORDER_FUNCS(6, out_51, \
         out[3] = in[5]; \
         out[4] = in[2]; \
         out[5] = in[3]; \
-        );
+        )
 
 MAKE_REORDER_FUNCS(8, out_71, \
         out[0] = in[0]; \
@@ -109,7 +112,7 @@ MAKE_REORDER_FUNCS(8, out_71, \
         out[5] = in[3]; \
         out[6] = in[6]; \
         out[7] = in[7]; \
-        );
+        )
 
 #define FORMAT_I8  0
 #define FORMAT_I16 1
@@ -124,7 +127,8 @@ switch(format) {\
     case FORMAT_F32: s->reorder_func = alsa_reorder_f32_out_ ##layout;   break;\
 }
 
-static av_cold int find_reorder_func(AlsaData *s, int codec_id, uint64_t layout, int out)
+static av_cold int find_reorder_func(AlsaData *s, int codec_id,
+                                     const AVChannelLayout *layout, int out)
 {
     int format;
 
@@ -133,7 +137,8 @@ static av_cold int find_reorder_func(AlsaData *s, int codec_id, uint64_t layout,
         return AVERROR(ENOSYS);
 
     /* reordering is not needed for QUAD or 2_2 layout */
-    if (layout == AV_CH_LAYOUT_QUAD || layout == AV_CH_LAYOUT_2_2)
+    if (!av_channel_layout_compare(layout, &(AVChannelLayout)AV_CHANNEL_LAYOUT_QUAD) ||
+        !av_channel_layout_compare(layout, &(AVChannelLayout)AV_CHANNEL_LAYOUT_2_2))
         return 0;
 
     switch (codec_id) {
@@ -154,11 +159,13 @@ static av_cold int find_reorder_func(AlsaData *s, int codec_id, uint64_t layout,
     default:                 return AVERROR(ENOSYS);
     }
 
-    if      (layout == AV_CH_LAYOUT_5POINT0_BACK || layout == AV_CH_LAYOUT_5POINT0)
+    if (!av_channel_layout_compare(layout, &(AVChannelLayout)AV_CHANNEL_LAYOUT_5POINT0_BACK) ||
+        !av_channel_layout_compare(layout, &(AVChannelLayout)AV_CHANNEL_LAYOUT_5POINT0))
         PICK_REORDER(50)
-    else if (layout == AV_CH_LAYOUT_5POINT1_BACK || layout == AV_CH_LAYOUT_5POINT1)
+    else if (!av_channel_layout_compare(layout, &(AVChannelLayout)AV_CHANNEL_LAYOUT_5POINT1_BACK) ||
+             !av_channel_layout_compare(layout, &(AVChannelLayout)AV_CHANNEL_LAYOUT_5POINT1))
         PICK_REORDER(51)
-    else if (layout == AV_CH_LAYOUT_7POINT1)
+    else if (!av_channel_layout_compare(layout, &(AVChannelLayout)AV_CHANNEL_LAYOUT_7POINT1))
         PICK_REORDER(71)
 
     return s->reorder_func ? 0 : AVERROR(ENOSYS);
@@ -166,7 +173,7 @@ static av_cold int find_reorder_func(AlsaData *s, int codec_id, uint64_t layout,
 
 av_cold int ff_alsa_open(AVFormatContext *ctx, snd_pcm_stream_t mode,
                          unsigned int *sample_rate,
-                         int channels, enum AVCodecID *codec_id)
+                         const AVChannelLayout *layout, enum AVCodecID *codec_id)
 {
     AlsaData *s = ctx->priv_data;
     const char *audio_device;
@@ -175,10 +182,9 @@ av_cold int ff_alsa_open(AVFormatContext *ctx, snd_pcm_stream_t mode,
     snd_pcm_t *h;
     snd_pcm_hw_params_t *hw_params;
     snd_pcm_uframes_t buffer_size, period_size;
-    uint64_t layout = ctx->streams[0]->codec->channel_layout;
 
-    if (ctx->filename[0] == 0) audio_device = "default";
-    else                       audio_device = ctx->filename;
+    if (ctx->url[0] == 0) audio_device = "default";
+    else                  audio_device = ctx->url;
 
     if (*codec_id == AV_CODEC_ID_NONE)
         *codec_id = DEFAULT_CODEC_ID;
@@ -187,7 +193,7 @@ av_cold int ff_alsa_open(AVFormatContext *ctx, snd_pcm_stream_t mode,
         av_log(ctx, AV_LOG_ERROR, "sample format 0x%04x is not supported\n", *codec_id);
         return AVERROR(ENOSYS);
     }
-    s->frame_size = av_get_bits_per_sample(*codec_id) / 8 * channels;
+    s->frame_size = av_get_bits_per_sample(*codec_id) / 8 * layout->nb_channels;
 
     if (ctx->flags & AVFMT_FLAG_NONBLOCK) {
         flags = SND_PCM_NONBLOCK;
@@ -234,10 +240,10 @@ av_cold int ff_alsa_open(AVFormatContext *ctx, snd_pcm_stream_t mode,
         goto fail;
     }
 
-    res = snd_pcm_hw_params_set_channels(h, hw_params, channels);
+    res = snd_pcm_hw_params_set_channels(h, hw_params, layout->nb_channels);
     if (res < 0) {
         av_log(ctx, AV_LOG_ERROR, "cannot set channel count to %d (%s)\n",
-               channels, snd_strerror(res));
+               layout->nb_channels, snd_strerror(res));
         goto fail;
     }
 
@@ -271,10 +277,10 @@ av_cold int ff_alsa_open(AVFormatContext *ctx, snd_pcm_stream_t mode,
 
     snd_pcm_hw_params_free(hw_params);
 
-    if (channels > 2 && layout) {
+    if (layout->nb_channels > 2 && layout->order != AV_CHANNEL_ORDER_UNSPEC) {
         if (find_reorder_func(s, *codec_id, layout, mode == SND_PCM_STREAM_PLAYBACK) < 0) {
             char name[128];
-            av_get_channel_layout_string(name, sizeof(name), channels, layout);
+            av_channel_layout_describe(layout, name, sizeof(name));
             av_log(ctx, AV_LOG_WARNING, "ALSA channel layout unknown or unimplemented for %s %s.\n",
                    name, mode == SND_PCM_STREAM_PLAYBACK ? "playback" : "capture");
         }
@@ -285,6 +291,10 @@ av_cold int ff_alsa_open(AVFormatContext *ctx, snd_pcm_stream_t mode,
                 goto fail1;
         }
     }
+
+    s->pkt = av_packet_alloc();
+    if (!s->pkt)
+        goto fail1;
 
     s->h = h;
     return 0;
@@ -300,10 +310,15 @@ av_cold int ff_alsa_close(AVFormatContext *s1)
 {
     AlsaData *s = s1->priv_data;
 
+    if (snd_pcm_stream(s->h) == SND_PCM_STREAM_PLAYBACK) {
+        snd_pcm_nonblock(s->h, 0);
+        snd_pcm_drain(s->h);
+    }
     av_freep(&s->reorder_buf);
     if (CONFIG_ALSA_INDEV)
         ff_timefilter_destroy(s->timefilter);
     snd_pcm_close(s->h);
+    av_packet_free(&s->pkt);
     return 0;
 }
 

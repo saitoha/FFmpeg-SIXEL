@@ -1,5 +1,5 @@
 /*
- * MPEG1/2 common code
+ * MPEG-1/2 common code
  * Copyright (c) 2007 Aurelien Jacobs <aurel@gnuage.org>
  *
  * This file is part of FFmpeg.
@@ -22,53 +22,20 @@
 #ifndef AVCODEC_MPEG12_H
 #define AVCODEC_MPEG12_H
 
-#include "mpegvideo.h"
+#include "libavutil/rational.h"
 
-#define DC_VLC_BITS 9
-#define MV_VLC_BITS 9
-#define TEX_VLC_BITS 9
+/* Start codes. */
+#define SEQ_END_CODE            0x000001b7
+#define SEQ_START_CODE          0x000001b3
+#define GOP_START_CODE          0x000001b8
+#define PICTURE_START_CODE      0x00000100
+#define SLICE_MIN_START_CODE    0x00000101
+#define SLICE_MAX_START_CODE    0x000001af
+#define EXT_START_CODE          0x000001b5
+#define USER_START_CODE         0x000001b2
 
-#define MBINCR_VLC_BITS 9
-#define MB_PAT_VLC_BITS 9
-#define MB_PTYPE_VLC_BITS 6
-#define MB_BTYPE_VLC_BITS 6
-
-extern VLC ff_dc_lum_vlc;
-extern VLC ff_dc_chroma_vlc;
-extern VLC ff_mbincr_vlc;
-extern VLC ff_mb_ptype_vlc;
-extern VLC ff_mb_btype_vlc;
-extern VLC ff_mb_pat_vlc;
-extern VLC ff_mv_vlc;
-
-extern uint8_t ff_mpeg12_static_rl_table_store[2][2][2*MAX_RUN + MAX_LEVEL + 3];
-
-void ff_mpeg12_common_init(MpegEncContext *s);
-void ff_mpeg12_init_vlcs(void);
-
-static inline int decode_dc(GetBitContext *gb, int component)
-{
-    int code, diff;
-
-    if (component == 0) {
-        code = get_vlc2(gb, ff_dc_lum_vlc.table, DC_VLC_BITS, 2);
-    } else {
-        code = get_vlc2(gb, ff_dc_chroma_vlc.table, DC_VLC_BITS, 2);
-    }
-    if (code < 0){
-        av_log(NULL, AV_LOG_ERROR, "invalid dc code at\n");
-        return 0xffff;
-    }
-    if (code == 0) {
-        diff = 0;
-    } else {
-        diff = get_xbits(gb, code);
-    }
-    return diff;
-}
-
-int ff_mpeg1_decode_block_intra(MpegEncContext *s, int16_t *block, int n);
-void ff_mpeg1_clean_buffers(MpegEncContext *s);
-int ff_mpeg1_find_frame_end(ParseContext *pc, const uint8_t *buf, int buf_size, AVCodecParserContext *s);
+void ff_mpeg12_find_best_frame_rate(AVRational frame_rate,
+                                    int *code, int *ext_n, int *ext_d,
+                                    int nonstandard);
 
 #endif /* AVCODEC_MPEG12_H */

@@ -28,13 +28,13 @@
  */
 
 #include "libavutil/common.h"
+#include "libavutil/internal.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 
 #include "avfilter.h"
 #include "drawutils.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
 #include "video.h"
 
 // #define DEBUG
@@ -53,7 +53,7 @@ enum HisteqAntibanding {
     HISTEQ_ANTIBANDING_NB,
 };
 
-typedef struct {
+typedef struct HisteqContext {
     const AVClass *class;
     float strength;
     float intensity;
@@ -67,12 +67,12 @@ typedef struct {
 
 #define OFFSET(x) offsetof(HisteqContext, x)
 #define FLAGS AV_OPT_FLAG_VIDEO_PARAM|AV_OPT_FLAG_FILTERING_PARAM
-#define CONST(name, help, val, unit) { name, help, 0, AV_OPT_TYPE_CONST, {.i64=val}, INT_MIN, INT_MAX, FLAGS, unit }
+#define CONST(name, help, val, u) { name, help, 0, AV_OPT_TYPE_CONST, {.i64=val}, INT_MIN, INT_MAX, FLAGS, .unit = u }
 
 static const AVOption histeq_options[] = {
     { "strength",    "set the strength", OFFSET(strength), AV_OPT_TYPE_FLOAT, {.dbl=0.2}, 0, 1, FLAGS },
     { "intensity",   "set the intensity", OFFSET(intensity), AV_OPT_TYPE_FLOAT, {.dbl=0.21}, 0, 1, FLAGS },
-    { "antibanding", "set the antibanding level", OFFSET(antibanding), AV_OPT_TYPE_INT, {.i64=HISTEQ_ANTIBANDING_NONE}, 0, HISTEQ_ANTIBANDING_NB-1, FLAGS, "antibanding" },
+    { "antibanding", "set the antibanding level", OFFSET(antibanding), AV_OPT_TYPE_INT, {.i64=HISTEQ_ANTIBANDING_NONE}, 0, HISTEQ_ANTIBANDING_NB-1, FLAGS, .unit = "antibanding" },
     CONST("none",    "apply no antibanding",     HISTEQ_ANTIBANDING_NONE,   "antibanding"),
     CONST("weak",    "apply weak antibanding",   HISTEQ_ANTIBANDING_WEAK,   "antibanding"),
     CONST("strong",  "apply strong antibanding", HISTEQ_ANTIBANDING_STRONG, "antibanding"),
@@ -92,18 +92,11 @@ static av_cold int init(AVFilterContext *ctx)
     return 0;
 }
 
-static int query_formats(AVFilterContext *ctx)
-{
-    static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_ARGB, AV_PIX_FMT_RGBA, AV_PIX_FMT_ABGR, AV_PIX_FMT_BGRA,
-        AV_PIX_FMT_RGB24, AV_PIX_FMT_BGR24,
-        AV_PIX_FMT_NONE
-    };
-    AVFilterFormats *fmts_list = ff_make_format_list(pix_fmts);
-    if (!fmts_list)
-        return AVERROR(ENOMEM);
-    return ff_set_common_formats(ctx, fmts_list);
-}
+static const enum AVPixelFormat pix_fmts[] = {
+    AV_PIX_FMT_ARGB, AV_PIX_FMT_RGBA, AV_PIX_FMT_ABGR, AV_PIX_FMT_BGRA,
+    AV_PIX_FMT_RGB24, AV_PIX_FMT_BGR24,
+    AV_PIX_FMT_NONE
+};
 
 static int config_input(AVFilterLink *inlink)
 {
@@ -168,7 +161,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *inpic)
 
 #ifdef DEBUG
     for (x = 0; x < 256; x++)
-        av_dlog(ctx, "in[%d]: %u\n", x, histeq->in_histogram[x]);
+        ff_dlog(ctx, "in[%d]: %u\n", x, histeq->in_histogram[x]);
 #endif
 
     /* Calculate the lookup table. */
@@ -244,7 +237,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *inpic)
     }
 #ifdef DEBUG
     for (x = 0; x < 256; x++)
-        av_dlog(ctx, "out[%d]: %u\n", x, histeq->out_histogram[x]);
+        ff_dlog(ctx, "out[%d]: %u\n", x, histeq->out_histogram[x]);
 #endif
 
     av_frame_free(&inpic);
@@ -258,25 +251,16 @@ static const AVFilterPad histeq_inputs[] = {
         .config_props = config_input,
         .filter_frame = filter_frame,
     },
-    { NULL }
 };
 
-static const AVFilterPad histeq_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-    { NULL }
-};
-
-AVFilter ff_vf_histeq = {
-    .name          = "histeq",
-    .description   = NULL_IF_CONFIG_SMALL("Apply global color histogram equalization."),
+const FFFilter ff_vf_histeq = {
+    .p.name        = "histeq",
+    .p.description = NULL_IF_CONFIG_SMALL("Apply global color histogram equalization."),
+    .p.priv_class  = &histeq_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
     .priv_size     = sizeof(HisteqContext),
     .init          = init,
-    .query_formats = query_formats,
-    .inputs        = histeq_inputs,
-    .outputs       = histeq_outputs,
-    .priv_class    = &histeq_class,
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
+    FILTER_INPUTS(histeq_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_PIXFMTS_ARRAY(pix_fmts),
 };

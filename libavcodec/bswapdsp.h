@@ -16,8 +16,8 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#ifndef AVCODEC_BSWAP_BUF_H
-#define AVCODEC_BSWAP_BUF_H
+#ifndef AVCODEC_BSWAPDSP_H
+#define AVCODEC_BSWAPDSP_H
 
 #include <stdint.h>
 
@@ -27,6 +27,7 @@ typedef struct BswapDSPContext {
 } BswapDSPContext;
 
 void ff_bswapdsp_init(BswapDSPContext *c);
+void ff_bswapdsp_init_riscv(BswapDSPContext *c);
 void ff_bswapdsp_init_x86(BswapDSPContext *c);
 
-#endif /* AVCODEC_BSWAP_BUF_H */
+#endif /* AVCODEC_BSWAPDSP_H */

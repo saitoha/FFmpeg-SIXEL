@@ -21,9 +21,10 @@
 
 #include "libavutil/intreadwrite.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
-static int sdr2_probe(AVProbeData *p)
+static int sdr2_probe(const AVProbeData *p)
 {
     if (AV_RL32(p->buf) != MKTAG('S', 'R', 'A', 1))
         return 0;
@@ -47,16 +48,16 @@ static int sdr2_read_header(AVFormatContext *s)
 
     avio_skip(s->pb, 20);
     avpriv_set_pts_info(st, 64, 1, avio_rl32(s->pb));
-    st->codec->codec_type = AVMEDIA_TYPE_VIDEO;
-    st->codec->width      = avio_rl32(s->pb);
-    st->codec->height     = avio_rl32(s->pb);
-    st->codec->codec_id   = AV_CODEC_ID_H264;
-    st->need_parsing      = AVSTREAM_PARSE_FULL;
+    st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+    st->codecpar->width      = avio_rl32(s->pb);
+    st->codecpar->height     = avio_rl32(s->pb);
+    st->codecpar->codec_id   = AV_CODEC_ID_H264;
+    ffstream(st)->need_parsing = AVSTREAM_PARSE_FULL;
 
-    ast->codec->codec_type  = AVMEDIA_TYPE_AUDIO;
-    ast->codec->channels    = 1;
-    ast->codec->sample_rate = 8000;
-    ast->codec->codec_id    = AV_CODEC_ID_PCM_S16LE;
+    ast->codecpar->codec_type  = AVMEDIA_TYPE_AUDIO;
+    ast->codecpar->ch_layout.nb_channels = 1;
+    ast->codecpar->sample_rate = 8000;
+    ast->codecpar->codec_id    = AV_CODEC_ID_PCM_S16LE;
     avpriv_set_pts_info(ast, 64, 1, 8000);
 
     avio_seek(s->pb, FIRST, SEEK_SET);
@@ -90,12 +91,11 @@ static int sdr2_read_packet(AVFormatContext *s, AVPacket *pkt)
     avio_skip(s->pb, 30);
 
     if (pos == FIRST) {
-        if (av_new_packet(pkt, next - 52 + 24) < 0)
-            return AVERROR(ENOMEM);
+        if ((ret = av_new_packet(pkt, next - 52 + 24)) < 0)
+            return ret;
         memcpy(pkt->data, header, 24);
         ret = avio_read(s->pb, pkt->data + 24, next - 52);
         if (ret < 0) {
-            av_free_packet(pkt);
             return ret;
         }
         av_shrink_packet(pkt, ret + 24);
@@ -110,12 +110,12 @@ static int sdr2_read_packet(AVFormatContext *s, AVPacket *pkt)
     return ret;
 }
 
-AVInputFormat ff_sdr2_demuxer = {
-    .name        = "sdr2",
-    .long_name   = NULL_IF_CONFIG_SMALL("SDR2"),
+const FFInputFormat ff_sdr2_demuxer = {
+    .p.name      = "sdr2",
+    .p.long_name = NULL_IF_CONFIG_SMALL("SDR2"),
+    .p.extensions= "sdr2",
+    .p.flags     = AVFMT_GENERIC_INDEX,
     .read_probe  = sdr2_probe,
     .read_header = sdr2_read_header,
     .read_packet = sdr2_read_packet,
-    .extensions  = "sdr2",
-    .flags       = AVFMT_GENERIC_INDEX,
 };

@@ -118,6 +118,72 @@
     B(1, 1) = (T(0, 1) + T(2, 1)) >> (1 + BAYER_SHIFT);
 #endif
 
+#if defined(BAYER_BGGR) || defined(BAYER_RGGB)
+#define BAYER_TO_RGB48_COPY \
+    R(0, 0) = \
+    R(0, 1) = \
+    R(1, 1) = \
+    R(1, 0) = S(1, 1); \
+    \
+    G(0, 1) = S(0, 1); \
+    G(0, 0) = \
+    G(1, 1) = (T(0, 1) + T(1, 0)) >> 1; \
+    G(1, 0) = S(1, 0); \
+    \
+    B(1, 1) = \
+    B(0, 0) = \
+    B(0, 1) = \
+    B(1, 0) = S(0, 0);
+#define BAYER_TO_RGB48_INTERPOLATE \
+    R(0, 0) = (T(-1, -1) + T(-1,  1) + T(1, -1) + T(1, 1)) >> 2; \
+    G(0, 0) = (T(-1,  0) + T( 0, -1) + T(0,  1) + T(1, 0)) >> 2; \
+    B(0, 0) =  S(0, 0); \
+    \
+    R(0, 1) = (T(-1, 1) + T(1, 1)) >> 1; \
+    G(0, 1) =  S(0,  1); \
+    B(0, 1) = (T(0,  0) + T(0, 2)) >> 1; \
+    \
+    R(1, 0) = (T(1, -1) + T(1, 1)) >> 1; \
+    G(1, 0) =  S(1,  0); \
+    B(1, 0) = (T(0,  0) + T(2, 0)) >> 1; \
+    \
+    R(1, 1) =  S(1, 1); \
+    G(1, 1) = (T(0, 1) + T(1, 0) + T(1, 2) + T(2, 1)) >> 2; \
+    B(1, 1) = (T(0, 0) + T(0, 2) + T(2, 0) + T(2, 2)) >> 2;
+#else
+#define BAYER_TO_RGB48_COPY \
+    R(0, 0) = \
+    R(0, 1) = \
+    R(1, 1) = \
+    R(1, 0) = S(1, 0); \
+    \
+    G(0, 0) = S(0, 0); \
+    G(1, 1) = S(1, 1); \
+    G(0, 1) = \
+    G(1, 0) = (T(0, 0) + T(1, 1)) >> 1; \
+    \
+    B(1, 1) = \
+    B(0, 0) = \
+    B(0, 1) = \
+    B(1, 0) = S(0, 1);
+#define BAYER_TO_RGB48_INTERPOLATE \
+    R(0, 0) = (T(-1, 0) + T(1, 0)) >> 1; \
+    G(0, 0) =  S(0, 0); \
+    B(0, 0) = (T(0, -1) + T(0, 1)) >> 1; \
+    \
+    R(0, 1) = (T(-1, 0) + T(-1, 2) + T(1, 0) + T(1, 2)) >> 2; \
+    G(0, 1) = (T(-1, 1) + T(0,  0) + T(0, 2) + T(1, 1)) >> 2; \
+    B(0, 1) =  S(0, 1); \
+    \
+    R(1, 0) =  S(1, 0); \
+    G(1, 0) = (T(0, 0)  + T(1, -1) + T(1,  1) + T(2, 0)) >> 2; \
+    B(1, 0) = (T(0, -1) + T(0,  1) + T(2, -1) + T(2, 1)) >> 2; \
+    \
+    R(1, 1) = (T(1, 0) + T(1, 2)) >> 1; \
+    G(1, 1) =  S(1, 1); \
+    B(1, 1) = (T(0, 1) + T(2, 1)) >> 1;
+#endif
+
 /**
  * invoke ff_rgb24toyv12 for 2x2 pixels
  */
@@ -153,7 +219,41 @@ static void BAYER_RENAME(rgb24_interpolate)(const uint8_t *src, int src_stride, 
     }
 }
 
-static void BAYER_RENAME(yv12_copy)(const uint8_t *src, int src_stride, uint8_t *dstY, uint8_t *dstU, uint8_t *dstV, int luma_stride, int width, int32_t *rgb2yuv)
+static void BAYER_RENAME(rgb48_copy)(const uint8_t *src, int src_stride, uint8_t *ddst, int dst_stride, int width)
+{
+    uint16_t *dst = (uint16_t *)ddst;
+    int i;
+
+    dst_stride /= 2;
+    for (i = 0 ; i < width; i+= 2) {
+        BAYER_TO_RGB48_COPY
+        src += 2 * BAYER_SIZEOF;
+        dst += 6;
+    }
+}
+
+static void BAYER_RENAME(rgb48_interpolate)(const uint8_t *src, int src_stride, uint8_t *ddst, int dst_stride, int width)
+{
+    uint16_t *dst = (uint16_t *)ddst;
+    int i;
+
+    dst_stride /= 2;
+    BAYER_TO_RGB48_COPY
+    src += 2 * BAYER_SIZEOF;
+    dst += 6;
+
+    for (i = 2 ; i < width - 2; i+= 2) {
+        BAYER_TO_RGB48_INTERPOLATE
+        src += 2 * BAYER_SIZEOF;
+        dst += 6;
+    }
+
+    if (width > 2) {
+        BAYER_TO_RGB48_COPY
+    }
+}
+
+static void BAYER_RENAME(yv12_copy)(const uint8_t *src, int src_stride, uint8_t *dstY, uint8_t *dstU, uint8_t *dstV, int luma_stride, int width, const int32_t *rgb2yuv)
 {
     uint8_t dst[12];
     const int dst_stride = 6;
@@ -168,7 +268,7 @@ static void BAYER_RENAME(yv12_copy)(const uint8_t *src, int src_stride, uint8_t 
     }
 }
 
-static void BAYER_RENAME(yv12_interpolate)(const uint8_t *src, int src_stride, uint8_t *dstY, uint8_t *dstU, uint8_t *dstV, int luma_stride, int width, int32_t *rgb2yuv)
+static void BAYER_RENAME(yv12_interpolate)(const uint8_t *src, int src_stride, uint8_t *dstY, uint8_t *dstU, uint8_t *dstV, int luma_stride, int width, const int32_t *rgb2yuv)
 {
     uint8_t dst[12];
     const int dst_stride = 6;
@@ -203,6 +303,8 @@ static void BAYER_RENAME(yv12_interpolate)(const uint8_t *src, int src_stride, u
 #undef B
 #undef BAYER_TO_RGB24_COPY
 #undef BAYER_TO_RGB24_INTERPOLATE
+#undef BAYER_TO_RGB48_COPY
+#undef BAYER_TO_RGB48_INTERPOLATE
 
 #undef BAYER_RENAME
 

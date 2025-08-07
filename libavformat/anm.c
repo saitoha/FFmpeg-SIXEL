@@ -26,6 +26,7 @@
 
 #include "libavutil/intreadwrite.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
 typedef struct Page {
@@ -47,7 +48,7 @@ typedef struct AnmDemuxContext {
 #define LPF_TAG  MKTAG('L','P','F',' ')
 #define ANIM_TAG MKTAG('A','N','I','M')
 
-static int probe(AVProbeData *p)
+static int probe(const AVProbeData *p)
 {
     /* verify tags and video dimensions */
     if (AV_RL32(&p->buf[0])  == LPF_TAG &&
@@ -100,11 +101,11 @@ static int read_header(AVFormatContext *s)
     st = avformat_new_stream(s, NULL);
     if (!st)
         return AVERROR(ENOMEM);
-    st->codec->codec_type = AVMEDIA_TYPE_VIDEO;
-    st->codec->codec_id   = AV_CODEC_ID_ANM;
-    st->codec->codec_tag  = 0; /* no fourcc */
-    st->codec->width      = avio_rl16(pb);
-    st->codec->height     = avio_rl16(pb);
+    st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+    st->codecpar->codec_id   = AV_CODEC_ID_ANM;
+    st->codecpar->codec_tag  = 0; /* no fourcc */
+    st->codecpar->width      = avio_rl16(pb);
+    st->codecpar->height     = avio_rl16(pb);
     if (avio_r8(pb) != 0)
         goto invalid;
     avio_skip(pb, 1); /* frame rate multiplier info */
@@ -132,12 +133,7 @@ static int read_header(AVFormatContext *s)
     avio_skip(pb, 58);
 
     /* color cycling and palette data */
-    st->codec->extradata_size = 16*8 + 4*256;
-    st->codec->extradata      = av_mallocz(st->codec->extradata_size + FF_INPUT_BUFFER_PADDING_SIZE);
-    if (!st->codec->extradata) {
-        return AVERROR(ENOMEM);
-    }
-    ret = avio_read(pb, st->codec->extradata, st->codec->extradata_size);
+    ret = ff_get_extradata(s, st->codecpar, s->pb, 16*8 + 4*256);
     if (ret < 0)
         return ret;
 
@@ -176,7 +172,7 @@ static int read_packet(AVFormatContext *s,
     int tmp, record_size;
 
     if (avio_feof(s->pb))
-        return AVERROR(EIO);
+        return AVERROR_EOF;
 
     if (anm->page < 0)
         return anm->page;
@@ -219,9 +215,9 @@ repeat:
     return 0;
 }
 
-AVInputFormat ff_anm_demuxer = {
-    .name           = "anm",
-    .long_name      = NULL_IF_CONFIG_SMALL("Deluxe Paint Animation"),
+const FFInputFormat ff_anm_demuxer = {
+    .p.name         = "anm",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Deluxe Paint Animation"),
     .priv_data_size = sizeof(AnmDemuxContext),
     .read_probe     = probe,
     .read_header    = read_header,

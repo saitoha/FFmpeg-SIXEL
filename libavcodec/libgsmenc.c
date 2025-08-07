@@ -28,16 +28,19 @@
 // The idiosyncrasies of GSM-in-WAV are explained at http://kbs.cs.tu-berlin.de/~jutta/toast.html
 
 #include "config.h"
+#include "config_components.h"
 #if HAVE_GSM_H
 #include <gsm.h>
 #else
 #include <gsm/gsm.h>
 #endif
 
+#include "libavutil/channel_layout.h"
 #include "libavutil/common.h"
 
 #include "avcodec.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "encode.h"
 #include "gsm.h"
 
 static av_cold int libgsm_encode_close(AVCodecContext *avctx) {
@@ -47,12 +50,6 @@ static av_cold int libgsm_encode_close(AVCodecContext *avctx) {
 }
 
 static av_cold int libgsm_encode_init(AVCodecContext *avctx) {
-    if (avctx->channels > 1) {
-        av_log(avctx, AV_LOG_ERROR, "Mono required for GSM, got %d channels\n",
-               avctx->channels);
-        return -1;
-    }
-
     if (avctx->sample_rate != 8000) {
         av_log(avctx, AV_LOG_ERROR, "Sample rate 8000Hz required for GSM, got %dHz\n",
                avctx->sample_rate);
@@ -62,7 +59,7 @@ static av_cold int libgsm_encode_init(AVCodecContext *avctx) {
     if (avctx->bit_rate != 13000 /* Official */ &&
         avctx->bit_rate != 13200 /* Very common */ &&
         avctx->bit_rate != 0 /* Unknown; a.o. mov does not set bitrate when decoding */ ) {
-        av_log(avctx, AV_LOG_ERROR, "Bitrate 13000bps required for GSM, got %dbps\n",
+        av_log(avctx, AV_LOG_ERROR, "Bitrate 13000bps required for GSM, got %"PRId64"bps\n",
                avctx->bit_rate);
         if (avctx->strict_std_compliance > FF_COMPLIANCE_UNOFFICIAL)
             return -1;
@@ -98,7 +95,7 @@ static int libgsm_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
     gsm_signal *samples = (gsm_signal *)frame->data[0];
     struct gsm_state *state = avctx->priv_data;
 
-    if ((ret = ff_alloc_packet2(avctx, avpkt, avctx->block_align)) < 0)
+    if ((ret = ff_get_encode_buffer(avctx, avpkt, avctx->block_align, 0)) < 0)
         return ret;
 
     switch(avctx->codec_id) {
@@ -114,30 +111,42 @@ static int libgsm_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
     return 0;
 }
 
+static const FFCodecDefault libgsm_defaults[] = {
+    { "b",                "13000" },
+    { NULL },
+};
 
 #if CONFIG_LIBGSM_ENCODER
-AVCodec ff_libgsm_encoder = {
-    .name           = "libgsm",
-    .long_name      = NULL_IF_CONFIG_SMALL("libgsm GSM"),
-    .type           = AVMEDIA_TYPE_AUDIO,
-    .id             = AV_CODEC_ID_GSM,
+const FFCodec ff_libgsm_encoder = {
+    .p.name         = "libgsm",
+    CODEC_LONG_NAME("libgsm GSM"),
+    .p.type         = AVMEDIA_TYPE_AUDIO,
+    .p.id           = AV_CODEC_ID_GSM,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
     .init           = libgsm_encode_init,
-    .encode2        = libgsm_encode_frame,
+    FF_CODEC_ENCODE_CB(libgsm_encode_frame),
     .close          = libgsm_encode_close,
-    .sample_fmts    = (const enum AVSampleFormat[]){ AV_SAMPLE_FMT_S16,
-                                                     AV_SAMPLE_FMT_NONE },
+    .defaults       = libgsm_defaults,
+    CODEC_CH_LAYOUTS(AV_CHANNEL_LAYOUT_MONO),
+    CODEC_SAMPLEFMTS(AV_SAMPLE_FMT_S16),
+    .p.wrapper_name = "libgsm",
+    .caps_internal  = FF_CODEC_CAP_NOT_INIT_THREADSAFE,
 };
 #endif
 #if CONFIG_LIBGSM_MS_ENCODER
-AVCodec ff_libgsm_ms_encoder = {
-    .name           = "libgsm_ms",
-    .long_name      = NULL_IF_CONFIG_SMALL("libgsm GSM Microsoft variant"),
-    .type           = AVMEDIA_TYPE_AUDIO,
-    .id             = AV_CODEC_ID_GSM_MS,
+const FFCodec ff_libgsm_ms_encoder = {
+    .p.name         = "libgsm_ms",
+    CODEC_LONG_NAME("libgsm GSM Microsoft variant"),
+    .p.type         = AVMEDIA_TYPE_AUDIO,
+    .p.id           = AV_CODEC_ID_GSM_MS,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
     .init           = libgsm_encode_init,
-    .encode2        = libgsm_encode_frame,
+    FF_CODEC_ENCODE_CB(libgsm_encode_frame),
     .close          = libgsm_encode_close,
-    .sample_fmts    = (const enum AVSampleFormat[]){ AV_SAMPLE_FMT_S16,
-                                                     AV_SAMPLE_FMT_NONE },
+    .defaults       = libgsm_defaults,
+    CODEC_CH_LAYOUTS(AV_CHANNEL_LAYOUT_MONO),
+    CODEC_SAMPLEFMTS(AV_SAMPLE_FMT_S16),
+    .p.wrapper_name = "libgsm",
+    .caps_internal  = FF_CODEC_CAP_NOT_INIT_THREADSAFE,
 };
 #endif

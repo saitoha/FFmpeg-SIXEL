@@ -22,8 +22,10 @@
 #define AVFORMAT_INTERNAL_H
 
 #include <stdint.h>
+
+#include "libavcodec/packet_internal.h"
+
 #include "avformat.h"
-#include "os_support.h"
 
 #define MAX_URL_SIZE 4096
 
@@ -47,61 +49,312 @@ typedef struct CodecMime{
     enum AVCodecID id;
 } CodecMime;
 
-struct AVFormatInternal {
+/*************************************************/
+/* fractional numbers for exact pts handling */
+
+/**
+ * The exact value of the fractional number is: 'val + num / den'.
+ * num is assumed to be 0 <= num < den.
+ */
+typedef struct FFFrac {
+    int64_t val, num, den;
+} FFFrac;
+
+
+typedef struct FFFormatContext {
     /**
-     * Number of streams relevant for interleaving.
-     * Muxing only.
+     * The public context.
      */
-    int nb_interleaved_streams;
+    AVFormatContext pub;
+
+    /**
+     * Whether the timestamp shift offset has already been determined.
+     * -1: disabled, 0: not yet determined, 1: determined.
+     */
+    enum {
+        AVOID_NEGATIVE_TS_DISABLED = -1,
+        AVOID_NEGATIVE_TS_UNKNOWN  = 0,
+        AVOID_NEGATIVE_TS_KNOWN    = 1,
+    } avoid_negative_ts_status;
+#define AVOID_NEGATIVE_TS_ENABLED(status) ((status) >= 0)
 
     /**
      * This buffer is only needed when packets were already buffered but
      * not decoded, for example to get the codec parameters in MPEG
      * streams.
      */
-    struct AVPacketList *packet_buffer;
-    struct AVPacketList *packet_buffer_end;
+    PacketList packet_buffer;
 
     /* av_seek_frame() support */
     int64_t data_offset; /**< offset of the first packet */
 
     /**
-     * Raw packets from the demuxer, prior to parsing and decoding.
-     * This buffer is used for buffering packets until the codec can
-     * be identified, as parsing cannot be done without knowing the
-     * codec.
+     * The generic code uses this as a temporary packet
+     * to parse packets or for muxing, especially flushing.
+     * For demuxers, it may also be used for other means
+     * for short periods that are guaranteed not to overlap
+     * with calls to av_read_frame() (or ff_read_packet())
+     * or with each other.
+     * It may be used by demuxers as a replacement for
+     * stack packets (unless they call one of the aforementioned
+     * functions with their own AVFormatContext).
+     * Every user has to ensure that this packet is blank
+     * after using it.
      */
-    struct AVPacketList *raw_packet_buffer;
-    struct AVPacketList *raw_packet_buffer_end;
-    /**
-     * Packets split by the parser get queued here.
-     */
-    struct AVPacketList *parse_queue;
-    struct AVPacketList *parse_queue_end;
-    /**
-     * Remaining size available for raw_packet_buffer, in bytes.
-     */
-#define RAW_PACKET_BUFFER_SIZE 2500000
-    int raw_packet_buffer_remaining_size;
+    AVPacket *parse_pkt;
 
     /**
-     * Offset to remap timestamps to be non-negative.
-     * Expressed in timebase units.
-     * @see AVStream.mux_ts_offset
+     * Used to hold temporary packets for the generic demuxing code.
+     * When muxing, it may be used by muxers to hold packets (even
+     * permanent ones).
      */
-    int64_t offset;
-
-    /**
-     * Timebase for the timestamp offset.
-     */
-    AVRational offset_timebase;
-
-    int inject_global_side_data;
+    AVPacket *pkt;
 
     int avoid_negative_ts_use_pts;
-};
 
-#ifdef __GNUC__
+    /**
+     * ID3v2 tag useful for MP3 demuxing
+     */
+    AVDictionary *id3v2_meta;
+
+    int missing_streams;
+} FFFormatContext;
+
+static av_always_inline FFFormatContext *ffformatcontext(AVFormatContext *s)
+{
+    return (FFFormatContext*)s;
+}
+
+typedef struct FFStream {
+    /**
+     * The public context.
+     */
+    AVStream pub;
+
+    AVFormatContext *fmtctx;
+    /**
+     * Set to 1 if the codec allows reordering, so pts can be different
+     * from dts.
+     */
+    int reorder;
+
+    /**
+     * bitstream filter to run on stream
+     * - encoding: Set by muxer using ff_stream_add_bitstream_filter
+     * - decoding: unused
+     */
+    struct AVBSFContext *bsfc;
+
+    /**
+     * Whether or not check_bitstream should still be run on each packet
+     */
+    int bitstream_checked;
+
+    /**
+     * The codec context used by avformat_find_stream_info, the parser, etc.
+     */
+    struct AVCodecContext *avctx;
+    /**
+     * 1 if avctx has been initialized with the values from the codec parameters
+     */
+    int avctx_inited;
+
+    /* the context for extracting extradata in find_stream_info()
+     * inited=1/bsf=NULL signals that extracting is not possible (codec not
+     * supported) */
+    struct {
+        struct AVBSFContext *bsf;
+        int inited;
+    } extract_extradata;
+
+    /**
+     * Whether the internal avctx needs to be updated from codecpar (after a late change to codecpar)
+     */
+    int need_context_update;
+
+    int is_intra_only;
+
+    FFFrac priv_pts;
+
+    /**
+     * Stream information used internally by avformat_find_stream_info()
+     */
+    struct FFStreamInfo *info;
+
+    AVIndexEntry *index_entries; /**< Only used if the format does not
+                                    support seeking natively. */
+    int nb_index_entries;
+    unsigned int index_entries_allocated_size;
+
+    int64_t interleaver_chunk_size;
+    int64_t interleaver_chunk_duration;
+
+    /**
+     * stream probing state
+     * -1   -> probing finished
+     *  0   -> no probing requested
+     * rest -> perform probing with request_probe being the minimum score to accept.
+     */
+    int request_probe;
+    /**
+     * Indicates that everything up to the next keyframe
+     * should be discarded.
+     */
+    int skip_to_keyframe;
+
+    /**
+     * Number of samples to skip at the start of the frame decoded from the next packet.
+     */
+    int skip_samples;
+
+    /**
+     * If not 0, the number of samples that should be skipped from the start of
+     * the stream (the samples are removed from packets with pts==0, which also
+     * assumes negative timestamps do not happen).
+     * Intended for use with formats such as mp3 with ad-hoc gapless audio
+     * support.
+     */
+    int64_t start_skip_samples;
+
+    /**
+     * If not 0, the first audio sample that should be discarded from the stream.
+     * This is broken by design (needs global sample count), but can't be
+     * avoided for broken by design formats such as mp3 with ad-hoc gapless
+     * audio support.
+     */
+    int64_t first_discard_sample;
+
+    /**
+     * The sample after last sample that is intended to be discarded after
+     * first_discard_sample. Works on frame boundaries only. Used to prevent
+     * early EOF if the gapless info is broken (considered concatenated mp3s).
+     */
+    int64_t last_discard_sample;
+
+    /**
+     * Number of internally decoded frames, used internally in libavformat, do not access
+     * its lifetime differs from info which is why it is not in that structure.
+     */
+    int nb_decoded_frames;
+
+    /**
+     * Timestamp offset added to timestamps before muxing
+     */
+    int64_t mux_ts_offset;
+
+    /**
+     * This is the lowest ts allowed in this track; it may be set by the muxer
+     * during init or write_header and influences the automatic timestamp
+     * shifting code.
+     */
+    int64_t lowest_ts_allowed;
+
+    /**
+     * Internal data to check for wrapping of the time stamp
+     */
+    int64_t pts_wrap_reference;
+
+    /**
+     * Options for behavior, when a wrap is detected.
+     *
+     * Defined by AV_PTS_WRAP_ values.
+     *
+     * If correction is enabled, there are two possibilities:
+     * If the first time stamp is near the wrap point, the wrap offset
+     * will be subtracted, which will create negative time stamps.
+     * Otherwise the offset will be added.
+     */
+    int pts_wrap_behavior;
+
+    /**
+     * Internal data to prevent doing update_initial_durations() twice
+     */
+    int update_initial_durations_done;
+
+#define MAX_REORDER_DELAY 16
+
+    /**
+     * Internal data to generate dts from pts
+     */
+    int64_t pts_reorder_error[MAX_REORDER_DELAY+1];
+    uint8_t pts_reorder_error_count[MAX_REORDER_DELAY+1];
+
+    int64_t pts_buffer[MAX_REORDER_DELAY+1];
+
+    /**
+     * Internal data to analyze DTS and detect faulty mpeg streams
+     */
+    int64_t last_dts_for_order_check;
+    uint8_t dts_ordered;
+    uint8_t dts_misordered;
+
+    /**
+     * display aspect ratio (0 if unknown)
+     * - encoding: unused
+     * - decoding: Set by libavformat to calculate sample_aspect_ratio internally
+     */
+    AVRational display_aspect_ratio;
+
+    AVProbeData probe_data;
+
+    /**
+     * last packet in packet_buffer for this stream when muxing.
+     */
+    PacketListEntry *last_in_packet_buffer;
+
+    int64_t last_IP_pts;
+    int last_IP_duration;
+
+    /**
+     * Number of packets to buffer for codec probing
+     */
+    int probe_packets;
+
+    /* av_read_frame() support */
+    enum AVStreamParseType need_parsing;
+    struct AVCodecParserContext *parser;
+
+    /**
+     * Number of frames that have been demuxed during avformat_find_stream_info()
+     */
+    int codec_info_nb_frames;
+
+    /**
+     * Stream Identifier
+     * This is the MPEG-TS stream identifier +1
+     * 0 means unknown
+     */
+    int stream_identifier;
+
+    // Timestamp generation support:
+    /**
+     * Timestamp corresponding to the last dts sync point.
+     *
+     * Initialized when AVCodecParserContext.dts_sync_point >= 0 and
+     * a DTS is received from the underlying container. Otherwise set to
+     * AV_NOPTS_VALUE by default.
+     */
+    int64_t first_dts;
+    int64_t cur_dts;
+
+    const struct AVCodecDescriptor *codec_desc;
+
+#if FF_API_INTERNAL_TIMING
+    AVRational transferred_mux_tb;
+#endif
+} FFStream;
+
+static av_always_inline FFStream *ffstream(AVStream *st)
+{
+    return (FFStream*)st;
+}
+
+static av_always_inline const FFStream *cffstream(const AVStream *st)
+{
+    return (const FFStream*)st;
+}
+
+#if defined (__GNUC__) || defined (__clang__)
 #define dynarray_add(tab, nb_ptr, elem)\
 do {\
     __typeof__(tab) _tab = (tab);\
@@ -116,8 +369,25 @@ do {\
 } while(0)
 #endif
 
-struct tm *ff_brktimegm(time_t secs, struct tm *tm);
+/**
+ * Automatically create sub-directories
+ *
+ * @param path will create sub-directories by path
+ * @return 0, or < 0 on error
+ */
+int ff_mkdir_p(const char *path);
 
+/**
+ * Write hexadecimal string corresponding to given binary data. The string
+ * is zero-terminated.
+ *
+ * @param buf       the output string is written here;
+ *                  needs to be at least 2 * size + 1 bytes long.
+ * @param src       the input data to be transformed.
+ * @param size      the size (in byte) of src.
+ * @param lowercase determines whether to use the range [0-9a-f] or [0-9A-F].
+ * @return buf.
+ */
 char *ff_data_to_hex(char *buf, const uint8_t *src, int size, int lowercase);
 
 /**
@@ -130,23 +400,27 @@ char *ff_data_to_hex(char *buf, const uint8_t *src, int size, int lowercase);
  */
 int ff_hex_to_data(uint8_t *data, const char *p);
 
-void ff_program_add_stream_index(AVFormatContext *ac, int progid, unsigned int idx);
-
-/**
- * Add packet to AVFormatContext->packet_buffer list, determining its
- * interleaved position using compare() function argument.
- * @return 0, or < 0 on error
- */
-int ff_interleave_add_packet(AVFormatContext *s, AVPacket *pkt,
-                             int (*compare)(AVFormatContext *, AVPacket *, AVPacket *));
-
-void ff_read_frame_flush(AVFormatContext *s);
-
 #define NTP_OFFSET 2208988800ULL
 #define NTP_OFFSET_US (NTP_OFFSET * 1000000ULL)
 
 /** Get the current time since NTP epoch in microseconds. */
 uint64_t ff_ntp_time(void);
+
+/**
+ * Get the NTP time stamp formatted as per the RFC-5905.
+ *
+ * @param ntp_time NTP time in micro seconds (since NTP epoch)
+ * @return the formatted NTP time stamp
+ */
+uint64_t ff_get_formatted_ntp_time(uint64_t ntp_time_us);
+
+/**
+ * Parse the NTP time in micro seconds (since NTP epoch).
+ *
+ * @param ntp_ts NTP time stamp formatted as per the RFC-5905.
+ * @return the time in micro seconds (since NTP epoch)
+ */
+uint64_t ff_parse_ntp_time(uint64_t ntp_ts);
 
 /**
  * Append the media-specific SDP fragment for the media stream c
@@ -165,35 +439,11 @@ uint64_t ff_ntp_time(void);
  * @param ttl the time to live of the stream, 0 if not multicast
  * @param fmt the AVFormatContext, which might contain options modifying
  *            the generated SDP
+ * @return 0 on success, a negative error code on failure
  */
-void ff_sdp_write_media(char *buff, int size, AVStream *st, int idx,
-                        const char *dest_addr, const char *dest_type,
-                        int port, int ttl, AVFormatContext *fmt);
-
-/**
- * Write a packet to another muxer than the one the user originally
- * intended. Useful when chaining muxers, where one muxer internally
- * writes a received packet to another muxer.
- *
- * @param dst the muxer to write the packet to
- * @param dst_stream the stream index within dst to write the packet to
- * @param pkt the packet to be written
- * @param src the muxer the packet originally was intended for
- * @param interleave 0->use av_write_frame, 1->av_interleaved_write_frame
- * @return the value av_write_frame returned
- */
-int ff_write_chained(AVFormatContext *dst, int dst_stream, AVPacket *pkt,
-                     AVFormatContext *src, int interleave);
-
-/**
- * Get the length in bytes which is needed to store val as v.
- */
-int ff_get_v_length(uint64_t val);
-
-/**
- * Put val using a variable number of bytes.
- */
-void ff_put_v(AVIOContext *bc, uint64_t val);
+int ff_sdp_write_media(char *buff, int size, const AVStream *st, int idx,
+                       const char *dest_addr, const char *dest_type,
+                       int port, int ttl, AVFormatContext *fmt);
 
 /**
  * Read a whole line of text from AVIOContext. Stop reading after reaching
@@ -207,6 +457,16 @@ void ff_put_v(AVIOContext *bc, uint64_t val);
  *         final \\0
  */
 int ff_get_line(AVIOContext *s, char *buf, int maxlen);
+
+/**
+ * Same as ff_get_line but strip the white-space characters in the text tail
+ *
+ * @param s the read-only AVIOContext
+ * @param buf buffer to store the read line
+ * @param maxlen size of the buffer
+ * @return the length of the string written in the buffer
+ */
+int ff_get_chomp_line(AVIOContext *s, char *buf, int maxlen);
 
 #define SPACE_CHARS " \t\r\n"
 
@@ -234,89 +494,7 @@ typedef void (*ff_parse_key_val_cb)(void *context, const char *key,
 void ff_parse_key_value(const char *str, ff_parse_key_val_cb callback_get_buf,
                         void *context);
 
-/**
- * Find stream index based on format-specific stream ID
- * @return stream index, or < 0 on error
- */
-int ff_find_stream_index(AVFormatContext *s, int id);
-
-/**
- * Internal version of av_index_search_timestamp
- */
-int ff_index_search_timestamp(const AVIndexEntry *entries, int nb_entries,
-                              int64_t wanted_timestamp, int flags);
-
-/**
- * Internal version of av_add_index_entry
- */
-int ff_add_index_entry(AVIndexEntry **index_entries,
-                       int *nb_index_entries,
-                       unsigned int *index_entries_allocated_size,
-                       int64_t pos, int64_t timestamp, int size, int distance, int flags);
-
-/**
- * Add a new chapter.
- *
- * @param s media file handle
- * @param id unique ID for this chapter
- * @param start chapter start time in time_base units
- * @param end chapter end time in time_base units
- * @param title chapter title
- *
- * @return AVChapter or NULL on error
- */
-AVChapter *avpriv_new_chapter(AVFormatContext *s, int id, AVRational time_base,
-                              int64_t start, int64_t end, const char *title);
-
-/**
- * Ensure the index uses less memory than the maximum specified in
- * AVFormatContext.max_index_size by discarding entries if it grows
- * too large.
- */
-void ff_reduce_index(AVFormatContext *s, int stream_index);
-
 enum AVCodecID ff_guess_image2_codec(const char *filename);
-
-/**
- * Convert a date string in ISO8601 format to Unix timestamp.
- */
-int64_t ff_iso8601_to_unix_time(const char *datestr);
-
-/**
- * Perform a binary search using av_index_search_timestamp() and
- * AVInputFormat.read_timestamp().
- *
- * @param target_ts target timestamp in the time base of the given stream
- * @param stream_index stream number
- */
-int ff_seek_frame_binary(AVFormatContext *s, int stream_index,
-                         int64_t target_ts, int flags);
-
-/**
- * Update cur_dts of all streams based on the given timestamp and AVStream.
- *
- * Stream ref_st unchanged, others set cur_dts in their native time base.
- * Only needed for timestamp wrapping or if (dts not set and pts!=dts).
- * @param timestamp new dts expressed in time_base of param ref_st
- * @param ref_st reference stream giving time_base of param timestamp
- */
-void ff_update_cur_dts(AVFormatContext *s, AVStream *ref_st, int64_t timestamp);
-
-int ff_find_last_ts(AVFormatContext *s, int stream_index, int64_t *ts, int64_t *pos,
-                    int64_t (*read_timestamp)(struct AVFormatContext *, int , int64_t *, int64_t ));
-
-/**
- * Perform a binary search using read_timestamp().
- *
- * @param target_ts target timestamp in the time base of the given stream
- * @param stream_index stream number
- */
-int64_t ff_gen_search(AVFormatContext *s, int stream_index,
-                      int64_t target_ts, int64_t pos_min,
-                      int64_t pos_max, int64_t pos_limit,
-                      int64_t ts_min, int64_t ts_max,
-                      int flags, int64_t *ts_ret,
-                      int64_t (*read_timestamp)(struct AVFormatContext *, int , int64_t *, int64_t ));
 
 /**
  * Set the time base and wrapping info for a given stream. This will be used
@@ -324,22 +502,14 @@ int64_t ff_gen_search(AVFormatContext *s, int stream_index,
  * (numerator or denominator are non-positive), it leaves the stream
  * unchanged.
  *
- * @param s stream
+ * @param st stream
  * @param pts_wrap_bits number of bits effectively used by the pts
  *        (used for wrap control)
  * @param pts_num time base numerator
  * @param pts_den time base denominator
  */
-void avpriv_set_pts_info(AVStream *s, int pts_wrap_bits,
+void avpriv_set_pts_info(AVStream *st, int pts_wrap_bits,
                          unsigned int pts_num, unsigned int pts_den);
-
-/**
- * Add side data to a packet for changing parameters to the given values.
- * Parameters set to 0 aren't included in the change.
- */
-int ff_add_param_change(AVPacket *pkt, int32_t channels,
-                        uint64_t channel_layout, int32_t sample_rate,
-                        int32_t width, int32_t height);
 
 /**
  * Set the timebase for each stream from the corresponding codec timebase and
@@ -348,39 +518,16 @@ int ff_add_param_change(AVPacket *pkt, int32_t channels,
 int ff_framehash_write_header(AVFormatContext *s);
 
 /**
- * Read a transport packet from a media file.
- *
- * @param s media file handle
- * @param pkt is filled
- * @return 0 if OK, AVERROR_xxx on error
+ * Remove a stream from its AVFormatContext and free it.
+ * The stream must be the last stream of the AVFormatContext.
  */
-int ff_read_packet(AVFormatContext *s, AVPacket *pkt);
+void ff_remove_stream(AVFormatContext *s, AVStream *st);
 
 /**
- * Interleave a packet per dts in an output media file.
- *
- * Packets with pkt->destruct == av_destruct_packet will be freed inside this
- * function, so they cannot be used after it. Note that calling av_free_packet()
- * on them is still safe.
- *
- * @param s media file handle
- * @param out the interleaved packet will be output here
- * @param pkt the input packet
- * @param flush 1 if no further packets are available as input and all
- *              remaining packets should be output
- * @return 1 if a packet was output, 0 if no packet could be output,
- *         < 0 if an error occurred
+ * Remove a stream group from its AVFormatContext and free it.
+ * The stream group must be the last stream group of the AVFormatContext.
  */
-int ff_interleave_packet_per_dts(AVFormatContext *s, AVPacket *out,
-                                 AVPacket *pkt, int flush);
-
-void ff_free_stream(AVFormatContext *s, AVStream *st);
-
-/**
- * Return the frame duration in seconds. Return 0 if not available.
- */
-void ff_compute_frame_duration(AVFormatContext *s, int *pnum, int *pden, AVStream *st,
-                               AVCodecParserContext *pc, AVPacket *pkt);
+void ff_remove_stream_group(AVFormatContext *s, AVStreamGroup *stg);
 
 unsigned int ff_codec_get_tag(const AVCodecTag *tags, enum AVCodecID id);
 
@@ -402,97 +549,104 @@ enum AVCodecID ff_codec_get_id(const AVCodecTag *tags, unsigned int tag);
 enum AVCodecID ff_get_pcm_codec_id(int bps, int flt, int be, int sflags);
 
 /**
- * Chooses a timebase for muxing the specified stream.
+ * Create a new stream and copy to it all parameters from a source stream, with
+ * the exception of the index field, which is set when the new stream is
+ * created.
  *
- * The chosen timebase allows sample accurate timestamps based
- * on the framerate or sample rate for audio streams. It also is
- * at least as precise as 1/min_precision would be.
+ * @param dst_ctx pointer to the context in which the new stream is created
+ * @param src pointer to source AVStream
+ * @return pointer to the new stream or NULL on error
  */
-AVRational ff_choose_timebase(AVFormatContext *s, AVStream *st, int min_precision);
+AVStream *ff_stream_clone(AVFormatContext *dst_ctx, const AVStream *src);
 
 /**
- * Chooses a timebase for muxing the specified stream.
- */
-enum AVChromaLocation ff_choose_chroma_location(AVFormatContext *s, AVStream *st);
-
-/**
- * Generate standard extradata for AVC-Intra based on width/height and field
- * order.
- */
-int ff_generate_avci_extradata(AVStream *st);
-
-/**
- * Wrap errno on rename() error.
+ * Wrap ffurl_move() and log if error happens.
  *
- * @param oldpath source path
- * @param newpath destination path
+ * @param url_src source path
+ * @param url_dst destination path
  * @return        0 or AVERROR on failure
  */
-static inline int ff_rename(const char *oldpath, const char *newpath, void *logctx)
-{
-    int ret = 0;
-    if (rename(oldpath, newpath) == -1) {
-        ret = AVERROR(errno);
-        if (logctx)
-            av_log(logctx, AV_LOG_ERROR, "failed to rename file %s to %s\n", oldpath, newpath);
-    }
-    return ret;
-}
+int ff_rename(const char *url_src, const char *url_dst, void *logctx);
 
 /**
- * Add new side data to a stream. If a side data of this type already exists, it
- * is replaced.
- */
-uint8_t *ff_stream_new_side_data(AVStream *st, enum AVPacketSideDataType type,
-                                 int size);
-
-/**
- * Allocate extradata with additional FF_INPUT_BUFFER_PADDING_SIZE at end
+ * Allocate extradata with additional AV_INPUT_BUFFER_PADDING_SIZE at end
  * which is always set to 0.
  *
+ * Previously allocated extradata in par will be freed.
+ *
  * @param size size of extradata
  * @return 0 if OK, AVERROR_xxx on error
  */
-int ff_alloc_extradata(AVCodecContext *avctx, int size);
-
-/**
- * Allocate extradata with additional FF_INPUT_BUFFER_PADDING_SIZE at end
- * which is always set to 0 and fill it from pb.
- *
- * @param size size of extradata
- * @return >= 0 if OK, AVERROR_xxx on error
- */
-int ff_get_extradata(AVCodecContext *avctx, AVIOContext *pb, int size);
-
-/**
- * add frame for rfps calculation.
- *
- * @param dts timestamp of the i-th frame
- * @return 0 if OK, AVERROR_xxx on error
- */
-int ff_rfps_add_frame(AVFormatContext *ic, AVStream *st, int64_t dts);
-
-void ff_rfps_calculate(AVFormatContext *ic);
-
-/**
- * Flags for AVFormatContext.write_uncoded_frame()
- */
-enum AVWriteUncodedFrameFlags {
-
-    /**
-     * Query whether the feature is possible on this stream.
-     * The frame argument is ignored.
-     */
-    AV_WRITE_UNCODED_FRAME_QUERY           = 0x0001,
-
-};
+int ff_alloc_extradata(AVCodecParameters *par, int size);
 
 /**
  * Copies the whilelists from one context to the other
  */
-int ff_copy_whitelists(AVFormatContext *dst, AVFormatContext *src);
+int ff_copy_whiteblacklists(AVFormatContext *dst, const AVFormatContext *src);
 
-int ffio_open2_wrapper(struct AVFormatContext *s, AVIOContext **pb, const char *url, int flags,
-                       const AVIOInterruptCB *int_cb, AVDictionary **options);
+/*
+ * A wrapper around AVFormatContext.io_close that should be used
+ * instead of calling the pointer directly.
+ *
+ * @param s AVFormatContext
+ * @param *pb the AVIOContext to be closed and freed. Can be NULL.
+ * @return >=0 on success, negative AVERROR in case of failure
+ */
+int ff_format_io_close(AVFormatContext *s, AVIOContext **pb);
+
+/**
+ * Utility function to check if the file uses http or https protocol
+ *
+ * @param s AVFormatContext
+ * @param filename URL or file name to open for writing
+ */
+int ff_is_http_proto(const char *filename);
+
+struct AVBPrint;
+/**
+ * Finalize buf into extradata and set its size appropriately.
+ */
+int ff_bprint_to_codecpar_extradata(AVCodecParameters *par, struct AVBPrint *buf);
+
+/**
+ * Set AVFormatContext url field to the provided pointer. The pointer must
+ * point to a valid string. The existing url field is freed if necessary. Also
+ * set the legacy filename field to the same string which was provided in url.
+ */
+void ff_format_set_url(AVFormatContext *s, char *url);
+
+/**
+ * Return a positive value if the given url has one of the given
+ * extensions, negative AVERROR on error, 0 otherwise.
+ *
+ * @param url        url to check against the given extensions
+ * @param extensions a comma-separated list of filename extensions
+ */
+int ff_match_url_ext(const char *url, const char *extensions);
+
+/**
+ * Return in 'buf' the path with '%d' replaced by a number.
+ *
+ * Also handles the '%0nd' format where 'n' is the total number
+ * of digits and '%%'.
+ *
+ * @param buf destination buffer
+ * @param path path with substitution template
+ * @param number the number to substitute
+ * @param flags AV_FRAME_FILENAME_FLAGS_*
+ * @return 0 if OK, <0 on error.
+ */
+int ff_bprint_get_frame_filename(struct AVBPrint *buf, const char *path, int64_t number, int flags);
+
+/**
+ * Set a dictionary value to an ISO-8601 compliant timestamp string.
+ *
+ * @param dict pointer to a pointer to a dictionary struct. If *dict is NULL
+ *             a dictionary struct is allocated and put in *dict.
+ * @param key metadata key
+ * @param timestamp unix timestamp in microseconds
+ * @return <0 on error
+ */
+int ff_dict_set_timestamp(AVDictionary **dict, const char *key, int64_t timestamp);
 
 #endif /* AVFORMAT_INTERNAL_H */

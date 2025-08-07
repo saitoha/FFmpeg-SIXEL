@@ -22,7 +22,7 @@
 
 /**
  * @file
- * @brief MPEG4 / RTP Code
+ * @brief MPEG-4 / RTP Code
  * @author Fabrice Bellard
  * @author Romain Degez
  */
@@ -31,12 +31,14 @@
 #include "internal.h"
 #include "libavutil/attributes.h"
 #include "libavutil/avstring.h"
+#include "libavutil/mem.h"
 #include "libavcodec/get_bits.h"
 
 #define MAX_AAC_HBR_FRAME_SIZE 8191
 
 /** Structure listing useful vars to parse RTP packet payload */
 struct PayloadContext {
+    int bitrate;
     int sizelength;
     int indexlength;
     int indexdeltalength;
@@ -70,25 +72,40 @@ typedef struct AttrNameMap {
     const char *str;
     uint16_t    type;
     uint32_t    offset;
+
+    /** Range for integer values */
+    struct Range {
+        int min;
+        int max;
+    } range;
 } AttrNameMap;
 
 /* All known fmtp parameters and the corresponding RTPAttrTypeEnum */
 #define ATTR_NAME_TYPE_INT 0
 #define ATTR_NAME_TYPE_STR 1
 static const AttrNameMap attr_names[] = {
+    { "bitrate",       ATTR_NAME_TYPE_INT,
+      offsetof(PayloadContext, bitrate),
+      {0, INT32_MAX} },
     { "SizeLength",       ATTR_NAME_TYPE_INT,
-      offsetof(PayloadContext, sizelength) },
+      offsetof(PayloadContext, sizelength),
+      {0, 32} }, // SizeLength number of bits used to encode AU-size integer value
     { "IndexLength",      ATTR_NAME_TYPE_INT,
-      offsetof(PayloadContext, indexlength) },
+      offsetof(PayloadContext, indexlength),
+      {0, 32} }, // IndexLength number of bits used to encode AU-Index integer value
     { "IndexDeltaLength", ATTR_NAME_TYPE_INT,
-      offsetof(PayloadContext, indexdeltalength) },
+      offsetof(PayloadContext, indexdeltalength),
+      {0, 32} }, // IndexDeltaLength number of bits to encode AU-Index-delta integer value
     { "profile-level-id", ATTR_NAME_TYPE_INT,
-      offsetof(PayloadContext, profile_level_id) },
+      offsetof(PayloadContext, profile_level_id),
+      {INT32_MIN, INT32_MAX} }, // It differs depending on StreamType
     { "StreamType",       ATTR_NAME_TYPE_INT,
-      offsetof(PayloadContext, streamtype) },
+      offsetof(PayloadContext, streamtype),
+      {0x00, 0x3F} }, // Values from ISO/IEC 14496-1, 'StreamType Values' table
     { "mode",             ATTR_NAME_TYPE_STR,
-      offsetof(PayloadContext, mode) },
-    { NULL, -1, -1 },
+      offsetof(PayloadContext, mode),
+       {0} },
+    { NULL, -1, -1, {0} },
 };
 
 static void close_context(PayloadContext *data)
@@ -97,14 +114,14 @@ static void close_context(PayloadContext *data)
     av_freep(&data->mode);
 }
 
-static int parse_fmtp_config(AVCodecContext *codec, const char *value)
+static int parse_fmtp_config(AVCodecParameters *par, const char *value)
 {
     /* decode the hexa encoded parameter */
-    int len = ff_hex_to_data(NULL, value);
-    av_freep(&codec->extradata);
-    if (ff_alloc_extradata(codec, len))
-        return AVERROR(ENOMEM);
-    ff_hex_to_data(codec->extradata, value);
+    int len = ff_hex_to_data(NULL, value), ret;
+
+    if ((ret = ff_alloc_extradata(par, len)) < 0)
+        return ret;
+    ff_hex_to_data(par->extradata, value);
     return 0;
 }
 
@@ -112,6 +129,7 @@ static int rtp_parse_mp4_au(PayloadContext *data, const uint8_t *buf, int len)
 {
     int au_headers_length, au_header_size, i;
     GetBitContext getbitcontext;
+    int ret;
 
     if (len < 2)
         return AVERROR_INVALIDDATA;
@@ -132,7 +150,9 @@ static int rtp_parse_mp4_au(PayloadContext *data, const uint8_t *buf, int len)
     if (len < data->au_headers_length_bytes)
         return AVERROR_INVALIDDATA;
 
-    init_get_bits(&getbitcontext, buf, data->au_headers_length_bytes * 8);
+    ret = init_get_bits(&getbitcontext, buf, data->au_headers_length_bytes * 8);
+    if (ret < 0)
+        return ret;
 
     /* XXX: Wrong if optional additional sections are present (cts, dts etc...) */
     au_header_size = data->sizelength + data->indexlength;
@@ -274,27 +294,50 @@ static int parse_fmtp(AVFormatContext *s,
                       AVStream *stream, PayloadContext *data,
                       const char *attr, const char *value)
 {
-    AVCodecContext *codec = stream->codec;
+    AVCodecParameters *par = stream->codecpar;
     int res, i;
 
     if (!strcmp(attr, "config")) {
-        res = parse_fmtp_config(codec, value);
+        res = parse_fmtp_config(par, value);
 
         if (res < 0)
             return res;
     }
 
-    if (codec->codec_id == AV_CODEC_ID_AAC) {
+    if (par->codec_id == AV_CODEC_ID_AAC) {
         /* Looking for a known attribute */
         for (i = 0; attr_names[i].str; ++i) {
             if (!av_strcasecmp(attr, attr_names[i].str)) {
                 if (attr_names[i].type == ATTR_NAME_TYPE_INT) {
+                    char *end_ptr = NULL;
+                    long long int val = strtoll(value, &end_ptr, 10);
+                    if (end_ptr == value || end_ptr[0] != '\0') {
+                        av_log(s, AV_LOG_ERROR,
+                               "The %s field value is not a valid number: %s\n",
+                               attr, value);
+                        return AVERROR_INVALIDDATA;
+                    }
+                    if (val < attr_names[i].range.min ||
+                        val > attr_names[i].range.max) {
+                        av_log(s, AV_LOG_ERROR,
+                            "fmtp field %s should be in range [%d,%d] (provided value: %lld)",
+                            attr, attr_names[i].range.min, attr_names[i].range.max, val);
+                        return  AVERROR_INVALIDDATA;
+                    }
+
                     *(int *)((char *)data+
-                        attr_names[i].offset) = atoi(value);
-                } else if (attr_names[i].type == ATTR_NAME_TYPE_STR)
+                        attr_names[i].offset) = (int) val;
+                } else if (attr_names[i].type == ATTR_NAME_TYPE_STR) {
+                    char *val = av_strdup(value);
+                    if (!val)
+                        return AVERROR(ENOMEM);
                     *(char **)((char *)data+
-                        attr_names[i].offset) = av_strdup(value);
+                        attr_names[i].offset) = val;
+                }
             }
+        }
+        if (!strcmp(attr, "bitrate")) {
+            par->bit_rate = data->bitrate;
         }
     }
     return 0;
@@ -314,7 +357,7 @@ static int parse_sdp_line(AVFormatContext *s, int st_index,
     return 0;
 }
 
-RTPDynamicProtocolHandler ff_mp4v_es_dynamic_handler = {
+const RTPDynamicProtocolHandler ff_mp4v_es_dynamic_handler = {
     .enc_name           = "MP4V-ES",
     .codec_type         = AVMEDIA_TYPE_VIDEO,
     .codec_id           = AV_CODEC_ID_MPEG4,
@@ -323,10 +366,11 @@ RTPDynamicProtocolHandler ff_mp4v_es_dynamic_handler = {
     .parse_sdp_a_line   = parse_sdp_line,
 };
 
-RTPDynamicProtocolHandler ff_mpeg4_generic_dynamic_handler = {
+const RTPDynamicProtocolHandler ff_mpeg4_generic_dynamic_handler = {
     .enc_name           = "mpeg4-generic",
     .codec_type         = AVMEDIA_TYPE_AUDIO,
     .codec_id           = AV_CODEC_ID_AAC,
+    .need_parsing       = AVSTREAM_PARSE_HEADERS,
     .priv_data_size     = sizeof(PayloadContext),
     .parse_sdp_a_line   = parse_sdp_line,
     .close              = close_context,

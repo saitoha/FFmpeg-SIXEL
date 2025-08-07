@@ -20,44 +20,57 @@
  */
 
 #include "swresample_internal.h"
+#include "libavutil/channel_layout.h"
 #include "libavutil/frame.h"
 #include "libavutil/opt.h"
 
 int swr_config_frame(SwrContext *s, const AVFrame *out, const AVFrame *in)
 {
+    AVChannelLayout ch_layout = { 0 };
+    int ret;
+
     swr_close(s);
 
     if (in) {
-        if (av_opt_set_int(s, "icl", in->channel_layout, 0) < 0)
+        if ((ret = av_channel_layout_copy(&ch_layout, &in->ch_layout)) < 0)
             goto fail;
-        if (av_opt_set_int(s, "isf", in->format, 0) < 0)
+        if ((ret = av_opt_set_chlayout(s, "ichl", &ch_layout, 0)) < 0)
             goto fail;
-        if (av_opt_set_int(s, "isr", in->sample_rate, 0) < 0)
+        if ((ret = av_opt_set_int(s, "isf", in->format, 0)) < 0)
+            goto fail;
+        if ((ret = av_opt_set_int(s, "isr", in->sample_rate, 0)) < 0)
             goto fail;
     }
 
     if (out) {
-        if (av_opt_set_int(s, "ocl", out->channel_layout, 0) < 0)
+        if ((ret = av_channel_layout_copy(&ch_layout, &out->ch_layout)) < 0)
             goto fail;
-        if (av_opt_set_int(s, "osf", out->format,  0) < 0)
+        if ((ret = av_opt_set_chlayout(s, "ochl", &ch_layout, 0)) < 0)
             goto fail;
-        if (av_opt_set_int(s, "osr", out->sample_rate, 0) < 0)
+        if ((ret = av_opt_set_int(s, "osf", out->format,  0)) < 0)
+            goto fail;
+        if ((ret = av_opt_set_int(s, "osr", out->sample_rate, 0)) < 0)
             goto fail;
     }
 
-    return 0;
+    ret = 0;
 fail:
-    av_log(s, AV_LOG_ERROR, "Failed to set option\n");
-    return AVERROR(EINVAL);
+    if (ret < 0)
+        av_log(s, AV_LOG_ERROR, "Failed to set option\n");
+    av_channel_layout_uninit(&ch_layout);
+    return ret;
 }
 
 static int config_changed(SwrContext *s,
                           const AVFrame *out, const AVFrame *in)
 {
-    int ret = 0;
+    AVChannelLayout ch_layout = { 0 };
+    int ret = 0, err;
 
     if (in) {
-        if (s->in_ch_layout   != in->channel_layout ||
+        if ((err = av_channel_layout_copy(&ch_layout, &in->ch_layout)) < 0)
+            return err;
+        if (av_channel_layout_compare(&s->in_ch_layout, &ch_layout) ||
             s->in_sample_rate != in->sample_rate ||
             s->in_sample_fmt  != in->format) {
             ret |= AVERROR_INPUT_CHANGED;
@@ -65,12 +78,15 @@ static int config_changed(SwrContext *s,
     }
 
     if (out) {
-        if (s->out_ch_layout   != out->channel_layout ||
+        if ((err = av_channel_layout_copy(&ch_layout, &out->ch_layout)) < 0)
+            return err;
+        if (av_channel_layout_compare(&s->out_ch_layout, &ch_layout) ||
             s->out_sample_rate != out->sample_rate ||
             s->out_sample_fmt  != out->format) {
             ret |= AVERROR_OUTPUT_CHANGED;
         }
     }
+    av_channel_layout_uninit(&ch_layout);
 
     return ret;
 }
@@ -115,7 +131,7 @@ static inline int available_samples(AVFrame *out)
     if (av_sample_fmt_is_planar(out->format)) {
         return samples;
     } else {
-        int channels = av_get_channel_layout_nb_channels(out->channel_layout);
+        int channels = out->ch_layout.nb_channels;
         return samples / channels;
     }
 }
@@ -139,9 +155,10 @@ int swr_convert_frame(SwrContext *s,
 
     if (out) {
         if (!out->linesize[0]) {
-            out->nb_samples =   swr_get_delay(s, s->out_sample_rate)
-                              + in->nb_samples*(int64_t)s->out_sample_rate / s->in_sample_rate
-                              + 3;
+            out->nb_samples = swr_get_delay(s, s->out_sample_rate) + 3;
+            if (in) {
+                out->nb_samples += in->nb_samples*(int64_t)s->out_sample_rate / s->in_sample_rate;
+            }
             if ((ret = av_frame_get_buffer(out, 0)) < 0) {
                 if (setup)
                     swr_close(s);
@@ -155,4 +172,3 @@ int swr_convert_frame(SwrContext *s,
 
     return convert_frame(s, out, in);
 }
-

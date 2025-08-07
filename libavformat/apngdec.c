@@ -28,9 +28,11 @@
 
 #include "avformat.h"
 #include "avio_internal.h"
+#include "demux.h"
 #include "internal.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavcodec/apng.h"
 #include "libavcodec/png.h"
@@ -44,7 +46,6 @@ typedef struct APNGDemuxContext {
     int max_fps;
     int default_fps;
 
-    int64_t pkt_pts;
     int pkt_duration;
 
     int is_key_frame;
@@ -67,7 +68,7 @@ typedef struct APNGDemuxContext {
  *     ...
  *     IDAT
  */
-static int apng_probe(AVProbeData *p)
+static int apng_probe(const AVProbeData *p)
 {
     GetByteContext gb;
     int state = 0;
@@ -122,23 +123,24 @@ end:
     return AVPROBE_SCORE_MAX;
 }
 
-static int append_extradata(AVCodecContext *s, AVIOContext *pb, int len)
+static int append_extradata(AVCodecParameters *par, AVIOContext *pb, int len)
 {
-    int previous_size = s->extradata_size;
+    int previous_size = par->extradata_size;
     int new_size, ret;
     uint8_t *new_extradata;
 
-    if (previous_size > INT_MAX - len)
+    if (len > INT_MAX - AV_INPUT_BUFFER_PADDING_SIZE - previous_size)
         return AVERROR_INVALIDDATA;
 
     new_size = previous_size + len;
-    new_extradata = av_realloc(s->extradata, new_size + FF_INPUT_BUFFER_PADDING_SIZE);
+    new_extradata = av_realloc(par->extradata, new_size + AV_INPUT_BUFFER_PADDING_SIZE);
     if (!new_extradata)
         return AVERROR(ENOMEM);
-    s->extradata = new_extradata;
-    s->extradata_size = new_size;
+    memset(new_extradata + new_size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+    par->extradata = new_extradata;
+    par->extradata_size = new_size;
 
-    if ((ret = avio_read(pb, s->extradata + previous_size, len)) < 0)
+    if ((ret = ffio_read_size(pb, par->extradata + previous_size, len)) < 0)
         return ret;
 
     return previous_size;
@@ -151,17 +153,17 @@ static int apng_read_header(AVFormatContext *s)
     uint32_t len, tag;
     AVStream *st;
     int acTL_found = 0;
-    int64_t ret = AVERROR_INVALIDDATA;
+    int64_t ret;
 
     /* verify PNGSIG */
     if (avio_rb64(pb) != PNGSIG)
-        return ret;
+        return AVERROR_INVALIDDATA;
 
     /* parse IHDR (must be first chunk) */
     len = avio_rb32(pb);
     tag = avio_rl32(pb);
     if (len != 13 || tag != MKTAG('I', 'H', 'D', 'R'))
-        return ret;
+        return AVERROR_INVALIDDATA;
 
     st = avformat_new_stream(s, NULL);
     if (!st)
@@ -170,35 +172,32 @@ static int apng_read_header(AVFormatContext *s)
     /* set the timebase to something large enough (1/100,000 of second)
      * to hopefully cope with all sane frame durations */
     avpriv_set_pts_info(st, 64, 1, 100000);
-    st->codec->codec_type = AVMEDIA_TYPE_VIDEO;
-    st->codec->codec_id   = AV_CODEC_ID_APNG;
-    st->codec->width      = avio_rb32(pb);
-    st->codec->height     = avio_rb32(pb);
-    if ((ret = av_image_check_size(st->codec->width, st->codec->height, 0, s)) < 0)
+    st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+    st->codecpar->codec_id   = AV_CODEC_ID_APNG;
+    st->codecpar->width      = avio_rb32(pb);
+    st->codecpar->height     = avio_rb32(pb);
+    if ((ret = av_image_check_size(st->codecpar->width, st->codecpar->height, 0, s)) < 0)
         return ret;
 
     /* extradata will contain every chunk up to the first fcTL (excluded) */
-    st->codec->extradata = av_malloc(len + 12 + FF_INPUT_BUFFER_PADDING_SIZE);
-    if (!st->codec->extradata)
-        return AVERROR(ENOMEM);
-    st->codec->extradata_size = len + 12;
-    AV_WB32(st->codec->extradata,    len);
-    AV_WL32(st->codec->extradata+4,  tag);
-    AV_WB32(st->codec->extradata+8,  st->codec->width);
-    AV_WB32(st->codec->extradata+12, st->codec->height);
-    if ((ret = avio_read(pb, st->codec->extradata+16, 9)) < 0)
-        goto fail;
+    ret = ff_alloc_extradata(st->codecpar, len + 12);
+    if (ret < 0)
+        return ret;
+    AV_WB32(st->codecpar->extradata,    len);
+    AV_WL32(st->codecpar->extradata+4,  tag);
+    AV_WB32(st->codecpar->extradata+8,  st->codecpar->width);
+    AV_WB32(st->codecpar->extradata+12, st->codecpar->height);
+    if ((ret = ffio_read_size(pb, st->codecpar->extradata + 16, 9)) < 0)
+        return ret;
 
-    while (!avio_feof(pb)) {
+    while (1) {
         if (acTL_found && ctx->num_play != 1) {
             int64_t size   = avio_size(pb);
             int64_t offset = avio_tell(pb);
             if (size < 0) {
-                ret = size;
-                goto fail;
+                return size;
             } else if (offset < 0) {
-                ret = offset;
-                goto fail;
+                return offset;
             } else if ((ret = ffio_ensure_seekback(pb, size - offset)) < 0) {
                 av_log(s, AV_LOG_WARNING, "Could not ensure seekback, will not loop\n");
                 ctx->num_play = 1;
@@ -206,47 +205,37 @@ static int apng_read_header(AVFormatContext *s)
         }
         if ((ctx->num_play == 1 || !acTL_found) &&
             ((ret = ffio_ensure_seekback(pb, 4 /* len */ + 4 /* tag */)) < 0))
-            goto fail;
+            return ret;
 
         len = avio_rb32(pb);
-        if (len > 0x7fffffff) {
-            ret = AVERROR_INVALIDDATA;
-            goto fail;
-        }
+        if (len > INT_MAX - 12)
+            return AVERROR_INVALIDDATA;
 
         tag = avio_rl32(pb);
         switch (tag) {
         case MKTAG('a', 'c', 'T', 'L'):
             if ((ret = avio_seek(pb, -8, SEEK_CUR)) < 0 ||
-                (ret = append_extradata(st->codec, pb, len + 12)) < 0)
-                goto fail;
+                (ret = append_extradata(st->codecpar, pb, len + 12)) < 0)
+                return ret;
             acTL_found = 1;
-            ctx->num_frames = AV_RB32(st->codec->extradata + ret + 8);
-            ctx->num_play   = AV_RB32(st->codec->extradata + ret + 12);
+            ctx->num_frames = AV_RB32(st->codecpar->extradata + ret + 8);
+            ctx->num_play   = AV_RB32(st->codecpar->extradata + ret + 12);
             av_log(s, AV_LOG_DEBUG, "num_frames: %"PRIu32", num_play: %"PRIu32"\n",
                                     ctx->num_frames, ctx->num_play);
             break;
         case MKTAG('f', 'c', 'T', 'L'):
-            if (!acTL_found) {
-               ret = AVERROR_INVALIDDATA;
-               goto fail;
+            if (!acTL_found || len != APNG_FCTL_CHUNK_SIZE) {
+                return AVERROR_INVALIDDATA;
             }
             if ((ret = avio_seek(pb, -8, SEEK_CUR)) < 0)
-                goto fail;
+                return ret;
             return 0;
         default:
             if ((ret = avio_seek(pb, -8, SEEK_CUR)) < 0 ||
-                (ret = append_extradata(st->codec, pb, len + 12)) < 0)
-                goto fail;
+                (ret = append_extradata(st->codecpar, pb, len + 12)) < 0)
+                return ret;
         }
     }
-
-fail:
-    if (st->codec->extradata_size) {
-        av_freep(&st->codec->extradata);
-        st->codec->extradata_size = 0;
-    }
-    return ret;
 }
 
 static int decode_fctl_chunk(AVFormatContext *s, APNGDemuxContext *ctx, AVPacket *pkt)
@@ -269,7 +258,7 @@ static int decode_fctl_chunk(AVFormatContext *s, APNGDemuxContext *ctx, AVPacket
     /* default is hundredths of seconds */
     if (!delay_den)
         delay_den = 100;
-    if (!delay_num || delay_den / delay_num > ctx->max_fps) {
+    if (!delay_num || (ctx->max_fps && delay_den / delay_num > ctx->max_fps)) {
         delay_num = 1;
         delay_den = ctx->default_fps;
     }
@@ -287,7 +276,7 @@ static int decode_fctl_chunk(AVFormatContext *s, APNGDemuxContext *ctx, AVPacket
             "delay_den: %"PRIu16", "
             "dispose_op: %d, "
             "blend_op: %d\n",
-            __FUNCTION__,
+            __func__,
             sequence_number,
             width,
             height,
@@ -298,15 +287,15 @@ static int decode_fctl_chunk(AVFormatContext *s, APNGDemuxContext *ctx, AVPacket
             dispose_op,
             blend_op);
 
-    if (width != s->streams[0]->codec->width ||
-        height != s->streams[0]->codec->height ||
+    if (width != s->streams[0]->codecpar->width ||
+        height != s->streams[0]->codecpar->height ||
         x_offset != 0 ||
         y_offset != 0) {
         if (sequence_number == 0 ||
-            x_offset >= s->streams[0]->codec->width ||
-            width > s->streams[0]->codec->width - x_offset ||
-            y_offset >= s->streams[0]->codec->height ||
-            height > s->streams[0]->codec->height - y_offset)
+            x_offset >= s->streams[0]->codecpar->width ||
+            width > s->streams[0]->codecpar->width - x_offset ||
+            y_offset >= s->streams[0]->codecpar->height ||
+            height > s->streams[0]->codecpar->height - y_offset)
             return AVERROR_INVALIDDATA;
         ctx->is_key_frame = 0;
     } else {
@@ -343,9 +332,13 @@ static int apng_read_packet(AVFormatContext *s, AVPacket *pkt)
 
     len = avio_rb32(pb);
     tag = avio_rl32(pb);
+
+    if (avio_feof(pb))
+        return AVERROR_EOF;
+
     switch (tag) {
     case MKTAG('f', 'c', 'T', 'L'):
-        if (len != 26)
+        if (len != APNG_FCTL_CHUNK_SIZE)
             return AVERROR_INVALIDDATA;
 
         if ((ret = decode_fctl_chunk(s, ctx, pkt)) < 0)
@@ -390,9 +383,8 @@ static int apng_read_packet(AVFormatContext *s, AVPacket *pkt)
 
         if (ctx->is_key_frame)
             pkt->flags |= AV_PKT_FLAG_KEY;
-        pkt->pts = ctx->pkt_pts;
+        pkt->pts = pkt->dts = AV_NOPTS_VALUE;
         pkt->duration = ctx->pkt_duration;
-        ctx->pkt_pts += ctx->pkt_duration;
         return ret;
     case MKTAG('I', 'E', 'N', 'D'):
         ctx->cur_loop++;
@@ -400,17 +392,13 @@ static int apng_read_packet(AVFormatContext *s, AVPacket *pkt)
             avio_seek(pb, -8, SEEK_CUR);
             return AVERROR_EOF;
         }
-        if ((ret = avio_seek(pb, s->streams[0]->codec->extradata_size + 8, SEEK_SET)) < 0)
+        if ((ret = avio_seek(pb, s->streams[0]->codecpar->extradata_size + 8, SEEK_SET)) < 0)
             return ret;
         return 0;
     default:
-        {
-        char tag_buf[32];
-
-        av_get_codec_tag_string(tag_buf, sizeof(tag_buf), tag);
-        avpriv_request_sample(s, "In-stream tag=%s (0x%08X) len=%"PRIu32, tag_buf, tag, len);
+        avpriv_request_sample(s, "In-stream tag=%s (0x%08"PRIX32") len=%"PRIu32,
+                              av_fourcc2str(tag), tag, len);
         avio_skip(pb, len + 4);
-        }
     }
 
     /* Handle the unsupported yet cases */
@@ -419,9 +407,9 @@ static int apng_read_packet(AVFormatContext *s, AVPacket *pkt)
 
 static const AVOption options[] = {
     { "ignore_loop", "ignore loop setting"                         , offsetof(APNGDemuxContext, ignore_loop),
-      AV_OPT_TYPE_INT, { .i64 = 1 }               , 0, 1      , AV_OPT_FLAG_DECODING_PARAM },
+      AV_OPT_TYPE_BOOL, { .i64 = 1 }              , 0, 1      , AV_OPT_FLAG_DECODING_PARAM },
     { "max_fps"    , "maximum framerate (0 is no limit)"           , offsetof(APNGDemuxContext, max_fps),
-      AV_OPT_TYPE_INT, { .i64 = DEFAULT_APNG_FPS }, 0, INT_MAX, AV_OPT_FLAG_DECODING_PARAM },
+      AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, AV_OPT_FLAG_DECODING_PARAM },
     { "default_fps", "default framerate (0 is as fast as possible)", offsetof(APNGDemuxContext, default_fps),
       AV_OPT_TYPE_INT, { .i64 = DEFAULT_APNG_FPS }, 0, INT_MAX, AV_OPT_FLAG_DECODING_PARAM },
     { NULL },
@@ -435,13 +423,13 @@ static const AVClass demuxer_class = {
     .category   = AV_CLASS_CATEGORY_DEMUXER,
 };
 
-AVInputFormat ff_apng_demuxer = {
-    .name           = "apng",
-    .long_name      = NULL_IF_CONFIG_SMALL("Animated Portable Network Graphics"),
+const FFInputFormat ff_apng_demuxer = {
+    .p.name         = "apng",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Animated Portable Network Graphics"),
+    .p.flags        = AVFMT_GENERIC_INDEX,
+    .p.priv_class   = &demuxer_class,
     .priv_data_size = sizeof(APNGDemuxContext),
     .read_probe     = apng_probe,
     .read_header    = apng_read_header,
     .read_packet    = apng_read_packet,
-    .flags          = AVFMT_GENERIC_INDEX,
-    .priv_class     = &demuxer_class,
 };

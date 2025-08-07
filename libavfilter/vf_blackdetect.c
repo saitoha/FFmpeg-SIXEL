@@ -25,12 +25,17 @@
  */
 
 #include <float.h>
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
+#include "libavutil/pixdesc.h"
 #include "libavutil/timestamp.h"
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
+#include "formats.h"
+#include "video.h"
+#include "vf_blackdetect.h"
 
-typedef struct {
+typedef struct BlackDetectContext {
     const AVClass *class;
     double  black_min_duration_time; ///< minimum duration of detected black, in seconds
     int64_t black_min_duration;      ///< minimum duration of detected black, expressed in timebase units
@@ -42,8 +47,15 @@ typedef struct {
     double       picture_black_ratio_th;
     double       pixel_black_th;
     unsigned int pixel_black_th_i;
+    int          alpha;
 
     unsigned int nb_black_pixels;   ///< number of black pixels counted so far
+    AVRational   time_base;
+    int          depth;
+    int          nb_threads;
+    unsigned int *counter;
+
+    ff_blackdetect_fn func;
 } BlackDetectContext;
 
 #define OFFSET(x) offsetof(BlackDetectContext, x)
@@ -56,6 +68,7 @@ static const AVOption blackdetect_options[] = {
     { "pic_th",                 "set the picture black ratio threshold", OFFSET(picture_black_ratio_th), AV_OPT_TYPE_DOUBLE, {.dbl=.98}, 0, 1, FLAGS },
     { "pixel_black_th", "set the pixel black threshold", OFFSET(pixel_black_th), AV_OPT_TYPE_DOUBLE, {.dbl=.10}, 0, 1, FLAGS },
     { "pix_th",         "set the pixel black threshold", OFFSET(pixel_black_th), AV_OPT_TYPE_DOUBLE, {.dbl=.10}, 0, 1, FLAGS },
+    { "alpha",          "check alpha instead of luma", OFFSET(alpha), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS },
     { NULL }
 };
 
@@ -64,121 +77,170 @@ AVFILTER_DEFINE_CLASS(blackdetect);
 #define YUVJ_FORMATS \
     AV_PIX_FMT_YUVJ411P, AV_PIX_FMT_YUVJ420P, AV_PIX_FMT_YUVJ422P, AV_PIX_FMT_YUVJ444P, AV_PIX_FMT_YUVJ440P
 
+#define YUVA_FORMATS \
+    AV_PIX_FMT_YUVA420P,  AV_PIX_FMT_YUVA422P,   AV_PIX_FMT_YUVA444P, \
+    AV_PIX_FMT_YUVA444P9, AV_PIX_FMT_YUVA444P10, AV_PIX_FMT_YUVA444P12, AV_PIX_FMT_YUVA444P16, \
+    AV_PIX_FMT_YUVA422P9, AV_PIX_FMT_YUVA422P10, AV_PIX_FMT_YUVA422P12, AV_PIX_FMT_YUVA422P16, \
+    AV_PIX_FMT_YUVA420P9, AV_PIX_FMT_YUVA420P10, AV_PIX_FMT_YUVA420P16
+
 static const enum AVPixelFormat yuvj_formats[] = {
     YUVJ_FORMATS, AV_PIX_FMT_NONE
 };
 
-static int query_formats(AVFilterContext *ctx)
-{
-    static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_GRAY8,
-        AV_PIX_FMT_YUV410P, AV_PIX_FMT_YUV411P,
-        AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV422P,
-        AV_PIX_FMT_YUV440P, AV_PIX_FMT_YUV444P,
-        AV_PIX_FMT_NV12, AV_PIX_FMT_NV21,
-        YUVJ_FORMATS,
-        AV_PIX_FMT_NONE
-    };
+static const enum AVPixelFormat yuva_formats[] = {
+    YUVA_FORMATS, AV_PIX_FMT_NONE
+};
 
-    AVFilterFormats *fmts_list = ff_make_format_list(pix_fmts);
-    if (!fmts_list)
-        return AVERROR(ENOMEM);
-    return ff_set_common_formats(ctx, fmts_list);
+static const enum AVPixelFormat yuv_formats[] = {
+    AV_PIX_FMT_GRAY8,
+    AV_PIX_FMT_YUV410P, AV_PIX_FMT_YUV411P,
+    AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV422P,
+    AV_PIX_FMT_YUV440P, AV_PIX_FMT_YUV444P,
+    AV_PIX_FMT_NV12, AV_PIX_FMT_NV21,
+    YUVJ_FORMATS,
+    AV_PIX_FMT_GRAY10, AV_PIX_FMT_GRAY12, AV_PIX_FMT_GRAY14,
+    AV_PIX_FMT_GRAY16,
+    AV_PIX_FMT_YUV420P9, AV_PIX_FMT_YUV422P9, AV_PIX_FMT_YUV444P9,
+    AV_PIX_FMT_YUV420P10, AV_PIX_FMT_YUV422P10, AV_PIX_FMT_YUV444P10,
+    AV_PIX_FMT_YUV440P10,
+    AV_PIX_FMT_YUV444P12, AV_PIX_FMT_YUV422P12, AV_PIX_FMT_YUV420P12,
+    AV_PIX_FMT_YUV440P12,
+    AV_PIX_FMT_YUV444P14, AV_PIX_FMT_YUV422P14, AV_PIX_FMT_YUV420P14,
+    AV_PIX_FMT_YUV420P16, AV_PIX_FMT_YUV422P16, AV_PIX_FMT_YUV444P16,
+    YUVA_FORMATS, AV_PIX_FMT_NONE
+};
+
+static int query_format(const AVFilterContext *ctx,
+                        AVFilterFormatsConfig **cfg_in,
+                        AVFilterFormatsConfig **cfg_out)
+{
+    const BlackDetectContext *s = ctx->priv;
+    AVFilterFormats *formats;
+    if (s->alpha)
+        formats = ff_make_format_list(yuva_formats);
+    else
+        formats = ff_make_format_list(yuv_formats);
+
+    return ff_set_common_formats2(ctx, cfg_in, cfg_out, formats);
 }
 
 static int config_input(AVFilterLink *inlink)
 {
     AVFilterContext *ctx = inlink->dst;
-    BlackDetectContext *blackdetect = ctx->priv;
+    BlackDetectContext *s = ctx->priv;
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(inlink->format);
+    const int depth = desc->comp[0].depth;
 
-    blackdetect->black_min_duration =
-        blackdetect->black_min_duration_time / av_q2d(inlink->time_base);
+    s->depth = depth;
+    s->nb_threads = ff_filter_get_nb_threads(ctx);
+    s->time_base = inlink->time_base;
+    s->black_min_duration = s->black_min_duration_time / av_q2d(s->time_base);
+    s->counter = av_calloc(s->nb_threads, sizeof(*s->counter));
+    s->func = ff_blackdetect_get_fn(depth);
+    if (!s->counter)
+        return AVERROR(ENOMEM);
 
-    blackdetect->pixel_black_th_i = ff_fmt_is_in(inlink->format, yuvj_formats) ?
-        // luminance_minimum_value + pixel_black_th * luminance_range_size
-             blackdetect->pixel_black_th *  255 :
-        16 + blackdetect->pixel_black_th * (235 - 16);
-
-    av_log(blackdetect, AV_LOG_VERBOSE,
-           "black_min_duration:%s pixel_black_th:%f pixel_black_th_i:%d picture_black_ratio_th:%f\n",
-           av_ts2timestr(blackdetect->black_min_duration, &inlink->time_base),
-           blackdetect->pixel_black_th, blackdetect->pixel_black_th_i,
-           blackdetect->picture_black_ratio_th);
+    av_log(s, AV_LOG_VERBOSE,
+           "black_min_duration:%s pixel_black_th:%f picture_black_ratio_th:%f alpha:%d\n",
+           av_ts2timestr(s->black_min_duration, &s->time_base),
+           s->pixel_black_th, s->picture_black_ratio_th, s->alpha);
     return 0;
 }
 
 static void check_black_end(AVFilterContext *ctx)
 {
-    BlackDetectContext *blackdetect = ctx->priv;
-    AVFilterLink *inlink = ctx->inputs[0];
+    BlackDetectContext *s = ctx->priv;
 
-    if ((blackdetect->black_end - blackdetect->black_start) >= blackdetect->black_min_duration) {
-        av_log(blackdetect, AV_LOG_INFO,
+    if ((s->black_end - s->black_start) >= s->black_min_duration) {
+        av_log(s, AV_LOG_INFO,
                "black_start:%s black_end:%s black_duration:%s\n",
-               av_ts2timestr(blackdetect->black_start, &inlink->time_base),
-               av_ts2timestr(blackdetect->black_end,   &inlink->time_base),
-               av_ts2timestr(blackdetect->black_end - blackdetect->black_start, &inlink->time_base));
+               av_ts2timestr(s->black_start, &s->time_base),
+               av_ts2timestr(s->black_end,   &s->time_base),
+               av_ts2timestr(s->black_end - s->black_start, &s->time_base));
     }
 }
 
-static int request_frame(AVFilterLink *outlink)
+static int black_counter(AVFilterContext *ctx, void *arg,
+                         int jobnr, int nb_jobs)
 {
-    AVFilterContext *ctx = outlink->src;
-    BlackDetectContext *blackdetect = ctx->priv;
-    AVFilterLink *inlink = ctx->inputs[0];
-    int ret = ff_request_frame(inlink);
+    BlackDetectContext *s = ctx->priv;
+    const AVFrame *in = arg;
+    const int plane = s->alpha ? 3 : 0;
+    const int linesize = in->linesize[plane];
+    const int h = in->height;
+    const int start = (h * jobnr) / nb_jobs;
+    const int end = (h * (jobnr+1)) / nb_jobs;
 
-    if (ret == AVERROR_EOF && blackdetect->black_started) {
-        // FIXME: black_end should be set to last_picref_pts + last_picref_duration
-        blackdetect->black_end = blackdetect->last_picref_pts;
-        check_black_end(ctx);
-    }
-    return ret;
+    s->counter[jobnr] = s->func(in->data[plane] + start * linesize,
+                                linesize, in->width, end - start,
+                                s->pixel_black_th_i);
+
+    return 0;
 }
 
-// TODO: document metadata
 static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
 {
+    FilterLink *inl = ff_filter_link(inlink);
     AVFilterContext *ctx = inlink->dst;
-    BlackDetectContext *blackdetect = ctx->priv;
+    BlackDetectContext *s = ctx->priv;
     double picture_black_ratio = 0;
-    const uint8_t *p = picref->data[0];
-    int x, i;
+    const int max = (1 << s->depth) - 1;
+    const int factor = (1 << (s->depth - 8));
+    const int full = picref->color_range == AVCOL_RANGE_JPEG ||
+                     ff_fmt_is_in(picref->format, yuvj_formats) ||
+                     s->alpha;
 
-    for (i = 0; i < inlink->h; i++) {
-        for (x = 0; x < inlink->w; x++)
-            blackdetect->nb_black_pixels += p[x] <= blackdetect->pixel_black_th_i;
-        p += picref->linesize[0];
-    }
+    s->pixel_black_th_i = full ? s->pixel_black_th * max :
+        // luminance_minimum_value + pixel_black_th * luminance_range_size
+        16 * factor + s->pixel_black_th * (235 - 16) * factor;
 
-    picture_black_ratio = (double)blackdetect->nb_black_pixels / (inlink->w * inlink->h);
+    ff_filter_execute(ctx, black_counter, picref, NULL,
+                      FFMIN(inlink->h, s->nb_threads));
+
+    for (int i = 0; i < s->nb_threads; i++)
+        s->nb_black_pixels += s->counter[i];
+
+    picture_black_ratio = (double)s->nb_black_pixels / (inlink->w * inlink->h);
 
     av_log(ctx, AV_LOG_DEBUG,
            "frame:%"PRId64" picture_black_ratio:%f pts:%s t:%s type:%c\n",
-           inlink->frame_count, picture_black_ratio,
-           av_ts2str(picref->pts), av_ts2timestr(picref->pts, &inlink->time_base),
+           inl->frame_count_out, picture_black_ratio,
+           av_ts2str(picref->pts), av_ts2timestr(picref->pts, &s->time_base),
            av_get_picture_type_char(picref->pict_type));
 
-    if (picture_black_ratio >= blackdetect->picture_black_ratio_th) {
-        if (!blackdetect->black_started) {
+    if (picture_black_ratio >= s->picture_black_ratio_th) {
+        if (!s->black_started) {
             /* black starts here */
-            blackdetect->black_started = 1;
-            blackdetect->black_start = picref->pts;
-            av_dict_set(avpriv_frame_get_metadatap(picref), "lavfi.black_start",
-                av_ts2timestr(blackdetect->black_start, &inlink->time_base), 0);
+            s->black_started = 1;
+            s->black_start = picref->pts;
+            av_dict_set(&picref->metadata, "lavfi.black_start",
+                av_ts2timestr(s->black_start, &s->time_base), 0);
         }
-    } else if (blackdetect->black_started) {
+    } else if (s->black_started) {
         /* black ends here */
-        blackdetect->black_started = 0;
-        blackdetect->black_end = picref->pts;
+        s->black_started = 0;
+        s->black_end = picref->pts;
         check_black_end(ctx);
-        av_dict_set(avpriv_frame_get_metadatap(picref), "lavfi.black_end",
-            av_ts2timestr(blackdetect->black_end, &inlink->time_base), 0);
+        av_dict_set(&picref->metadata, "lavfi.black_end",
+            av_ts2timestr(s->black_end, &s->time_base), 0);
     }
 
-    blackdetect->last_picref_pts = picref->pts;
-    blackdetect->nb_black_pixels = 0;
+    s->last_picref_pts = picref->pts;
+    s->nb_black_pixels = 0;
     return ff_filter_frame(inlink->dst->outputs[0], picref);
+}
+
+static av_cold void uninit(AVFilterContext *ctx)
+{
+    BlackDetectContext *s = ctx->priv;
+
+    av_freep(&s->counter);
+
+    if (s->black_started) {
+        // FIXME: black_end should be set to last_picref_pts + last_picref_duration
+        s->black_end = s->last_picref_pts;
+        check_black_end(ctx);
+    }
 }
 
 static const AVFilterPad blackdetect_inputs[] = {
@@ -188,24 +250,16 @@ static const AVFilterPad blackdetect_inputs[] = {
         .config_props  = config_input,
         .filter_frame  = filter_frame,
     },
-    { NULL }
 };
 
-static const AVFilterPad blackdetect_outputs[] = {
-    {
-        .name          = "default",
-        .type          = AVMEDIA_TYPE_VIDEO,
-        .request_frame = request_frame,
-    },
-    { NULL }
-};
-
-AVFilter ff_vf_blackdetect = {
-    .name          = "blackdetect",
-    .description   = NULL_IF_CONFIG_SMALL("Detect video intervals that are (almost) black."),
+const FFFilter ff_vf_blackdetect = {
+    .p.name        = "blackdetect",
+    .p.description = NULL_IF_CONFIG_SMALL("Detect video intervals that are (almost) black."),
+    .p.priv_class  = &blackdetect_class,
+    .p.flags       = AVFILTER_FLAG_SLICE_THREADS | AVFILTER_FLAG_METADATA_ONLY,
     .priv_size     = sizeof(BlackDetectContext),
-    .query_formats = query_formats,
-    .inputs        = blackdetect_inputs,
-    .outputs       = blackdetect_outputs,
-    .priv_class    = &blackdetect_class,
+    FILTER_INPUTS(blackdetect_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_QUERY_FUNC2(query_format),
+    .uninit        = uninit,
 };

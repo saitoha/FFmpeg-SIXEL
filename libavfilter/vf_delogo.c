@@ -1,7 +1,7 @@
 /*
  * Copyright (c) 2002 Jindrich Makovicka <makovick@gmail.com>
  * Copyright (c) 2011 Stefano Sabatini
- * Copyright (c) 2013 Jean Delvare <khali@linux-fr.org>
+ * Copyright (c) 2013, 2015 Jean Delvare <jdelvare@suse.com>
  *
  * This file is part of FFmpeg.
  *
@@ -31,10 +31,50 @@
 #include "libavutil/imgutils.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
+#include "libavutil/eval.h"
 #include "avfilter.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
 #include "video.h"
+static const char * const var_names[] = {
+    "x",
+    "y",
+    "w",
+    "h",
+    "n",            ///< number of frame
+    "t",            ///< timestamp expressed in seconds
+    NULL
+};
+
+enum var_name {
+    VAR_X,
+    VAR_Y,
+    VAR_W,
+    VAR_H,
+    VAR_N,
+    VAR_T,
+    VAR_VARS_NB
+};
+
+static int set_expr(AVExpr **pexpr, const char *expr, const char *option, void *log_ctx)
+{
+    int ret;
+    AVExpr *old = NULL;
+
+    if (*pexpr)
+        old = *pexpr;
+    ret = av_expr_parse(pexpr, expr, var_names, NULL, NULL, NULL, NULL, 0, log_ctx);
+    if (ret < 0) {
+        av_log(log_ctx, AV_LOG_ERROR,
+               "Error when parsing the expression '%s' for %s\n",
+               expr, option);
+        *pexpr = old;
+        return ret;
+    }
+
+    av_expr_free(old);
+    return 0;
+}
+
 
 /**
  * Apply a simple delogo algorithm to the image in src and put the
@@ -61,7 +101,7 @@ static void apply_delogo(uint8_t *dst, int dst_linesize,
                          unsigned int band, int show, int direct)
 {
     int x, y;
-    uint64_t interp, weightl, weightr, weightt, weightb;
+    uint64_t interp, weightl, weightr, weightt, weightb, weight;
     uint8_t *xdst, *xsrc;
 
     uint8_t *topleft, *botleft, *topright;
@@ -75,13 +115,13 @@ static void apply_delogo(uint8_t *dst, int dst_linesize,
     yclipb = FFMAX(logo_y+logo_h-h, 0);
 
     logo_x1 = logo_x + xclipl;
-    logo_x2 = logo_x + logo_w - xclipr;
+    logo_x2 = logo_x + logo_w - xclipr - 1;
     logo_y1 = logo_y + yclipt;
-    logo_y2 = logo_y + logo_h - yclipb;
+    logo_y2 = logo_y + logo_h - yclipb - 1;
 
-    topleft  = src+logo_y1     * src_linesize+logo_x1;
-    topright = src+logo_y1     * src_linesize+logo_x2-1;
-    botleft  = src+(logo_y2-1) * src_linesize+logo_x1;
+    topleft  = src+logo_y1 * src_linesize+logo_x1;
+    topright = src+logo_y1 * src_linesize+logo_x2;
+    botleft  = src+logo_y2 * src_linesize+logo_x1;
 
     if (!direct)
         av_image_copy_plane(dst, dst_linesize, src, src_linesize, w, h);
@@ -89,7 +129,7 @@ static void apply_delogo(uint8_t *dst, int dst_linesize,
     dst += (logo_y1 + 1) * dst_linesize;
     src += (logo_y1 + 1) * src_linesize;
 
-    for (y = logo_y1+1; y < logo_y2-1; y++) {
+    for (y = logo_y1+1; y < logo_y2; y++) {
         left_sample = topleft[src_linesize*(y-logo_y1)]   +
                       topleft[src_linesize*(y-logo_y1-1)] +
                       topleft[src_linesize*(y-logo_y1+1)];
@@ -99,13 +139,19 @@ static void apply_delogo(uint8_t *dst, int dst_linesize,
 
         for (x = logo_x1+1,
              xdst = dst+logo_x1+1,
-             xsrc = src+logo_x1+1; x < logo_x2-1; x++, xdst++, xsrc++) {
+             xsrc = src+logo_x1+1; x < logo_x2; x++, xdst++, xsrc++) {
+
+            if (show && (y == logo_y1+1 || y == logo_y2-1 ||
+                         x == logo_x1+1 || x == logo_x2-1)) {
+                *xdst = 0;
+                continue;
+            }
 
             /* Weighted interpolation based on relative distances, taking SAR into account */
-            weightl = (uint64_t)              (logo_x2-1-x) * (y-logo_y1) * (logo_y2-1-y) * sar.den;
-            weightr = (uint64_t)(x-logo_x1)                 * (y-logo_y1) * (logo_y2-1-y) * sar.den;
-            weightt = (uint64_t)(x-logo_x1) * (logo_x2-1-x)               * (logo_y2-1-y) * sar.num;
-            weightb = (uint64_t)(x-logo_x1) * (logo_x2-1-x) * (y-logo_y1)                 * sar.num;
+            weightl = (uint64_t)              (logo_x2-x) * (y-logo_y1) * (logo_y2-y) * sar.den;
+            weightr = (uint64_t)(x-logo_x1)               * (y-logo_y1) * (logo_y2-y) * sar.den;
+            weightt = (uint64_t)(x-logo_x1) * (logo_x2-x)               * (logo_y2-y) * sar.num;
+            weightb = (uint64_t)(x-logo_x1) * (logo_x2-x) * (y-logo_y1)               * sar.num;
 
             interp =
                 left_sample * weightl
@@ -119,7 +165,8 @@ static void apply_delogo(uint8_t *dst, int dst_linesize,
                 (botleft[x-logo_x1]    +
                  botleft[x-logo_x1-1]  +
                  botleft[x-logo_x1+1]) * weightb;
-            interp /= (weightl + weightr + weightt + weightb) * 3U;
+            weight = (weightl + weightr + weightt + weightb) * 3U;
+            interp = (interp + (weight >> 1)) / weight;
 
             if (y >= logo_y+band && y < logo_y+logo_h-band &&
                 x >= logo_x+band && x < logo_x+logo_w-band) {
@@ -138,8 +185,6 @@ static void apply_delogo(uint8_t *dst, int dst_linesize,
                     dist = FFMAX(dist, y-(logo_y+logo_h-1-band));
 
                 *xdst = (*xsrc*dist + interp*(band-dist))/band;
-                if (show && (dist == band-1))
-                    *xdst = 0;
             }
         }
 
@@ -151,41 +196,56 @@ static void apply_delogo(uint8_t *dst, int dst_linesize,
 typedef struct DelogoContext {
     const AVClass *class;
     int x, y, w, h, band, show;
+    char *x_expr, *y_expr, *w_expr, *h_expr;
+    AVExpr *x_pexpr, *y_pexpr, *w_pexpr, *h_pexpr;
+    double var_values[VAR_VARS_NB];
 }  DelogoContext;
 
 #define OFFSET(x) offsetof(DelogoContext, x)
 #define FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM
 
 static const AVOption delogo_options[]= {
-    { "x",    "set logo x position",       OFFSET(x),    AV_OPT_TYPE_INT, { .i64 = -1 }, -1, INT_MAX, FLAGS },
-    { "y",    "set logo y position",       OFFSET(y),    AV_OPT_TYPE_INT, { .i64 = -1 }, -1, INT_MAX, FLAGS },
-    { "w",    "set logo width",            OFFSET(w),    AV_OPT_TYPE_INT, { .i64 = -1 }, -1, INT_MAX, FLAGS },
-    { "h",    "set logo height",           OFFSET(h),    AV_OPT_TYPE_INT, { .i64 = -1 }, -1, INT_MAX, FLAGS },
-    { "band", "set delogo area band size", OFFSET(band), AV_OPT_TYPE_INT, { .i64 =  4 },  1, INT_MAX, FLAGS },
-    { "t",    "set delogo area band size", OFFSET(band), AV_OPT_TYPE_INT, { .i64 =  4 },  1, INT_MAX, FLAGS },
-    { "show", "show delogo area",          OFFSET(show), AV_OPT_TYPE_INT, { .i64 =  0 },  0, 1,       FLAGS },
+    { "x",    "set logo x position",       OFFSET(x_expr),    AV_OPT_TYPE_STRING, { .str = "-1" }, 0, 0, FLAGS },
+    { "y",    "set logo y position",       OFFSET(y_expr),    AV_OPT_TYPE_STRING, { .str = "-1" }, 0, 0, FLAGS },
+    { "w",    "set logo width",            OFFSET(w_expr),    AV_OPT_TYPE_STRING, { .str = "-1" }, 0, 0, FLAGS },
+    { "h",    "set logo height",           OFFSET(h_expr),    AV_OPT_TYPE_STRING, { .str = "-1" }, 0, 0, FLAGS },
+    { "show", "show delogo area",          OFFSET(show),      AV_OPT_TYPE_BOOL,   { .i64 =  0 },   0, 1, FLAGS },
     { NULL }
 };
 
 AVFILTER_DEFINE_CLASS(delogo);
-
-static int query_formats(AVFilterContext *ctx)
+static av_cold void uninit(AVFilterContext *ctx)
 {
-    static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_YUV444P,  AV_PIX_FMT_YUV422P,  AV_PIX_FMT_YUV420P,
-        AV_PIX_FMT_YUV411P,  AV_PIX_FMT_YUV410P,  AV_PIX_FMT_YUV440P,
-        AV_PIX_FMT_YUVA420P, AV_PIX_FMT_GRAY8,
-        AV_PIX_FMT_NONE
-    };
-    AVFilterFormats *fmts_list = ff_make_format_list(pix_fmts);
-    if (!fmts_list)
-        return AVERROR(ENOMEM);
-    return ff_set_common_formats(ctx, fmts_list);
+    DelogoContext *s = ctx->priv;
+
+    av_expr_free(s->x_pexpr);    s->x_pexpr = NULL;
+    av_expr_free(s->y_pexpr);    s->y_pexpr = NULL;
+    av_expr_free(s->w_pexpr);    s->w_pexpr = NULL;
+    av_expr_free(s->h_pexpr);    s->h_pexpr = NULL;
 }
+
+static const enum AVPixelFormat pix_fmts[] = {
+    AV_PIX_FMT_YUV444P,  AV_PIX_FMT_YUV422P,  AV_PIX_FMT_YUV420P,
+    AV_PIX_FMT_YUV411P,  AV_PIX_FMT_YUV410P,  AV_PIX_FMT_YUV440P,
+    AV_PIX_FMT_YUVA420P, AV_PIX_FMT_GRAY8,
+    AV_PIX_FMT_NONE
+};
 
 static av_cold int init(AVFilterContext *ctx)
 {
     DelogoContext *s = ctx->priv;
+    int ret = 0;
+
+    if ((ret = set_expr(&s->x_pexpr, s->x_expr, "x", ctx)) < 0 ||
+        (ret = set_expr(&s->y_pexpr, s->y_expr, "y", ctx)) < 0 ||
+        (ret = set_expr(&s->w_pexpr, s->w_expr, "w", ctx)) < 0 ||
+        (ret = set_expr(&s->h_pexpr, s->h_expr, "h", ctx)) < 0 )
+        return ret;
+
+    s->x = av_expr_eval(s->x_pexpr, s->var_values, s);
+    s->y = av_expr_eval(s->y_pexpr, s->var_values, s);
+    s->w = av_expr_eval(s->w_pexpr, s->var_values, s);
+    s->h = av_expr_eval(s->h_pexpr, s->var_values, s);
 
 #define CHECK_UNSET_OPT(opt)                                            \
     if (s->opt == -1) {                                            \
@@ -196,6 +256,8 @@ static av_cold int init(AVFilterContext *ctx)
     CHECK_UNSET_OPT(y);
     CHECK_UNSET_OPT(w);
     CHECK_UNSET_OPT(h);
+
+    s->band = 1;
 
     av_log(ctx, AV_LOG_VERBOSE, "x:%d y:%d, w:%d h:%d band:%d show:%d\n",
            s->x, s->y, s->w, s->h, s->band, s->show);
@@ -208,8 +270,23 @@ static av_cold int init(AVFilterContext *ctx)
     return 0;
 }
 
+static int config_input(AVFilterLink *inlink)
+{
+    DelogoContext *s = inlink->dst->priv;
+
+    /* Check whether the logo area fits in the frame */
+    if (s->x + (s->band - 1) < 0 || s->x + s->w - (s->band*2 - 2) > inlink->w ||
+        s->y + (s->band - 1) < 0 || s->y + s->h - (s->band*2 - 2) > inlink->h) {
+        av_log(s, AV_LOG_ERROR, "Logo area is outside of the frame.\n");
+        return AVERROR(EINVAL);
+    }
+
+    return 0;
+}
+
 static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 {
+    FilterLink *inl = ff_filter_link(inlink);
     DelogoContext *s = inlink->dst->priv;
     AVFilterLink *outlink = inlink->dst->outputs[0];
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(inlink->format);
@@ -219,6 +296,40 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     int direct = 0;
     int plane;
     AVRational sar;
+    int ret;
+
+    s->var_values[VAR_N] = inl->frame_count_out;
+    s->var_values[VAR_T] = TS2T(in->pts, inlink->time_base);
+    s->x = av_expr_eval(s->x_pexpr, s->var_values, s);
+    s->y = av_expr_eval(s->y_pexpr, s->var_values, s);
+    s->w = av_expr_eval(s->w_pexpr, s->var_values, s);
+    s->h = av_expr_eval(s->h_pexpr, s->var_values, s);
+
+    if (s->x + (s->band - 1) <= 0 || s->x + s->w - (s->band*2 - 2) > inlink->w ||
+        s->y + (s->band - 1) <= 0 || s->y + s->h - (s->band*2 - 2) > inlink->h) {
+        av_log(s, AV_LOG_WARNING, "Logo area is outside of the frame,"
+               " auto set the area inside of the frame\n");
+    }
+
+    if (s->x + (s->band - 1) <= 0)
+        s->x = 1 + s->band;
+    if (s->y + (s->band - 1) <= 0)
+        s->y = 1 + s->band;
+    if (s->x + s->w - (s->band*2 - 2) > inlink->w)
+        s->w = inlink->w - s->x - (s->band*2 - 2);
+    if (s->y + s->h - (s->band*2 - 2) > inlink->h)
+        s->h = inlink->h - s->y - (s->band*2 - 2);
+
+    ret = config_input(inlink);
+    if (ret < 0) {
+        av_frame_free(&in);
+        return ret;
+    }
+
+    s->w += s->band*2;
+    s->h += s->band*2;
+    s->x -= s->band;
+    s->y -= s->band;
 
     if (av_frame_is_writable(in)) {
         direct = 1;
@@ -238,19 +349,19 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     if (!sar.num)
         sar.num = sar.den = 1;
 
-    for (plane = 0; plane < 4 && in->data[plane] && in->linesize[plane]; plane++) {
+    for (plane = 0; plane < desc->nb_components; plane++) {
         int hsub = plane == 1 || plane == 2 ? hsub0 : 0;
         int vsub = plane == 1 || plane == 2 ? vsub0 : 0;
 
         apply_delogo(out->data[plane], out->linesize[plane],
                      in ->data[plane], in ->linesize[plane],
-                     FF_CEIL_RSHIFT(inlink->w, hsub),
-                     FF_CEIL_RSHIFT(inlink->h, vsub),
+                     AV_CEIL_RSHIFT(inlink->w, hsub),
+                     AV_CEIL_RSHIFT(inlink->h, vsub),
                      sar, s->x>>hsub, s->y>>vsub,
                      /* Up and left borders were rounded down, inject lost bits
                       * into width and height to avoid error accumulation */
-                     FF_CEIL_RSHIFT(s->w + (s->x & ((1<<hsub)-1)), hsub),
-                     FF_CEIL_RSHIFT(s->h + (s->y & ((1<<vsub)-1)), vsub),
+                     AV_CEIL_RSHIFT(s->w + (s->x & ((1<<hsub)-1)), hsub),
+                     AV_CEIL_RSHIFT(s->h + (s->y & ((1<<vsub)-1)), vsub),
                      s->band>>FFMIN(hsub, vsub),
                      s->show, direct);
     }
@@ -266,26 +377,19 @@ static const AVFilterPad avfilter_vf_delogo_inputs[] = {
         .name         = "default",
         .type         = AVMEDIA_TYPE_VIDEO,
         .filter_frame = filter_frame,
+        .config_props = config_input,
     },
-    { NULL }
 };
 
-static const AVFilterPad avfilter_vf_delogo_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-    { NULL }
-};
-
-AVFilter ff_vf_delogo = {
-    .name          = "delogo",
-    .description   = NULL_IF_CONFIG_SMALL("Remove logo from input video."),
+const FFFilter ff_vf_delogo = {
+    .p.name        = "delogo",
+    .p.description = NULL_IF_CONFIG_SMALL("Remove logo from input video."),
+    .p.priv_class  = &delogo_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
     .priv_size     = sizeof(DelogoContext),
-    .priv_class    = &delogo_class,
     .init          = init,
-    .query_formats = query_formats,
-    .inputs        = avfilter_vf_delogo_inputs,
-    .outputs       = avfilter_vf_delogo_outputs,
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
+    .uninit        = uninit,
+    FILTER_INPUTS(avfilter_vf_delogo_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_PIXFMTS_ARRAY(pix_fmts),
 };

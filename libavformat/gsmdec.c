@@ -23,6 +23,7 @@
 #include "libavutil/mathematics.h"
 #include "libavutil/opt.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
 #define GSM_BLOCK_SIZE    33
@@ -33,6 +34,23 @@ typedef struct GSMDemuxerContext {
     AVClass *class;
     int sample_rate;
 } GSMDemuxerContext;
+
+static int gsm_probe(const AVProbeData *p)
+{
+    int valid = 0, invalid = 0;
+    uint8_t *b = p->buf;
+    while (b < p->buf + p->buf_size - 32) {
+        if ((*b & 0xf0) == 0xd0) {
+            valid++;
+        } else {
+            invalid++;
+        }
+        b += 33;
+    }
+    if (valid >> 5 > invalid)
+        return AVPROBE_SCORE_EXTENSION + 1;
+    return 0;
+}
 
 static int gsm_read_packet(AVFormatContext *s, AVPacket *pkt)
 {
@@ -45,7 +63,6 @@ static int gsm_read_packet(AVFormatContext *s, AVPacket *pkt)
 
     ret = av_get_packet(s->pb, pkt, size);
     if (ret < GSM_BLOCK_SIZE) {
-        av_free_packet(pkt);
         return ret < 0 ? ret : AVERROR(EIO);
     }
     pkt->duration = 1;
@@ -61,12 +78,11 @@ static int gsm_read_header(AVFormatContext *s)
     if (!st)
         return AVERROR(ENOMEM);
 
-    st->codec->codec_type  = AVMEDIA_TYPE_AUDIO;
-    st->codec->codec_id    = s->iformat->raw_codec_id;
-    st->codec->channels    = 1;
-    st->codec->channel_layout = AV_CH_LAYOUT_MONO;
-    st->codec->sample_rate = c->sample_rate;
-    st->codec->bit_rate    = GSM_BLOCK_SIZE * 8 * c->sample_rate / GSM_BLOCK_SAMPLES;
+    st->codecpar->codec_type  = AVMEDIA_TYPE_AUDIO;
+    st->codecpar->codec_id    = AV_CODEC_ID_GSM;
+    st->codecpar->ch_layout   = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
+    st->codecpar->sample_rate = c->sample_rate;
+    st->codecpar->bit_rate    = GSM_BLOCK_SIZE * 8 * c->sample_rate / GSM_BLOCK_SAMPLES;
 
     avpriv_set_pts_info(st, 64, GSM_BLOCK_SAMPLES, GSM_SAMPLE_RATE);
 
@@ -87,14 +103,15 @@ static const AVClass gsm_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-AVInputFormat ff_gsm_demuxer = {
-    .name           = "gsm",
-    .long_name      = NULL_IF_CONFIG_SMALL("raw GSM"),
+const FFInputFormat ff_gsm_demuxer = {
+    .p.name         = "gsm",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("raw GSM"),
+    .p.flags        = AVFMT_GENERIC_INDEX,
+    .p.extensions   = "gsm",
+    .p.priv_class   = &gsm_class,
     .priv_data_size = sizeof(GSMDemuxerContext),
+    .read_probe     = gsm_probe,
     .read_header    = gsm_read_header,
     .read_packet    = gsm_read_packet,
-    .flags          = AVFMT_GENERIC_INDEX,
-    .extensions     = "gsm",
     .raw_codec_id   = AV_CODEC_ID_GSM,
-    .priv_class     = &gsm_class,
 };

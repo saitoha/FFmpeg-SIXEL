@@ -19,10 +19,13 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <string.h>
+
 #include "config.h"
 #include "libavutil/attributes.h"
 #include "libavutil/cpu.h"
 #include "libavutil/internal.h"
+#include "libavutil/mem_internal.h"
 #include "libavutil/ppc/cpu.h"
 #include "libavutil/ppc/util_altivec.h"
 #include "libavcodec/mpegaudiodsp.h"
@@ -90,7 +93,7 @@ static void apply_window(const float *buf, const float *win1,
 }
 
 static void apply_window_mp3(float *in, float *win, int *unused, float *out,
-                             int incr)
+                             ptrdiff_t incr)
 {
     LOCAL_ALIGNED_16(float, suma, [17]);
     LOCAL_ALIGNED_16(float, sumb, [17]);

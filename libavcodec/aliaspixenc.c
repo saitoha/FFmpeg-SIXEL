@@ -23,26 +23,16 @@
 
 #include "avcodec.h"
 #include "bytestream.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "encode.h"
 
 #define ALIAS_HEADER_SIZE 10
-
-static av_cold int encode_init(AVCodecContext *avctx)
-{
-    avctx->coded_frame = av_frame_alloc();
-    if (!avctx->coded_frame)
-        return AVERROR(ENOMEM);
-    return 0;
-}
 
 static int encode_frame(AVCodecContext *avctx, AVPacket *pkt,
                         const AVFrame *frame, int *got_packet)
 {
-    int width, height, bits_pixel, i, j, length, ret;
-    uint8_t *in_buf, *buf;
-
-    avctx->coded_frame->pict_type = AV_PICTURE_TYPE_I;
-    avctx->coded_frame->key_frame = 1;
+    int width, height, bits_pixel, length, ret;
+    uint8_t *buf;
 
     width  = avctx->width;
     height = avctx->height;
@@ -65,10 +55,8 @@ static int encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     }
 
     length = ALIAS_HEADER_SIZE + 4 * width * height; // max possible
-    if ((ret = ff_alloc_packet(pkt, length)) < 0) {
-        av_log(avctx, AV_LOG_ERROR, "Error getting output packet of size %d.\n", length);
+    if ((ret = ff_alloc_packet(avctx, pkt, length)) < 0)
         return ret;
-    }
 
     buf = pkt->data;
 
@@ -78,15 +66,16 @@ static int encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     bytestream_put_be32(&buf, 0); /* X, Y offset */
     bytestream_put_be16(&buf, bits_pixel);
 
-    for (j = 0; j < height; j++) {
-        in_buf = frame->data[0] + frame->linesize[0] * j;
-        for (i = 0; i < width; ) {
+    for (int j = 0, bytes_pixel = bits_pixel >> 3; j < height; j++) {
+        const uint8_t *in_buf = frame->data[0] + frame->linesize[0] * j;
+        const uint8_t *const line_end = in_buf + bytes_pixel * width;
+        while (in_buf < line_end) {
             int count = 0;
             int pixel;
 
             if (avctx->pix_fmt == AV_PIX_FMT_GRAY8) {
                 pixel = *in_buf;
-                while (count < 255 && count + i < width && pixel == *in_buf) {
+                while (count < 255 && in_buf < line_end && pixel == *in_buf) {
                     count++;
                     in_buf++;
                 }
@@ -94,7 +83,7 @@ static int encode_frame(AVCodecContext *avctx, AVPacket *pkt,
                 bytestream_put_byte(&buf, pixel);
             } else { /* AV_PIX_FMT_BGR24 */
                 pixel = AV_RB24(in_buf);
-                while (count < 255 && count + i < width &&
+                while (count < 255 && in_buf < line_end &&
                        pixel == AV_RB24(in_buf)) {
                     count++;
                     in_buf += 3;
@@ -102,33 +91,22 @@ static int encode_frame(AVCodecContext *avctx, AVPacket *pkt,
                 bytestream_put_byte(&buf, count);
                 bytestream_put_be24(&buf, pixel);
             }
-            i += count;
         }
     }
 
     /* Total length */
     av_shrink_packet(pkt, buf - pkt->data);
-    pkt->flags |= AV_PKT_FLAG_KEY;
     *got_packet = 1;
 
     return 0;
 }
 
-static av_cold int encode_close(AVCodecContext *avctx)
-{
-    av_frame_free(&avctx->coded_frame);
-    return 0;
-}
-
-AVCodec ff_alias_pix_encoder = {
-    .name      = "alias_pix",
-    .long_name = NULL_IF_CONFIG_SMALL("Alias/Wavefront PIX image"),
-    .type      = AVMEDIA_TYPE_VIDEO,
-    .id        = AV_CODEC_ID_ALIAS_PIX,
-    .init      = encode_init,
-    .encode2   = encode_frame,
-    .close     = encode_close,
-    .pix_fmts  = (const enum AVPixelFormat[]) {
-        AV_PIX_FMT_BGR24, AV_PIX_FMT_GRAY8, AV_PIX_FMT_NONE
-    },
+const FFCodec ff_alias_pix_encoder = {
+    .p.name    = "alias_pix",
+    CODEC_LONG_NAME("Alias/Wavefront PIX image"),
+    .p.type    = AVMEDIA_TYPE_VIDEO,
+    .p.id      = AV_CODEC_ID_ALIAS_PIX,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
+    FF_CODEC_ENCODE_CB(encode_frame),
+    CODEC_PIXFMTS(AV_PIX_FMT_BGR24, AV_PIX_FMT_GRAY8),
 };

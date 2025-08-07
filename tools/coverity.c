@@ -31,12 +31,67 @@
 
 #define NULL (void *)0
 
+typedef long long int64_t;
+
+enum AVRounding {
+    AV_ROUND_ZERO     = 0,
+    AV_ROUND_INF      = 1,
+    AV_ROUND_DOWN     = 2,
+    AV_ROUND_UP       = 3,
+    AV_ROUND_NEAR_INF = 5,
+    AV_ROUND_PASS_MINMAX = 8192,
+};
+
 // Based on https://scan.coverity.com/models
 void *av_malloc(size_t size) {
     int has_memory;
     __coverity_negative_sink__(size);
-    if(has_memory)
-        return __coverity_alloc__(size);
-    else
+    if (has_memory) {
+        void *ptr = __coverity_alloc__(size);
+        __coverity_mark_as_uninitialized_buffer__(ptr);
+        __coverity_mark_as_afm_allocated__(ptr, "av_free");
+         return ptr;
+    } else {
         return 0;
+    }
+}
+
+void *av_mallocz(size_t size) {
+    int has_memory;
+    __coverity_negative_sink__(size);
+    if (has_memory) {
+        void *ptr = __coverity_alloc__(size);
+        __coverity_writeall0__(ptr);
+        __coverity_mark_as_afm_allocated__(ptr, "av_free");
+        return ptr;
+    } else {
+        return 0;
+    }
+}
+
+void *av_realloc(void *ptr, size_t size) {
+    int has_memory;
+    __coverity_negative_sink__(size);
+    if (has_memory) {
+        __coverity_escape__(ptr);
+        ptr = __coverity_alloc__(size);
+        __coverity_writeall__(ptr);
+        __coverity_mark_as_afm_allocated__(ptr, "av_free");
+        return ptr;
+    } else {
+        return 0;
+    }
+}
+
+void *av_free(void *ptr) {
+    __coverity_free__(ptr);
+    __coverity_mark_as_afm_freed__(ptr, "av_free");
+}
+
+
+int64_t av_rescale_rnd(int64_t a, int64_t b, int64_t c, enum AVRounding rnd) {
+    __coverity_negative_sink__(b);
+    __coverity_negative_sink__(c);
+
+    return (double)a * (double)b / (double)c;
 }

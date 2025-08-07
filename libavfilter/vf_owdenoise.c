@@ -19,6 +19,11 @@
  * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
  */
 
+// The code written by Michael Niedermayer in 70024b6b47b9eacfe01e8f92349ca9bf1ccd7d5a:libavfilter/vf_owdenoise.c
+// can also be used under the LGPL due to:
+// <michaelni> durandal_1707, if you do all the "todo" points from vf_owdenoise.c that are in that file since 2013 then sure i would be more than happy to relicense my part of it to LGPL
+// <durandal_1707> michaelni: first relicense than work
+
 /**
  * @todo try to change to int
  * @todo try lifting based implementation
@@ -29,12 +34,15 @@
  */
 
 #include "libavutil/imgutils.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
+#include "libavutil/mem_internal.h"
 #include "libavutil/pixdesc.h"
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
+#include "video.h"
 
-typedef struct {
+typedef struct OWDenoiseContext {
     const AVClass *class;
     double luma_strength;
     double chroma_strength;
@@ -42,6 +50,7 @@ typedef struct {
     float *plane[16+1][4];
     int linesize;
     int hsub, vsub;
+    int pixel_depth;
 } OWDenoiseContext;
 
 #define OFFSET(x) offsetof(OWDenoiseContext, x)
@@ -188,9 +197,18 @@ static void filter(OWDenoiseContext *s,
     while (1<<depth > width || 1<<depth > height)
         depth--;
 
-    for (y = 0; y < height; y++)
-        for(x = 0; x < width; x++)
-            s->plane[0][0][y*s->linesize + x] = src[y*src_linesize + x];
+    if (s->pixel_depth <= 8) {
+        for (y = 0; y < height; y++)
+            for(x = 0; x < width; x++)
+                s->plane[0][0][y*s->linesize + x] = src[y*src_linesize + x];
+    } else {
+        const uint16_t *src16 = (const uint16_t *)src;
+
+        src_linesize /= 2;
+        for (y = 0; y < height; y++)
+            for(x = 0; x < width; x++)
+                s->plane[0][0][y*s->linesize + x] = src16[y*src_linesize + x];
+    }
 
     for (i = 0; i < depth; i++)
         decompose2D2(s->plane[i + 1], s->plane[i][0], s->plane[0] + 1, s->linesize, 1<<i, width, height);
@@ -211,28 +229,45 @@ static void filter(OWDenoiseContext *s,
     for (i = depth-1; i >= 0; i--)
         compose2D2(s->plane[i][0], s->plane[i + 1], s->plane[0] + 1, s->linesize, 1<<i, width, height);
 
-    for (y = 0; y < height; y++) {
-        for (x = 0; x < width; x++) {
-            i = s->plane[0][0][y*s->linesize + x] + dither[x&7][y&7]*(1.0/64) + 1.0/128; // yes the rounding is insane but optimal :)
-            if ((unsigned)i > 255U) i = ~(i >> 31);
-            dst[y*dst_linesize + x] = i;
+    if (s->pixel_depth <= 8) {
+        for (y = 0; y < height; y++) {
+            for (x = 0; x < width; x++) {
+                i = s->plane[0][0][y*s->linesize + x] + dither[x&7][y&7]*(1.0/64) + 1.0/128; // yes the rounding is insane but optimal :)
+                if ((unsigned)i > 255U) i = ~(i >> 31);
+                dst[y*dst_linesize + x] = i;
+            }
+        }
+    } else {
+        uint16_t *dst16 = (uint16_t *)dst;
+
+        dst_linesize /= 2;
+        for (y = 0; y < height; y++) {
+            for (x = 0; x < width; x++) {
+                i = s->plane[0][0][y*s->linesize + x];
+                dst16[y*dst_linesize + x] = i;
+            }
         }
     }
 }
 
 static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 {
-    int direct = 0;
     AVFilterContext *ctx = inlink->dst;
     OWDenoiseContext *s = ctx->priv;
     AVFilterLink *outlink = ctx->outputs[0];
     AVFrame *out;
-    const int cw = FF_CEIL_RSHIFT(inlink->w, s->hsub);
-    const int ch = FF_CEIL_RSHIFT(inlink->h, s->vsub);
+    const int cw = AV_CEIL_RSHIFT(inlink->w, s->hsub);
+    const int ch = AV_CEIL_RSHIFT(inlink->h, s->vsub);
 
     if (av_frame_is_writable(in)) {
-        direct = 1;
         out = in;
+
+        if (s->luma_strength > 0)
+            filter(s, out->data[0], out->linesize[0], in->data[0], in->linesize[0], inlink->w, inlink->h, s->luma_strength);
+        if (s->chroma_strength > 0) {
+            filter(s, out->data[1], out->linesize[1], in->data[1], in->linesize[1], cw,        ch,        s->chroma_strength);
+            filter(s, out->data[2], out->linesize[2], in->data[2], in->linesize[2], cw,        ch,        s->chroma_strength);
+        }
     } else {
         out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
         if (!out) {
@@ -240,13 +275,20 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
             return AVERROR(ENOMEM);
         }
         av_frame_copy_props(out, in);
-    }
 
-    filter(s, out->data[0], out->linesize[0], in->data[0], in->linesize[0], inlink->w, inlink->h, s->luma_strength);
-    filter(s, out->data[1], out->linesize[1], in->data[1], in->linesize[1], cw,        ch,        s->chroma_strength);
-    filter(s, out->data[2], out->linesize[2], in->data[2], in->linesize[2], cw,        ch,        s->chroma_strength);
+        if (s->luma_strength > 0) {
+            filter(s, out->data[0], out->linesize[0], in->data[0], in->linesize[0], inlink->w, inlink->h, s->luma_strength);
+        } else {
+            av_image_copy_plane(out->data[0], out->linesize[0], in ->data[0], in ->linesize[0], inlink->w, inlink->h);
+        }
+        if (s->chroma_strength > 0) {
+            filter(s, out->data[1], out->linesize[1], in->data[1], in->linesize[1], cw, ch, s->chroma_strength);
+            filter(s, out->data[2], out->linesize[2], in->data[2], in->linesize[2], cw, ch, s->chroma_strength);
+        } else {
+            av_image_copy_plane(out->data[1], out->linesize[1], in ->data[1], in ->linesize[1], inlink->w, inlink->h);
+            av_image_copy_plane(out->data[2], out->linesize[2], in ->data[2], in ->linesize[2], inlink->w, inlink->h);
+        }
 
-    if (!direct) {
         if (in->data[3])
             av_image_copy_plane(out->data[3], out->linesize[3],
                                 in ->data[3], in ->linesize[3],
@@ -257,21 +299,21 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     return ff_filter_frame(outlink, out);
 }
 
-static int query_formats(AVFilterContext *ctx)
-{
-    static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_YUV444P,      AV_PIX_FMT_YUV422P,
-        AV_PIX_FMT_YUV420P,      AV_PIX_FMT_YUV411P,
-        AV_PIX_FMT_YUV410P,      AV_PIX_FMT_YUV440P,
-        AV_PIX_FMT_YUVA444P,     AV_PIX_FMT_YUVA422P,
-        AV_PIX_FMT_YUVA420P,
-        AV_PIX_FMT_NONE
-    };
-    AVFilterFormats *fmts_list = ff_make_format_list(pix_fmts);
-    if (!fmts_list)
-        return AVERROR(ENOMEM);
-    return ff_set_common_formats(ctx, fmts_list);
-}
+static const enum AVPixelFormat pix_fmts[] = {
+    AV_PIX_FMT_YUV444P,      AV_PIX_FMT_YUV422P,
+    AV_PIX_FMT_YUV420P,      AV_PIX_FMT_YUV411P,
+    AV_PIX_FMT_YUV410P,      AV_PIX_FMT_YUV440P,
+    AV_PIX_FMT_YUVA444P,     AV_PIX_FMT_YUVA422P,
+    AV_PIX_FMT_YUVA420P,
+    AV_PIX_FMT_YUV420P9, AV_PIX_FMT_YUV422P9, AV_PIX_FMT_YUV444P9,
+    AV_PIX_FMT_YUV420P10, AV_PIX_FMT_YUV422P10, AV_PIX_FMT_YUV444P10,
+    AV_PIX_FMT_YUV440P10,
+    AV_PIX_FMT_YUV444P12, AV_PIX_FMT_YUV422P12, AV_PIX_FMT_YUV420P12,
+    AV_PIX_FMT_YUV440P12,
+    AV_PIX_FMT_YUV444P14, AV_PIX_FMT_YUV422P14, AV_PIX_FMT_YUV420P14,
+    AV_PIX_FMT_YUV420P16, AV_PIX_FMT_YUV422P16, AV_PIX_FMT_YUV444P16,
+    AV_PIX_FMT_NONE
+};
 
 static int config_input(AVFilterLink *inlink)
 {
@@ -282,6 +324,7 @@ static int config_input(AVFilterLink *inlink)
 
     s->hsub = desc->log2_chroma_w;
     s->vsub = desc->log2_chroma_h;
+    s->pixel_depth = desc->comp[0].depth;
 
     s->linesize = FFALIGN(inlink->w, 16);
     for (j = 0; j < 4; j++) {
@@ -311,25 +354,16 @@ static const AVFilterPad owdenoise_inputs[] = {
         .filter_frame = filter_frame,
         .config_props = config_input,
     },
-    { NULL }
 };
 
-static const AVFilterPad owdenoise_outputs[] = {
-     {
-         .name = "default",
-         .type = AVMEDIA_TYPE_VIDEO,
-     },
-     { NULL }
-};
-
-AVFilter ff_vf_owdenoise = {
-    .name          = "owdenoise",
-    .description   = NULL_IF_CONFIG_SMALL("Denoise using wavelets."),
+const FFFilter ff_vf_owdenoise = {
+    .p.name        = "owdenoise",
+    .p.description = NULL_IF_CONFIG_SMALL("Denoise using wavelets."),
+    .p.priv_class  = &owdenoise_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
     .priv_size     = sizeof(OWDenoiseContext),
     .uninit        = uninit,
-    .query_formats = query_formats,
-    .inputs        = owdenoise_inputs,
-    .outputs       = owdenoise_outputs,
-    .priv_class    = &owdenoise_class,
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
+    FILTER_INPUTS(owdenoise_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_PIXFMTS_ARRAY(pix_fmts),
 };

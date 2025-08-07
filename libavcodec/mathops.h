@@ -24,21 +24,22 @@
 
 #include <stdint.h>
 
+#include "libavutil/attributes_internal.h"
 #include "libavutil/common.h"
 #include "config.h"
 
 #define MAX_NEG_CROP 1024
 
 extern const uint32_t ff_inverse[257];
-extern const uint8_t  ff_reverse[256];
+extern const uint8_t ff_log2_run[41];
+EXTERN const uint32_t ff_square_tab[512];
 extern const uint8_t ff_sqrt_tab[256];
-extern const uint8_t ff_crop_tab[256 + 2 * MAX_NEG_CROP];
+EXTERN const uint8_t ff_crop_tab[256 + 2 * MAX_NEG_CROP];
 extern const uint8_t ff_zigzag_direct[64];
+extern const uint8_t ff_zigzag_scan[16+1];
 
 #if   ARCH_ARM
 #   include "arm/mathops.h"
-#elif ARCH_AVR32
-#   include "avr32/mathops.h"
 #elif ARCH_MIPS
 #   include "mips/mathops.h"
 #elif ARCH_PPC
@@ -96,15 +97,6 @@ static av_always_inline unsigned UMULH(unsigned a, unsigned b){
 #define mid_pred mid_pred
 static inline av_const int mid_pred(int a, int b, int c)
 {
-#if 0
-    int t= (a-b)&((a-b)>>31);
-    a-=t;
-    b+=t;
-    b-= (b-c)&((b-c)>>31);
-    b+= (a-b)&((a-b)>>31);
-
-    return b;
-#else
     if(a>b){
         if(c>b){
             if(c>a) b=a;
@@ -117,7 +109,6 @@ static inline av_const int mid_pred(int a, int b, int c)
         }
     }
     return b;
-#endif
 }
 #endif
 
@@ -135,11 +126,22 @@ static inline av_const int median4(int a, int b, int c, int d)
 }
 #endif
 
+#define FF_SIGNBIT(x) ((x) >> CHAR_BIT * sizeof(x) - 1)
+
 #ifndef sign_extend
 static inline av_const int sign_extend(int val, unsigned bits)
 {
     unsigned shift = 8 * sizeof(int) - bits;
     union { unsigned u; int s; } v = { (unsigned) val << shift };
+    return v.s >> shift;
+}
+#endif
+
+#ifndef sign_extend64
+static inline av_const int64_t sign_extend64(int64_t val, unsigned bits)
+{
+    unsigned shift = 8 * sizeof(int64_t) - bits;
+    union { uint64_t u; int64_t s; } v = { (uint64_t) val << shift };
     return v.s >> shift;
 }
 #endif
@@ -233,6 +235,11 @@ static inline av_const unsigned int ff_sqrt(unsigned int a)
     return b - (a < b * b);
 }
 #endif
+
+static inline av_const float ff_sqrf(float a)
+{
+    return a*a;
+}
 
 static inline int8_t ff_u8_to_s8(uint8_t a)
 {

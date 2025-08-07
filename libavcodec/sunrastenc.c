@@ -19,12 +19,17 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/opt.h"
+
 #include "avcodec.h"
 #include "bytestream.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "encode.h"
 #include "sunrast.h"
 
 typedef struct SUNRASTContext {
+    AVClass *class;
+
     PutByteContext p;
     int depth;      ///< depth of pixel
     int length;     ///< length (bytes) of image
@@ -136,17 +141,8 @@ static av_cold int sunrast_encode_init(AVCodecContext *avctx)
 {
     SUNRASTContext *s = avctx->priv_data;
 
-    switch (avctx->coder_type) {
-    case FF_CODER_TYPE_RLE:
-        s->type = RT_BYTE_ENCODED;
-        break;
-    case FF_CODER_TYPE_RAW:
-        s->type = RT_STANDARD;
-        break;
-    default:
-        av_log(avctx, AV_LOG_ERROR, "invalid coder_type\n");
-        return AVERROR(EINVAL);
-    }
+    // adjust boolean option to RT equivalent
+    s->type++;
 
     s->maptype                    = RMT_NONE;
     s->maplength                  = 0;
@@ -169,8 +165,7 @@ static av_cold int sunrast_encode_init(AVCodecContext *avctx)
         return AVERROR_BUG;
     }
     s->length = avctx->height * (FFALIGN(avctx->width * s->depth, 16) >> 3);
-    s->size   = 32 + s->maplength +
-                s->length * (s->type == RT_BYTE_ENCODED ? 2 : 1);
+    s->size   = 32 + s->maplength + s->length * s->type;
 
     return 0;
 }
@@ -181,7 +176,7 @@ static int sunrast_encode_frame(AVCodecContext *avctx,  AVPacket *avpkt,
     SUNRASTContext *s = avctx->priv_data;
     int ret;
 
-    if ((ret = ff_alloc_packet2(avctx, avpkt, s->size)) < 0)
+    if ((ret = ff_alloc_packet(avctx, avpkt, s->size)) < 0)
         return ret;
 
     bytestream2_init_writer(&s->p, avpkt->data, avpkt->size);
@@ -194,35 +189,37 @@ static int sunrast_encode_frame(AVCodecContext *avctx,  AVPacket *avpkt,
         AV_WB32(&avpkt->data[16], s->length);
 
     *got_packet_ptr = 1;
-    avpkt->flags |= AV_PKT_FLAG_KEY;
     avpkt->size = bytestream2_tell_p(&s->p);
     return 0;
 }
 
-static av_cold int sunrast_encode_close(AVCodecContext *avctx)
-{
-    av_frame_free(&avctx->coded_frame);
-    return 0;
-}
+#define OFFSET(x) offsetof(SUNRASTContext, x)
+#define VE AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
+static const AVOption options[] = {
+    { "rle", "Use run-length compression", OFFSET(type), AV_OPT_TYPE_INT, { .i64 = 1 }, 0, 1, VE },
 
-static const AVCodecDefault sunrast_defaults[] = {
-     { "coder", "rle" },
-     { NULL },
+    { NULL },
 };
 
-AVCodec ff_sunrast_encoder = {
-    .name           = "sunrast",
-    .long_name      = NULL_IF_CONFIG_SMALL("Sun Rasterfile image"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_SUNRAST,
+static const AVClass sunrast_class = {
+    .class_name = "sunrast",
+    .item_name  = av_default_item_name,
+    .option     = options,
+    .version    = LIBAVUTIL_VERSION_INT,
+};
+
+const FFCodec ff_sunrast_encoder = {
+    .p.name         = "sunrast",
+    CODEC_LONG_NAME("Sun Rasterfile image"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_SUNRAST,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
     .priv_data_size = sizeof(SUNRASTContext),
     .init           = sunrast_encode_init,
-    .close          = sunrast_encode_close,
-    .encode2        = sunrast_encode_frame,
-    .defaults       = sunrast_defaults,
-    .pix_fmts       = (const enum AVPixelFormat[]){ AV_PIX_FMT_BGR24,
-                                                  AV_PIX_FMT_PAL8,
-                                                  AV_PIX_FMT_GRAY8,
-                                                  AV_PIX_FMT_MONOWHITE,
-                                                  AV_PIX_FMT_NONE },
+    FF_CODEC_ENCODE_CB(sunrast_encode_frame),
+    .p.priv_class   = &sunrast_class,
+    CODEC_PIXFMTS(AV_PIX_FMT_BGR24,
+                  AV_PIX_FMT_PAL8,
+                  AV_PIX_FMT_GRAY8,
+                  AV_PIX_FMT_MONOWHITE),
 };

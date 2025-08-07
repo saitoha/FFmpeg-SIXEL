@@ -25,6 +25,7 @@
  */
 
 #include "libavutil/avstring.h"
+#include "libavutil/bprint.h"
 #include "libavutil/mathematics.h"
 #include "libavutil/opt.h"
 #include "avformat.h"
@@ -38,6 +39,7 @@
 
 typedef struct LibRTMPContext {
     const AVClass *class;
+    AVBPrint filename;
     RTMP rtmp;
     char *app;
     char *conn;
@@ -50,7 +52,6 @@ typedef struct LibRTMPContext {
     char *pageurl;
     char *client_buffer_time;
     int live;
-    char *temp_filename;
     int buffer_size;
 } LibRTMPContext;
 
@@ -76,7 +77,7 @@ static int rtmp_close(URLContext *s)
     RTMP *r = &ctx->rtmp;
 
     RTMP_Close(r);
-    av_freep(&ctx->temp_filename);
+    av_bprint_finalize(&ctx->filename, NULL);
     return 0;
 }
 
@@ -97,8 +98,8 @@ static int rtmp_open(URLContext *s, const char *uri, int flags)
     LibRTMPContext *ctx = s->priv_data;
     RTMP *r = &ctx->rtmp;
     int rc = 0, level;
-    char *filename = s->filename;
-    int len = strlen(s->filename) + 1;
+    /* This needs to stay allocated for as long as the RTMP context exists. */
+    av_bprint_init(&ctx->filename, 0, AV_BPRINT_SIZE_UNLIMITED);
 
     switch (av_log_get_level()) {
     default:
@@ -112,116 +113,58 @@ static int rtmp_open(URLContext *s, const char *uri, int flags)
     RTMP_LogSetLevel(level);
     RTMP_LogSetCallback(rtmp_log);
 
-    if (ctx->app)      len += strlen(ctx->app)      + sizeof(" app=");
-    if (ctx->tcurl)    len += strlen(ctx->tcurl)    + sizeof(" tcUrl=");
-    if (ctx->pageurl)  len += strlen(ctx->pageurl)  + sizeof(" pageUrl=");
-    if (ctx->flashver) len += strlen(ctx->flashver) + sizeof(" flashver=");
-
-    if (ctx->conn) {
-        char *sep, *p = ctx->conn;
-        int options = 0;
-
-        while (p) {
-            options++;
-            p += strspn(p, " ");
-            if (!*p)
-                break;
-            sep = strchr(p, ' ');
-            if (sep)
-                p = sep + 1;
-            else
-                break;
-        }
-        len += options * sizeof(" conn=");
-        len += strlen(ctx->conn);
-    }
-
-    if (ctx->playpath)
-        len += strlen(ctx->playpath) + sizeof(" playpath=");
-    if (ctx->live)
-        len += sizeof(" live=1");
-    if (ctx->subscribe)
-        len += strlen(ctx->subscribe) + sizeof(" subscribe=");
-
-    if (ctx->client_buffer_time)
-        len += strlen(ctx->client_buffer_time) + sizeof(" buffer=");
-
-    if (ctx->swfurl || ctx->swfverify) {
-        len += sizeof(" swfUrl=");
-
-        if (ctx->swfverify)
-            len += strlen(ctx->swfverify) + sizeof(" swfVfy=1");
-        else
-            len += strlen(ctx->swfurl);
-    }
-
-    if (!(ctx->temp_filename = filename = av_malloc(len)))
-        return AVERROR(ENOMEM);
-
-    av_strlcpy(filename, s->filename, len);
-    if (ctx->app) {
-        av_strlcat(filename, " app=", len);
-        av_strlcat(filename, ctx->app, len);
-    }
-    if (ctx->tcurl) {
-        av_strlcat(filename, " tcUrl=", len);
-        av_strlcat(filename, ctx->tcurl, len);
-    }
-    if (ctx->pageurl) {
-        av_strlcat(filename, " pageUrl=", len);
-        av_strlcat(filename, ctx->pageurl, len);
-    }
-    if (ctx->swfurl) {
-        av_strlcat(filename, " swfUrl=", len);
-        av_strlcat(filename, ctx->swfurl, len);
-    }
-    if (ctx->flashver) {
-        av_strlcat(filename, " flashVer=", len);
-        av_strlcat(filename, ctx->flashver, len);
-    }
+    av_bprintf(&ctx->filename, "%s", s->filename);
+    if (ctx->app)
+        av_bprintf(&ctx->filename, " app=%s", ctx->app);
+    if (ctx->tcurl)
+        av_bprintf(&ctx->filename, " tcUrl=%s", ctx->tcurl);
+    if (ctx->pageurl)
+        av_bprintf(&ctx->filename, " pageUrl=%s", ctx->pageurl);
+    if (ctx->swfurl)
+        av_bprintf(&ctx->filename, " swfUrl=%s", ctx->swfurl);
+    if (ctx->flashver)
+        av_bprintf(&ctx->filename, " flashVer=%s", ctx->flashver);
     if (ctx->conn) {
         char *sep, *p = ctx->conn;
         while (p) {
-            av_strlcat(filename, " conn=", len);
+            av_bprintf(&ctx->filename,  " conn=");
             p += strspn(p, " ");
             if (!*p)
                 break;
             sep = strchr(p, ' ');
             if (sep)
                 *sep = '\0';
-            av_strlcat(filename, p, len);
+            av_bprintf(&ctx->filename, "%s", p);
 
             if (sep)
                 p = sep + 1;
+            else
+                break;
         }
     }
-    if (ctx->playpath) {
-        av_strlcat(filename, " playpath=", len);
-        av_strlcat(filename, ctx->playpath, len);
-    }
+    if (ctx->playpath)
+        av_bprintf(&ctx->filename, " playpath=%s", ctx->playpath);
     if (ctx->live)
-        av_strlcat(filename, " live=1", len);
-    if (ctx->subscribe) {
-        av_strlcat(filename, " subscribe=", len);
-        av_strlcat(filename, ctx->subscribe, len);
-    }
-    if (ctx->client_buffer_time) {
-        av_strlcat(filename, " buffer=", len);
-        av_strlcat(filename, ctx->client_buffer_time, len);
-    }
+        av_bprintf(&ctx->filename, " live=1");
+    if (ctx->subscribe)
+        av_bprintf(&ctx->filename, " subscribe=%s", ctx->subscribe);
+    if (ctx->client_buffer_time)
+        av_bprintf(&ctx->filename, " buffer=%s", ctx->client_buffer_time);
     if (ctx->swfurl || ctx->swfverify) {
-        av_strlcat(filename, " swfUrl=", len);
+        if (ctx->swfverify)
+            av_bprintf(&ctx->filename, " swfUrl=%s swfVfy=1", ctx->swfverify);
+        else
+            av_bprintf(&ctx->filename, " swfUrl=%s", ctx->swfurl);
+    }
 
-        if (ctx->swfverify) {
-            av_strlcat(filename, ctx->swfverify, len);
-            av_strlcat(filename, " swfVfy=1", len);
-        } else {
-            av_strlcat(filename, ctx->swfurl, len);
-        }
+    if (!av_bprint_is_complete(&ctx->filename)) {
+        av_bprint_finalize(&ctx->filename, NULL);
+        return AVERROR(ENOMEM);
     }
 
     RTMP_Init(r);
-    if (!RTMP_SetupURL(r, filename)) {
+    /* This will modify filename by null terminating the URL portion */
+    if (!RTMP_SetupURL(r, ctx->filename.str)) {
         rc = AVERROR_UNKNOWN;
         goto fail;
     }
@@ -237,16 +180,20 @@ static int rtmp_open(URLContext *s, const char *uri, int flags)
 #if CONFIG_NETWORK
     if (ctx->buffer_size >= 0 && (flags & AVIO_FLAG_WRITE)) {
         int tmp = ctx->buffer_size;
-        setsockopt(r->m_sb.sb_socket, SOL_SOCKET, SO_SNDBUF, &tmp, sizeof(tmp));
+        if (setsockopt(r->m_sb.sb_socket, SOL_SOCKET, SO_SNDBUF, &tmp, sizeof(tmp))) {
+            rc = AVERROR_EXTERNAL;
+            goto fail;
+        }
     }
 #endif
 
     s->is_streamed = 1;
     return 0;
 fail:
-    av_freep(&ctx->temp_filename);
+
     if (rc)
         RTMP_Close(r);
+    av_bprint_finalize(&ctx->filename, NULL);
 
     return rc;
 }
@@ -256,7 +203,10 @@ static int rtmp_write(URLContext *s, const uint8_t *buf, int size)
     LibRTMPContext *ctx = s->priv_data;
     RTMP *r = &ctx->rtmp;
 
-    return RTMP_Write(r, buf, size);
+    int ret = RTMP_Write(r, buf, size);
+    if (!ret)
+        return AVERROR_EOF;
+    return ret;
 }
 
 static int rtmp_read(URLContext *s, uint8_t *buf, int size)
@@ -264,11 +214,15 @@ static int rtmp_read(URLContext *s, uint8_t *buf, int size)
     LibRTMPContext *ctx = s->priv_data;
     RTMP *r = &ctx->rtmp;
 
-    return RTMP_Read(r, buf, size);
+    int ret = RTMP_Read(r, buf, size);
+    if (!ret)
+        return AVERROR_EOF;
+    return ret;
 }
 
-static int rtmp_read_pause(URLContext *s, int pause)
+static int rtmp_read_pause(void *opaque, int pause)
 {
+    URLContext *s = opaque;
     LibRTMPContext *ctx = s->priv_data;
     RTMP *r = &ctx->rtmp;
 
@@ -277,9 +231,10 @@ static int rtmp_read_pause(URLContext *s, int pause)
     return 0;
 }
 
-static int64_t rtmp_read_seek(URLContext *s, int stream_index,
+static int64_t rtmp_read_seek(void *opaque, int stream_index,
                               int64_t timestamp, int flags)
 {
+    URLContext *s = opaque;
     LibRTMPContext *ctx = s->priv_data;
     RTMP *r = &ctx->rtmp;
 
@@ -312,10 +267,10 @@ static const AVOption options[] = {
     {"rtmp_buffer", "Set buffer time in milliseconds. The default is 3000.", OFFSET(client_buffer_time), AV_OPT_TYPE_STRING, {.str = "3000"}, 0, 0, DEC|ENC},
     {"rtmp_conn", "Append arbitrary AMF data to the Connect message", OFFSET(conn), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, DEC|ENC},
     {"rtmp_flashver", "Version of the Flash plugin used to run the SWF player.", OFFSET(flashver), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, DEC|ENC},
-    {"rtmp_live", "Specify that the media is a live stream.", OFFSET(live), AV_OPT_TYPE_INT, {.i64 = 0}, INT_MIN, INT_MAX, DEC, "rtmp_live"},
-    {"any", "both", 0, AV_OPT_TYPE_CONST, {.i64 = -2}, 0, 0, DEC, "rtmp_live"},
-    {"live", "live stream", 0, AV_OPT_TYPE_CONST, {.i64 = -1}, 0, 0, DEC, "rtmp_live"},
-    {"recorded", "recorded stream", 0, AV_OPT_TYPE_CONST, {.i64 = 0}, 0, 0, DEC, "rtmp_live"},
+    {"rtmp_live", "Specify that the media is a live stream.", OFFSET(live), AV_OPT_TYPE_INT, {.i64 = 0}, INT_MIN, INT_MAX, DEC, .unit = "rtmp_live"},
+    {"any", "both", 0, AV_OPT_TYPE_CONST, {.i64 = -2}, 0, 0, DEC, .unit = "rtmp_live"},
+    {"live", "live stream", 0, AV_OPT_TYPE_CONST, {.i64 = -1}, 0, 0, DEC, .unit = "rtmp_live"},
+    {"recorded", "recorded stream", 0, AV_OPT_TYPE_CONST, {.i64 = 0}, 0, 0, DEC, .unit = "rtmp_live"},
     {"rtmp_pageurl", "URL of the web page in which the media was embedded. By default no value will be sent.", OFFSET(pageurl), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, DEC},
     {"rtmp_playpath", "Stream identifier to play or to publish", OFFSET(playpath), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, DEC|ENC},
     {"rtmp_subscribe", "Name of live stream to subscribe to. Defaults to rtmp_playpath.", OFFSET(subscribe), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, DEC},
@@ -337,7 +292,7 @@ static const AVClass lib ## flavor ## _class = {\
 };
 
 RTMP_CLASS(rtmp)
-URLProtocol ff_librtmp_protocol = {
+const URLProtocol ff_librtmp_protocol = {
     .name                = "rtmp",
     .url_open            = rtmp_open,
     .url_read            = rtmp_read,
@@ -352,7 +307,7 @@ URLProtocol ff_librtmp_protocol = {
 };
 
 RTMP_CLASS(rtmpt)
-URLProtocol ff_librtmpt_protocol = {
+const URLProtocol ff_librtmpt_protocol = {
     .name                = "rtmpt",
     .url_open            = rtmp_open,
     .url_read            = rtmp_read,
@@ -367,7 +322,7 @@ URLProtocol ff_librtmpt_protocol = {
 };
 
 RTMP_CLASS(rtmpe)
-URLProtocol ff_librtmpe_protocol = {
+const URLProtocol ff_librtmpe_protocol = {
     .name                = "rtmpe",
     .url_open            = rtmp_open,
     .url_read            = rtmp_read,
@@ -382,7 +337,7 @@ URLProtocol ff_librtmpe_protocol = {
 };
 
 RTMP_CLASS(rtmpte)
-URLProtocol ff_librtmpte_protocol = {
+const URLProtocol ff_librtmpte_protocol = {
     .name                = "rtmpte",
     .url_open            = rtmp_open,
     .url_read            = rtmp_read,
@@ -397,7 +352,7 @@ URLProtocol ff_librtmpte_protocol = {
 };
 
 RTMP_CLASS(rtmps)
-URLProtocol ff_librtmps_protocol = {
+const URLProtocol ff_librtmps_protocol = {
     .name                = "rtmps",
     .url_open            = rtmp_open,
     .url_read            = rtmp_read,

@@ -48,7 +48,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 #include "config.h"
-#include "libavcodec/avcodec.h"
+#include "libavutil/attributes.h"
 #include "libavcodec/fmtconvert.h"
 #include "libavutil/mips/asmdefs.h"
 

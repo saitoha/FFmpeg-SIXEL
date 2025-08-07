@@ -27,8 +27,10 @@
 #include "libavutil/common.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/imgutils.h"
+#include "libavutil/mem.h"
 #include "avcodec.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 
 typedef struct KgvContext {
     uint16_t *frame_buffer;
@@ -43,10 +45,9 @@ static void decode_flush(AVCodecContext *avctx)
     av_freep(&c->last_frame_buffer);
 }
 
-static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
-                        AVPacket *avpkt)
+static int decode_frame(AVCodecContext *avctx, AVFrame *frame,
+                        int *got_frame, AVPacket *avpkt)
 {
-    AVFrame *frame = data;
     const uint8_t *buf = avpkt->data;
     const uint8_t *buf_end = buf + avpkt->size;
     KgvContext * const c = avctx->priv_data;
@@ -61,6 +62,9 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
     w = (buf[0] + 1) * 8;
     h = (buf[1] + 1) * 8;
     buf += 2;
+
+    if (avpkt->size < 2 + w*h / 513)
+        return AVERROR_INVALIDDATA;
 
     if (w != avctx->width || h != avctx->height) {
         av_freep(&c->frame_buffer);
@@ -173,15 +177,15 @@ static av_cold int decode_end(AVCodecContext *avctx)
     return 0;
 }
 
-AVCodec ff_kgv1_decoder = {
-    .name           = "kgv1",
-    .long_name      = NULL_IF_CONFIG_SMALL("Kega Game Video"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_KGV1,
+const FFCodec ff_kgv1_decoder = {
+    .p.name         = "kgv1",
+    CODEC_LONG_NAME("Kega Game Video"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_KGV1,
     .priv_data_size = sizeof(KgvContext),
     .init           = decode_init,
     .close          = decode_end,
-    .decode         = decode_frame,
+    FF_CODEC_DECODE_CB(decode_frame),
     .flush          = decode_flush,
-    .capabilities   = CODEC_CAP_DR1,
+    .p.capabilities = AV_CODEC_CAP_DR1,
 };

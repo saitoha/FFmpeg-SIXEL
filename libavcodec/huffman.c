@@ -26,15 +26,23 @@
 
 #include <stdint.h>
 
-#include "avcodec.h"
-#include "get_bits.h"
+#include "libavutil/error.h"
+#include "libavutil/log.h"
+#include "libavutil/macros.h"
+#include "libavutil/mem.h"
+#include "libavutil/qsort.h"
+
 #include "huffman.h"
+#include "vlc.h"
 
 /* symbol for Huffman tree node */
 #define HNODE -1
 
 typedef struct HeapElem {
-    uint64_t val;
+    union {
+        uint64_t val;
+        uint16_t dummy; // exists solely to ensure alignof(HeapElem) >= alignof(uint16_t)
+    };
     int name;
 } HeapElem;
 
@@ -54,18 +62,22 @@ static void heap_sift(HeapElem *h, int root, int size)
 
 int ff_huff_gen_len_table(uint8_t *dst, const uint64_t *stats, int stats_size, int skip0)
 {
-    HeapElem *h  = av_malloc_array(sizeof(*h), stats_size);
-    int *up      = av_malloc_array(sizeof(*up) * 2, stats_size);
-    uint8_t *len = av_malloc_array(sizeof(*len) * 2, stats_size);
-    uint16_t *map= av_malloc_array(sizeof(*map), stats_size);
+    int *up;
+    uint16_t *map;
+    uint8_t *len;
+    HeapElem *h = av_malloc_array(stats_size,
+                                  sizeof(*h) + 2 * sizeof(up) + 2 * sizeof(len) + sizeof(map));
+    if (!h)
+        return AVERROR(ENOMEM);
+    up  = (int*)(h + stats_size);
+    // map is suitably aligned because up uses an even number of elements
+    // and alignof(uint16_t) is either 1 or 2.
+    map = (uint16_t*)(up + 2 * stats_size);
+    len = (uint8_t*)(map + stats_size);
+
     int offset, i, next;
     int size = 0;
     int ret = 0;
-
-    if (!h || !up || !len || !map) {
-        ret = AVERROR(ENOMEM);
-        goto end;
-    }
 
     for (i = 0; i<stats_size; i++) {
         dst[i] = 255;
@@ -102,48 +114,40 @@ int ff_huff_gen_len_table(uint8_t *dst, const uint64_t *stats, int stats_size, i
         }
         if (i==size) break;
     }
-end:
     av_free(h);
-    av_free(up);
-    av_free(len);
-    av_free(map);
     return ret;
 }
 
-static void get_tree_codes(uint32_t *bits, int16_t *lens, uint8_t *xlat,
-                           Node *nodes, int node,
-                           uint32_t pfx, int pl, int *pos, int no_zero_count)
+static void get_tree_codes(int8_t *lens, uint8_t *xlat,
+                           Node *nodes, int node, int pl, int *pos, int no_zero_count)
 {
     int s;
 
     s = nodes[node].sym;
     if (s != HNODE || (no_zero_count && !nodes[node].count)) {
-        bits[*pos] = pfx;
         lens[*pos] = pl;
         xlat[*pos] = s;
         (*pos)++;
     } else {
-        pfx <<= 1;
         pl++;
-        get_tree_codes(bits, lens, xlat, nodes, nodes[node].n0, pfx, pl,
+        get_tree_codes(lens, xlat, nodes, nodes[node].n0, pl,
                        pos, no_zero_count);
-        pfx |= 1;
-        get_tree_codes(bits, lens, xlat, nodes, nodes[node].n0 + 1, pfx, pl,
+        get_tree_codes(lens, xlat, nodes, nodes[node].n0 + 1, pl,
                        pos, no_zero_count);
     }
 }
 
-static int build_huff_tree(VLC *vlc, Node *nodes, int head, int flags, int nb_bits)
+static int build_huff_tree(VLC *vlc, Node *nodes, int head, int flags, int nb_bits, void *logctx)
 {
     int no_zero_count = !(flags & FF_HUFFMAN_FLAG_ZERO_COUNT);
-    uint32_t bits[256];
-    int16_t lens[256];
+    int8_t lens[256];
     uint8_t xlat[256];
     int pos = 0;
 
-    get_tree_codes(bits, lens, xlat, nodes, head, 0, 0,
+    get_tree_codes(lens, xlat, nodes, head, 0,
                    &pos, no_zero_count);
-    return ff_init_vlc_sparse(vlc, nb_bits, pos, lens, 2, 2, bits, 4, 4, xlat, 1, 1, 0);
+    return ff_vlc_init_from_lengths(vlc, nb_bits, pos, lens, 1,
+                                    xlat, 1, 1, 0, 0, logctx);
 }
 
 
@@ -151,7 +155,7 @@ static int build_huff_tree(VLC *vlc, Node *nodes, int head, int flags, int nb_bi
  * nodes size must be 2*nb_codes
  * first nb_codes nodes.count must be set
  */
-int ff_huff_build_tree(AVCodecContext *avctx, VLC *vlc, int nb_codes, int nb_bits,
+int ff_huff_build_tree(void *logctx, VLC *vlc, int nb_codes, int nb_bits,
                        Node *nodes, HuffCmp cmp, int flags)
 {
     int i, j;
@@ -165,12 +169,12 @@ int ff_huff_build_tree(AVCodecContext *avctx, VLC *vlc, int nb_codes, int nb_bit
     }
 
     if (sum >> 31) {
-        av_log(avctx, AV_LOG_ERROR,
+        av_log(logctx, AV_LOG_ERROR,
                "Too high symbol frequencies. "
                "Tree construction is not possible\n");
         return -1;
     }
-    qsort(nodes, nb_codes, sizeof(Node), cmp);
+    AV_QSORT(nodes, nb_codes, Node, cmp);
     cur_node = nb_codes;
     nodes[nb_codes*2-1].count = 0;
     for (i = 0; i < nb_codes * 2 - 1; i += 2) {
@@ -189,8 +193,8 @@ int ff_huff_build_tree(AVCodecContext *avctx, VLC *vlc, int nb_codes, int nb_bit
         nodes[j].n0 = i;
         cur_node++;
     }
-    if (build_huff_tree(vlc, nodes, nb_codes * 2 - 2, flags, nb_bits) < 0) {
-        av_log(avctx, AV_LOG_ERROR, "Error building tree\n");
+    if (build_huff_tree(vlc, nodes, nb_codes * 2 - 2, flags, nb_bits, logctx) < 0) {
+        av_log(logctx, AV_LOG_ERROR, "Error building tree\n");
         return -1;
     }
     return 0;

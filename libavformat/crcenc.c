@@ -23,12 +23,13 @@
 
 #include "libavutil/adler32.h"
 #include "avformat.h"
+#include "mux.h"
 
 typedef struct CRCState {
     uint32_t crcval;
 } CRCState;
 
-static int crc_write_header(struct AVFormatContext *s)
+static int crc_init(struct AVFormatContext *s)
 {
     CRCState *crc = s->priv_data;
 
@@ -48,22 +49,20 @@ static int crc_write_packet(struct AVFormatContext *s, AVPacket *pkt)
 static int crc_write_trailer(struct AVFormatContext *s)
 {
     CRCState *crc = s->priv_data;
-    char buf[64];
 
-    snprintf(buf, sizeof(buf), "CRC=0x%08"PRIx32"\n", crc->crcval);
-    avio_write(s->pb, buf, strlen(buf));
+    avio_printf(s->pb, "CRC=0x%08"PRIx32"\n", crc->crcval);
 
     return 0;
 }
 
-AVOutputFormat ff_crc_muxer = {
-    .name              = "crc",
-    .long_name         = NULL_IF_CONFIG_SMALL("CRC testing"),
+const FFOutputFormat ff_crc_muxer = {
+    .p.name            = "crc",
+    .p.long_name       = NULL_IF_CONFIG_SMALL("CRC testing"),
     .priv_data_size    = sizeof(CRCState),
-    .audio_codec       = AV_CODEC_ID_PCM_S16LE,
-    .video_codec       = AV_CODEC_ID_RAWVIDEO,
-    .write_header      = crc_write_header,
+    .p.audio_codec     = AV_CODEC_ID_PCM_S16LE,
+    .p.video_codec     = AV_CODEC_ID_RAWVIDEO,
+    .init              = crc_init,
     .write_packet      = crc_write_packet,
     .write_trailer     = crc_write_trailer,
-    .flags             = AVFMT_NOTIMESTAMPS,
+    .p.flags           = AVFMT_NOTIMESTAMPS,
 };

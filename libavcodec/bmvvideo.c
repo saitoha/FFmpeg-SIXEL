@@ -24,7 +24,8 @@
 
 #include "avcodec.h"
 #include "bytestream.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 
 enum BMVFlags{
     BMV_NOP = 0,
@@ -107,7 +108,7 @@ static int decode_bmv_frame(const uint8_t *source, int src_len, uint8_t *frame, 
                     if (src < source || src >= source_end)
                         return AVERROR_INVALIDDATA;
                     shift += 2;
-                    val |= *src << shift;
+                    val |= (unsigned)*src << shift;
                     if (*src & 0xC)
                         break;
                 }
@@ -193,14 +194,12 @@ static int decode_bmv_frame(const uint8_t *source, int src_len, uint8_t *frame, 
         if (dst == dst_end)
             return 0;
     }
-    return 0;
 }
 
-static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
-                        AVPacket *pkt)
+static int decode_frame(AVCodecContext *avctx, AVFrame *frame,
+                        int *got_frame, AVPacket *pkt)
 {
     BMVDecContext * const c = avctx->priv_data;
-    AVFrame *frame = data;
     int type, scr_off;
     int i, ret;
     uint8_t *srcptr, *outptr;
@@ -252,7 +251,6 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
     }
 
     memcpy(frame->data[1], c->pal, AVPALETTE_SIZE);
-    frame->palette_has_changed = type & BMV_PALETTE;
 
     outptr = frame->data[0];
     srcptr = c->frame;
@@ -286,13 +284,13 @@ static av_cold int decode_init(AVCodecContext *avctx)
     return 0;
 }
 
-AVCodec ff_bmv_video_decoder = {
-    .name           = "bmv_video",
-    .long_name      = NULL_IF_CONFIG_SMALL("Discworld II BMV video"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_BMV_VIDEO,
+const FFCodec ff_bmv_video_decoder = {
+    .p.name         = "bmv_video",
+    CODEC_LONG_NAME("Discworld II BMV video"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_BMV_VIDEO,
     .priv_data_size = sizeof(BMVDecContext),
     .init           = decode_init,
-    .decode         = decode_frame,
-    .capabilities   = CODEC_CAP_DR1,
+    FF_CODEC_DECODE_CB(decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1,
 };

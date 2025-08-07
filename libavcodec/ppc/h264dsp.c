@@ -19,13 +19,18 @@
  */
 
 #include "config.h"
+
+#include <stdint.h>
+#include <string.h>
+
 #include "libavutil/attributes.h"
 #include "libavutil/cpu.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/mem_internal.h"
 #include "libavutil/ppc/cpu.h"
-#include "libavutil/ppc/types_altivec.h"
 #include "libavutil/ppc/util_altivec.h"
-#include "libavcodec/h264data.h"
+
+#include "libavcodec/h264dec.h"
 #include "libavcodec/h264dsp.h"
 
 #if HAVE_ALTIVEC
@@ -323,7 +328,7 @@ static void h264_idct8_dc_add_altivec(uint8_t *dst, int16_t *block, int stride)
 
 static void h264_idct_add16_altivec(uint8_t *dst, const int *block_offset,
                                     int16_t *block, int stride,
-                                    const uint8_t nnzc[15 * 8])
+                                    const uint8_t nnzc[5 * 8])
 {
     int i;
     for(i=0; i<16; i++){
@@ -337,7 +342,7 @@ static void h264_idct_add16_altivec(uint8_t *dst, const int *block_offset,
 
 static void h264_idct_add16intra_altivec(uint8_t *dst, const int *block_offset,
                                          int16_t *block, int stride,
-                                         const uint8_t nnzc[15 * 8])
+                                         const uint8_t nnzc[5 * 8])
 {
     int i;
     for(i=0; i<16; i++){
@@ -348,7 +353,7 @@ static void h264_idct_add16intra_altivec(uint8_t *dst, const int *block_offset,
 
 static void h264_idct8_add4_altivec(uint8_t *dst, const int *block_offset,
                                     int16_t *block, int stride,
-                                    const uint8_t nnzc[15 * 8])
+                                    const uint8_t nnzc[5 * 8])
 {
     int i;
     for(i=0; i<16; i+=4){
@@ -396,30 +401,29 @@ static inline void write16x4(uint8_t *dst, int dst_stride,
                              register vec_u8 r0, register vec_u8 r1,
                              register vec_u8 r2, register vec_u8 r3) {
     DECLARE_ALIGNED(16, unsigned char, result)[64];
-    uint32_t *src_int = (uint32_t *)result, *dst_int = (uint32_t *)dst;
-    int int_dst_stride = dst_stride/4;
+    uint32_t *src_int = (uint32_t *)result;
 
     vec_st(r0, 0, result);
     vec_st(r1, 16, result);
     vec_st(r2, 32, result);
     vec_st(r3, 48, result);
     /* FIXME: there has to be a better way!!!! */
-    *dst_int = *src_int;
-    *(dst_int+   int_dst_stride) = *(src_int + 1);
-    *(dst_int+ 2*int_dst_stride) = *(src_int + 2);
-    *(dst_int+ 3*int_dst_stride) = *(src_int + 3);
-    *(dst_int+ 4*int_dst_stride) = *(src_int + 4);
-    *(dst_int+ 5*int_dst_stride) = *(src_int + 5);
-    *(dst_int+ 6*int_dst_stride) = *(src_int + 6);
-    *(dst_int+ 7*int_dst_stride) = *(src_int + 7);
-    *(dst_int+ 8*int_dst_stride) = *(src_int + 8);
-    *(dst_int+ 9*int_dst_stride) = *(src_int + 9);
-    *(dst_int+10*int_dst_stride) = *(src_int + 10);
-    *(dst_int+11*int_dst_stride) = *(src_int + 11);
-    *(dst_int+12*int_dst_stride) = *(src_int + 12);
-    *(dst_int+13*int_dst_stride) = *(src_int + 13);
-    *(dst_int+14*int_dst_stride) = *(src_int + 14);
-    *(dst_int+15*int_dst_stride) = *(src_int + 15);
+    AV_WN32(dst,                   AV_RN32A(src_int + 0));
+    AV_WN32(dst +      dst_stride, AV_RN32A(src_int + 1));
+    AV_WN32(dst +  2 * dst_stride, AV_RN32A(src_int + 2));
+    AV_WN32(dst +  3 * dst_stride, AV_RN32A(src_int + 3));
+    AV_WN32(dst +  4 * dst_stride, AV_RN32A(src_int + 4));
+    AV_WN32(dst +  5 * dst_stride, AV_RN32A(src_int + 5));
+    AV_WN32(dst +  6 * dst_stride, AV_RN32A(src_int + 6));
+    AV_WN32(dst +  7 * dst_stride, AV_RN32A(src_int + 7));
+    AV_WN32(dst +  8 * dst_stride, AV_RN32A(src_int + 8));
+    AV_WN32(dst +  9 * dst_stride, AV_RN32A(src_int + 9));
+    AV_WN32(dst + 10 * dst_stride, AV_RN32A(src_int + 10));
+    AV_WN32(dst + 11 * dst_stride, AV_RN32A(src_int + 11));
+    AV_WN32(dst + 12 * dst_stride, AV_RN32A(src_int + 12));
+    AV_WN32(dst + 13 * dst_stride, AV_RN32A(src_int + 13));
+    AV_WN32(dst + 14 * dst_stride, AV_RN32A(src_int + 14));
+    AV_WN32(dst + 15 * dst_stride, AV_RN32A(src_int + 15));
 }
 
 /** @brief performs a 6x16 transpose of data in src, and stores it to dst
@@ -524,7 +528,7 @@ static inline vec_u8 h264_deblock_q1(register vec_u8 p0,
 
     register vec_u8 average = vec_avg(p0, q0);
     register vec_u8 temp;
-    register vec_u8 uncliped;
+    register vec_u8 unclipped;
     register vec_u8 ones;
     register vec_u8 max;
     register vec_u8 min;
@@ -534,10 +538,10 @@ static inline vec_u8 h264_deblock_q1(register vec_u8 p0,
     average = vec_avg(average, p2);     /*avg(p2, avg(p0, q0)) */
     ones = vec_splat_u8(1);
     temp = vec_and(temp, ones);         /*(p2^avg(p0, q0)) & 1 */
-    uncliped = vec_subs(average, temp); /*(p2+((p0+q0+1)>>1))>>1 */
+    unclipped = vec_subs(average, temp); /*(p2+((p0+q0+1)>>1))>>1 */
     max = vec_adds(p1, tc0);
     min = vec_subs(p1, tc0);
-    newp1 = vec_max(min, uncliped);
+    newp1 = vec_max(min, unclipped);
     newp1 = vec_min(max, newp1);
     return newp1;
 }
@@ -620,7 +624,7 @@ static inline vec_u8 h264_deblock_q1(register vec_u8 p0,
     q1 = newq1;                                                                              \
 }
 
-static void h264_v_loop_filter_luma_altivec(uint8_t *pix, int stride, int alpha, int beta, int8_t *tc0) {
+static void h264_v_loop_filter_luma_altivec(uint8_t *pix, ptrdiff_t stride, int alpha, int beta, int8_t *tc0) {
 
     if ((tc0[0] & tc0[1] & tc0[2] & tc0[3]) >= 0) {
         register vec_u8 p2 = vec_ld(-3*stride, pix);
@@ -637,7 +641,7 @@ static void h264_v_loop_filter_luma_altivec(uint8_t *pix, int stride, int alpha,
     }
 }
 
-static void h264_h_loop_filter_luma_altivec(uint8_t *pix, int stride, int alpha, int beta, int8_t *tc0) {
+static void h264_h_loop_filter_luma_altivec(uint8_t *pix, ptrdiff_t stride, int alpha, int beta, int8_t *tc0) {
 
     register vec_u8 line0, line1, line2, line3, line4, line5;
     if ((tc0[0] & tc0[1] & tc0[2] & tc0[3]) < 0)
@@ -659,7 +663,7 @@ void weight_h264_W_altivec(uint8_t *block, int stride, int height,
     DECLARE_ALIGNED(16, int32_t, temp)[4];
     LOAD_ZERO;
 
-    offset <<= log2_denom;
+    offset *= 1 << log2_denom;
     if(log2_denom) offset += 1<<(log2_denom-1);
     temp[0] = log2_denom;
     temp[1] = weight;
@@ -708,7 +712,7 @@ void biweight_h264_W_altivec(uint8_t *dst, uint8_t *src, int stride, int height,
     DECLARE_ALIGNED(16, int32_t, temp)[4];
     LOAD_ZERO;
 
-    offset = ((offset + 1) | 1) << log2_denom;
+    offset = ((offset + 1) | 1) * (1 << log2_denom);
     temp[0] = log2_denom+1;
     temp[1] = weights;
     temp[2] = weightd;
@@ -766,12 +770,12 @@ void biweight_h264_W_altivec(uint8_t *dst, uint8_t *src, int stride, int height,
 }
 
 #define H264_WEIGHT(W) \
-static void weight_h264_pixels ## W ## _altivec(uint8_t *block, int stride, int height, \
+static void weight_h264_pixels ## W ## _altivec(uint8_t *block, ptrdiff_t stride, int height, \
                                                 int log2_denom, int weight, int offset) \
 { \
     weight_h264_W_altivec(block, stride, height, log2_denom, weight, offset, W); \
 }\
-static void biweight_h264_pixels ## W ## _altivec(uint8_t *dst, uint8_t *src, int stride, int height, \
+static void biweight_h264_pixels ## W ## _altivec(uint8_t *dst, uint8_t *src, ptrdiff_t stride, int height, \
                                                   int log2_denom, int weightd, int weights, int offset) \
 { \
     biweight_h264_W_altivec(dst, src, stride, height, log2_denom, weightd, weights, offset, W); \

@@ -37,9 +37,11 @@
 
 #include "libavutil/common.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
 
 #include "avcodec.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include "bytestream.h"
 
 #define VMD_HEADER_SIZE 0x330
@@ -194,7 +196,7 @@ static int vmd_decode(VmdVideoContext *s, AVFrame *frame)
     unsigned char len;
     int ofs;
 
-    int frame_x, frame_y;
+    int frame_x, frame_y, prev_linesize;
     int frame_width, frame_height;
 
     frame_x = AV_RL16(&s->buf[6]);
@@ -226,7 +228,7 @@ static int vmd_decode(VmdVideoContext *s, AVFrame *frame)
         frame_y + frame_height > s->avctx->height) {
         av_log(s->avctx, AV_LOG_ERROR,
                "Invalid vertical range %d-%d\n",
-               frame_x, frame_width);
+               frame_y, frame_height);
         return AVERROR_INVALIDDATA;
     }
 
@@ -282,7 +284,13 @@ static int vmd_decode(VmdVideoContext *s, AVFrame *frame)
     }
 
     dp = &frame->data[0][frame_y * frame->linesize[0] + frame_x];
-    pp = &s->prev_frame->data[0][frame_y * s->prev_frame->linesize[0] + frame_x];
+    if (s->prev_frame->data[0]) {
+        prev_linesize = s->prev_frame->linesize[0];
+        pp = s->prev_frame->data[0] + frame_y * prev_linesize + frame_x;
+    } else {
+        pp = NULL;
+        prev_linesize = 0;
+    }
     switch (meth) {
     case 1:
         for (i = 0; i < frame_height; i++) {
@@ -298,7 +306,7 @@ static int vmd_decode(VmdVideoContext *s, AVFrame *frame)
                     ofs += len;
                 } else {
                     /* interframe pixel copy */
-                    if (ofs + len + 1 > frame_width || !s->prev_frame->data[0])
+                    if (ofs + len + 1 > frame_width || !pp)
                         return AVERROR_INVALIDDATA;
                     memcpy(&dp[ofs], &pp[ofs], len + 1);
                     ofs += len + 1;
@@ -311,7 +319,7 @@ static int vmd_decode(VmdVideoContext *s, AVFrame *frame)
                 return AVERROR_INVALIDDATA;
             }
             dp += frame->linesize[0];
-            pp += s->prev_frame->linesize[0];
+            pp  = FF_PTR_ADD(pp, prev_linesize);
         }
         break;
 
@@ -319,7 +327,6 @@ static int vmd_decode(VmdVideoContext *s, AVFrame *frame)
         for (i = 0; i < frame_height; i++) {
             bytestream2_get_buffer(&gb, dp, frame_width);
             dp += frame->linesize[0];
-            pp += s->prev_frame->linesize[0];
         }
         break;
 
@@ -347,7 +354,7 @@ static int vmd_decode(VmdVideoContext *s, AVFrame *frame)
                     }
                 } else {
                     /* interframe pixel copy */
-                    if (ofs + len + 1 > frame_width || !s->prev_frame->data[0])
+                    if (ofs + len + 1 > frame_width || !pp)
                         return AVERROR_INVALIDDATA;
                     memcpy(&dp[ofs], &pp[ofs], len + 1);
                     ofs += len + 1;
@@ -360,7 +367,7 @@ static int vmd_decode(VmdVideoContext *s, AVFrame *frame)
                 return AVERROR_INVALIDDATA;
             }
             dp += frame->linesize[0];
-            pp += s->prev_frame->linesize[0];
+            pp  = FF_PTR_ADD(pp, prev_linesize);
         }
         break;
     }
@@ -418,22 +425,18 @@ static av_cold int vmdvideo_decode_init(AVCodecContext *avctx)
     }
 
     s->prev_frame = av_frame_alloc();
-    if (!s->prev_frame) {
-        vmdvideo_decode_end(avctx);
+    if (!s->prev_frame)
         return AVERROR(ENOMEM);
-    }
 
     return 0;
 }
 
-static int vmdvideo_decode_frame(AVCodecContext *avctx,
-                                 void *data, int *got_frame,
-                                 AVPacket *avpkt)
+static int vmdvideo_decode_frame(AVCodecContext *avctx, AVFrame *frame,
+                                 int *got_frame, AVPacket *avpkt)
 {
     const uint8_t *buf = avpkt->data;
     int buf_size = avpkt->size;
     VmdVideoContext *s = avctx->priv_data;
-    AVFrame *frame = data;
     int ret;
 
     s->buf = buf;
@@ -452,8 +455,7 @@ static int vmdvideo_decode_frame(AVCodecContext *avctx,
     memcpy(frame->data[1], s->palette, PALETTE_COUNT * 4);
 
     /* shuffle frames */
-    av_frame_unref(s->prev_frame);
-    if ((ret = av_frame_ref(s->prev_frame, frame)) < 0)
+    if ((ret = av_frame_replace(s->prev_frame, frame)) < 0)
         return ret;
 
     *got_frame      = 1;
@@ -462,14 +464,15 @@ static int vmdvideo_decode_frame(AVCodecContext *avctx,
     return buf_size;
 }
 
-AVCodec ff_vmdvideo_decoder = {
-    .name           = "vmdvideo",
-    .long_name      = NULL_IF_CONFIG_SMALL("Sierra VMD video"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_VMDVIDEO,
+const FFCodec ff_vmdvideo_decoder = {
+    .p.name         = "vmdvideo",
+    CODEC_LONG_NAME("Sierra VMD video"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_VMDVIDEO,
     .priv_data_size = sizeof(VmdVideoContext),
     .init           = vmdvideo_decode_init,
     .close          = vmdvideo_decode_end,
-    .decode         = vmdvideo_decode_frame,
-    .capabilities   = CODEC_CAP_DR1,
+    FF_CODEC_DECODE_CB(vmdvideo_decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };

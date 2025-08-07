@@ -22,9 +22,9 @@
 #include "libavutil/avassert.h"
 #include "audio.h"
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
 
-typedef struct {
+typedef struct VolDetectContext {
     /**
      * Number of samples at each PCM value.
      * histogram[0x8000 + i] is the number of samples at value i.
@@ -33,27 +33,12 @@ typedef struct {
     uint64_t histogram[0x10001];
 } VolDetectContext;
 
-static int query_formats(AVFilterContext *ctx)
-{
-    static const enum AVSampleFormat sample_fmts[] = {
-        AV_SAMPLE_FMT_S16,
-        AV_SAMPLE_FMT_S16P,
-        AV_SAMPLE_FMT_NONE
-    };
-    AVFilterFormats *formats;
-
-    if (!(formats = ff_make_format_list(sample_fmts)))
-        return AVERROR(ENOMEM);
-    return ff_set_common_formats(ctx, formats);
-}
-
 static int filter_frame(AVFilterLink *inlink, AVFrame *samples)
 {
     AVFilterContext *ctx = inlink->dst;
     VolDetectContext *vd = ctx->priv;
-    int64_t layout  = samples->channel_layout;
     int nb_samples  = samples->nb_samples;
-    int nb_channels = av_get_channel_layout_nb_channels(layout);
+    int nb_channels = samples->ch_layout.nb_channels;
     int nb_planes   = nb_channels;
     int plane, i;
     int16_t *pcm;
@@ -78,7 +63,7 @@ static inline double logdb(uint64_t v)
     double d = v / (double)(0x8000 * 0x8000);
     if (!v)
         return MAX_DB;
-    return log(d) * -4.3429448190325182765112891891660508229; /* -10/log(10) */
+    return -log10(d) * 10;
 }
 
 static void print_stats(AVFilterContext *ctx)
@@ -135,23 +120,15 @@ static const AVFilterPad volumedetect_inputs[] = {
         .type         = AVMEDIA_TYPE_AUDIO,
         .filter_frame = filter_frame,
     },
-    { NULL }
 };
 
-static const AVFilterPad volumedetect_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_AUDIO,
-    },
-    { NULL }
-};
-
-AVFilter ff_af_volumedetect = {
-    .name          = "volumedetect",
-    .description   = NULL_IF_CONFIG_SMALL("Detect audio volume."),
+const FFFilter ff_af_volumedetect = {
+    .p.name        = "volumedetect",
+    .p.description = NULL_IF_CONFIG_SMALL("Detect audio volume."),
+    .p.flags       = AVFILTER_FLAG_METADATA_ONLY,
     .priv_size     = sizeof(VolDetectContext),
-    .query_formats = query_formats,
     .uninit        = uninit,
-    .inputs        = volumedetect_inputs,
-    .outputs       = volumedetect_outputs,
+    FILTER_INPUTS(volumedetect_inputs),
+    FILTER_OUTPUTS(ff_audio_default_filterpad),
+    FILTER_SAMPLEFMTS(AV_SAMPLE_FMT_S16, AV_SAMPLE_FMT_S16P),
 };

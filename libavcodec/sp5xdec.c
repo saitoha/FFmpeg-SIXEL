@@ -24,23 +24,24 @@
  * Sunplus JPEG decoder (SP5X).
  */
 
+#include "config_components.h"
+
+#include "libavutil/mem.h"
 #include "avcodec.h"
-#include "internal.h"
-#include "mjpeg.h"
+#include "codec_internal.h"
 #include "mjpegdec.h"
 #include "sp5x.h"
 
 
 static int sp5x_decode_frame(AVCodecContext *avctx,
-                              void *data, int *got_frame,
-                              AVPacket *avpkt)
+                             AVFrame *frame, int *got_frame,
+                             AVPacket *avpkt)
 {
     const uint8_t *buf = avpkt->data;
     int buf_size = avpkt->size;
-    AVPacket avpkt_recoded;
-    const int qscale = 5;
     uint8_t *recoded;
     int i = 0, j = 0;
+    int ret;
 
     if (!avctx->width || !avctx->height)
         return -1;
@@ -54,8 +55,8 @@ static int sp5x_decode_frame(AVCodecContext *avctx,
     recoded[j++] = 0xD8;
 
     memcpy(recoded+j, &sp5x_data_dqt[0], sizeof(sp5x_data_dqt));
-    memcpy(recoded+j+5, &sp5x_quant_table[qscale * 2], 64);
-    memcpy(recoded+j+70, &sp5x_quant_table[(qscale * 2) + 1], 64);
+    memcpy(recoded + j + 5,  &sp5x_qscale_five_quant_table[0], 64);
+    memcpy(recoded + j + 70, &sp5x_qscale_five_quant_table[1], 64);
     j += sizeof(sp5x_data_dqt);
 
     memcpy(recoded+j, &sp5x_data_dht[0], sizeof(sp5x_data_dht));
@@ -84,42 +85,41 @@ static int sp5x_decode_frame(AVCodecContext *avctx,
     recoded[j++] = 0xFF;
     recoded[j++] = 0xD9;
 
-    av_init_packet(&avpkt_recoded);
-    avpkt_recoded.data = recoded;
-    avpkt_recoded.size = j;
-    i = ff_mjpeg_decode_frame(avctx, data, got_frame, &avpkt_recoded);
+    ret = ff_mjpeg_decode_frame_from_buf(avctx, frame, got_frame,
+                                         avpkt, recoded, j);
 
     av_free(recoded);
 
-    return i < 0 ? i : avpkt->size;
+    return ret < 0 ? ret : avpkt->size;
 }
 
 #if CONFIG_SP5X_DECODER
-AVCodec ff_sp5x_decoder = {
-    .name           = "sp5x",
-    .long_name      = NULL_IF_CONFIG_SMALL("Sunplus JPEG (SP5X)"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_SP5X,
+const FFCodec ff_sp5x_decoder = {
+    .p.name         = "sp5x",
+    CODEC_LONG_NAME("Sunplus JPEG (SP5X)"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_SP5X,
     .priv_data_size = sizeof(MJpegDecodeContext),
     .init           = ff_mjpeg_decode_init,
     .close          = ff_mjpeg_decode_end,
-    .decode         = sp5x_decode_frame,
-    .capabilities   = CODEC_CAP_DR1,
-    .max_lowres     = 3,
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE,
+    FF_CODEC_DECODE_CB(sp5x_decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1,
+    .p.max_lowres   = 3,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };
 #endif
 #if CONFIG_AMV_DECODER
-AVCodec ff_amv_decoder = {
-    .name           = "amv",
-    .long_name      = NULL_IF_CONFIG_SMALL("AMV Video"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_AMV,
+const FFCodec ff_amv_decoder = {
+    .p.name         = "amv",
+    CODEC_LONG_NAME("AMV Video"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_AMV,
     .priv_data_size = sizeof(MJpegDecodeContext),
     .init           = ff_mjpeg_decode_init,
     .close          = ff_mjpeg_decode_end,
-    .decode         = sp5x_decode_frame,
-    .max_lowres     = 3,
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE,
+    FF_CODEC_DECODE_CB(sp5x_decode_frame),
+    .p.max_lowres   = 3,
+    .p.capabilities = AV_CODEC_CAP_DR1,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };
 #endif

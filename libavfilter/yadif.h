@@ -19,8 +19,10 @@
 #ifndef AVFILTER_YADIF_H
 #define AVFILTER_YADIF_H
 
+#include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 #include "avfilter.h"
+#include "ccfifo.h"
 
 enum YADIFMode {
     YADIF_MODE_SEND_FRAME           = 0, ///< send 1 frame for each frame
@@ -40,6 +42,12 @@ enum YADIFDeint {
     YADIF_DEINT_INTERLACED = 1, ///< only deinterlace frames marked as interlaced
 };
 
+enum YADIFCurrentField {
+    YADIF_FIELD_BACK_END = -1, ///< The last frame in a sequence
+    YADIF_FIELD_END      =  0, ///< The first or last field in a sequence
+    YADIF_FIELD_NORMAL   =  1, ///< A normal field in the middle of a sequence
+};
+
 typedef struct YADIFContext {
     const AVClass *class;
 
@@ -54,6 +62,8 @@ typedef struct YADIFContext {
     AVFrame *prev;
     AVFrame *out;
 
+    void (*filter)(AVFilterContext *ctx, AVFrame *dstpic, int parity, int tff);
+
     /**
      * Required alignment for filter_line
      */
@@ -67,8 +77,29 @@ typedef struct YADIFContext {
     int eof;
     uint8_t *temp_line;
     int temp_line_size;
+    CCFifo cc_fifo;
+
+    /*
+     * An algorithm that treats first and/or last fields in a sequence
+     * differently can use this to detect those cases. It is the algorithm's
+     * responsibility to set the value to YADIF_FIELD_NORMAL after processing
+     * the first field.
+     */
+    int current_field;  ///< YADIFCurrentField
+
+    int pts_multiplier;
 } YADIFContext;
 
 void ff_yadif_init_x86(YADIFContext *yadif);
+
+int ff_yadif_filter_frame(AVFilterLink *link, AVFrame *frame);
+
+int ff_yadif_request_frame(AVFilterLink *link);
+
+int ff_yadif_config_output_common(AVFilterLink *outlink);
+
+void ff_yadif_uninit(AVFilterContext *ctx);
+
+extern const AVOption ff_yadif_options[];
 
 #endif /* AVFILTER_YADIF_H */

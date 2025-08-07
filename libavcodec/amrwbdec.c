@@ -24,9 +24,11 @@
  * AMR wideband decoder
  */
 
+#include "config.h"
+
+#include "libavutil/avassert.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/common.h"
-#include "libavutil/float_dsp.h"
 #include "libavutil/lfg.h"
 
 #include "avcodec.h"
@@ -36,13 +38,16 @@
 #include "acelp_filters.h"
 #include "acelp_vectors.h"
 #include "acelp_pitch_delay.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 
 #define AMR_USE_16BIT_TABLES
 #include "amr.h"
 
 #include "amrwbdata.h"
+#if ARCH_MIPS
 #include "mips/amrwbdec_mips.h"
+#endif /* ARCH_MIPS */
 
 typedef struct AMRWBContext {
     AMRWBFrame                             frame; ///< AMRWB parameters decoded from bitstream
@@ -93,37 +98,47 @@ typedef struct AMRWBContext {
 
 } AMRWBContext;
 
+typedef struct AMRWBChannelsContext {
+    AMRWBContext ch[2];
+} AMRWBChannelsContext;
+
 static av_cold int amrwb_decode_init(AVCodecContext *avctx)
 {
-    AMRWBContext *ctx = avctx->priv_data;
+    AMRWBChannelsContext *s = avctx->priv_data;
     int i;
 
-    if (avctx->channels > 1) {
-        avpriv_report_missing_feature(avctx, "multi-channel AMR");
+    if (avctx->ch_layout.nb_channels > 2) {
+        avpriv_report_missing_feature(avctx, ">2 channel AMR");
         return AVERROR_PATCHWELCOME;
     }
 
-    avctx->channels       = 1;
-    avctx->channel_layout = AV_CH_LAYOUT_MONO;
+    if (!avctx->ch_layout.nb_channels) {
+        av_channel_layout_uninit(&avctx->ch_layout);
+        avctx->ch_layout      = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
+    }
     if (!avctx->sample_rate)
         avctx->sample_rate = 16000;
-    avctx->sample_fmt     = AV_SAMPLE_FMT_FLT;
+    avctx->sample_fmt     = AV_SAMPLE_FMT_FLTP;
 
-    av_lfg_init(&ctx->prng, 1);
+    for (int ch = 0; ch < avctx->ch_layout.nb_channels; ch++) {
+        AMRWBContext *ctx = &s->ch[ch];
 
-    ctx->excitation  = &ctx->excitation_buf[AMRWB_P_DELAY_MAX + LP_ORDER + 1];
-    ctx->first_frame = 1;
+        av_lfg_init(&ctx->prng, 1);
 
-    for (i = 0; i < LP_ORDER; i++)
-        ctx->isf_past_final[i] = isf_init[i] * (1.0f / (1 << 15));
+        ctx->excitation  = &ctx->excitation_buf[AMRWB_P_DELAY_MAX + LP_ORDER + 1];
+        ctx->first_frame = 1;
 
-    for (i = 0; i < 4; i++)
-        ctx->prediction_error[i] = MIN_ENERGY;
+        for (i = 0; i < LP_ORDER; i++)
+            ctx->isf_past_final[i] = isf_init[i] * (1.0f / (1 << 15));
 
-    ff_acelp_filter_init(&ctx->acelpf_ctx);
-    ff_acelp_vectors_init(&ctx->acelpv_ctx);
-    ff_celp_filter_init(&ctx->celpf_ctx);
-    ff_celp_math_init(&ctx->celpm_ctx);
+        for (i = 0; i < 4; i++)
+            ctx->prediction_error[i] = MIN_ENERGY;
+
+        ff_acelp_filter_init(&ctx->acelpf_ctx);
+        ff_acelp_vectors_init(&ctx->acelpv_ctx);
+        ff_celp_filter_init(&ctx->celpf_ctx);
+        ff_celp_math_init(&ctx->celpm_ctx);
+    }
 
     return 0;
 }
@@ -151,7 +166,6 @@ static int decode_mime_header(AMRWBContext *ctx, const uint8_t *buf)
  *
  * @param[in]  ind                 Array of 5 indexes
  * @param[out] isf_q               Buffer for isf_q[LP_ORDER]
- *
  */
 static void decode_isf_indices_36b(uint16_t *ind, float *isf_q)
 {
@@ -178,7 +192,6 @@ static void decode_isf_indices_36b(uint16_t *ind, float *isf_q)
  *
  * @param[in]  ind                 Array of 7 indexes
  * @param[out] isf_q               Buffer for isf_q[LP_ORDER]
- *
  */
 static void decode_isf_indices_46b(uint16_t *ind, float *isf_q)
 {
@@ -212,7 +225,6 @@ static void decode_isf_indices_46b(uint16_t *ind, float *isf_q)
  *
  * @param[in,out] isf_q            Current quantized ISF
  * @param[in,out] isf_past         Past quantized ISF
- *
  */
 static void isf_add_mean_and_past(float *isf_q, float *isf_past)
 {
@@ -265,7 +277,7 @@ static void decode_pitch_lag_high(int *lag_int, int *lag_frac, int pitch_index,
             *lag_frac = pitch_index - (*lag_int << 2) + 136;
         } else if (pitch_index < 440) {
             *lag_int  = (pitch_index + 257 - 376) >> 1;
-            *lag_frac = (pitch_index - (*lag_int << 1) + 256 - 376) << 1;
+            *lag_frac = (pitch_index - (*lag_int << 1) + 256 - 376) * 2;
             /* the actual resolution is 1/2 but expressed as 1/4 */
         } else {
             *lag_int  = pitch_index - 280;
@@ -295,7 +307,7 @@ static void decode_pitch_lag_low(int *lag_int, int *lag_frac, int pitch_index,
     if (subframe == 0 || (subframe == 2 && mode != MODE_6k60)) {
         if (pitch_index < 116) {
             *lag_int  = (pitch_index + 69) >> 1;
-            *lag_frac = (pitch_index - (*lag_int << 1) + 68) << 1;
+            *lag_frac = (pitch_index - (*lag_int << 1) + 68) * 2;
         } else {
             *lag_int  = pitch_index - 24;
             *lag_frac = 0;
@@ -305,7 +317,7 @@ static void decode_pitch_lag_low(int *lag_int, int *lag_frac, int pitch_index,
                                 AMRWB_P_DELAY_MIN, AMRWB_P_DELAY_MAX - 15);
     } else {
         *lag_int  = (pitch_index + 1) >> 1;
-        *lag_frac = (pitch_index - (*lag_int << 1)) << 1;
+        *lag_frac = (pitch_index - (*lag_int << 1)) * 2;
         *lag_int += *base_lag_int;
     }
 }
@@ -358,7 +370,7 @@ static void decode_pitch_vector(AMRWBContext *ctx,
 }
 
 /** Get x bits in the index interval [lsb,lsb+len-1] inclusive */
-#define BIT_STR(x,lsb,len) (((x) >> (lsb)) & ((1 << (len)) - 1))
+#define BIT_STR(x,lsb,len) av_zero_extend((x) >> (lsb), (len))
 
 /** Get the bit at specified position */
 #define BIT_POS(x, p) (((x) >> (p)) & 1)
@@ -543,6 +555,9 @@ static void decode_fixed_vector(float *fixed_vector, const uint16_t *pulse_hi,
             decode_6p_track(sig_pos[i], (int) pulse_lo[i] +
                            ((int) pulse_hi[i] << 11), 4, 1);
         break;
+    default:
+        av_unreachable("Everything >= MODE_SID is impossible: MODE_SID is patchwelcome,"
+                       "> MODE_SID is invalid");
     }
 
     memset(fixed_vector, 0, sizeof(float) * AMRWB_SFR_SIZE);
@@ -614,7 +629,7 @@ static float voice_factor(float *p_vector, float p_gain,
                                                           AMRWB_SFR_SIZE) *
                     f_gain * f_gain;
 
-    return (p_ener - f_ener) / (p_ener + f_ener);
+    return (p_ener - f_ener) / (p_ener + f_ener + 0.01);
 }
 
 /**
@@ -865,15 +880,20 @@ static float find_hb_gain(AMRWBContext *ctx, const float *synth,
 {
     int wsp = (vad > 0);
     float tilt;
+    float tmp;
 
     if (ctx->fr_cur_mode == MODE_23k85)
         return qua_hb_gain[hb_idx] * (1.0f / (1 << 14));
 
-    tilt = ctx->celpm_ctx.dot_productf(synth, synth + 1, AMRWB_SFR_SIZE - 1) /
-           ctx->celpm_ctx.dot_productf(synth, synth, AMRWB_SFR_SIZE);
+    tmp = ctx->celpm_ctx.dot_productf(synth, synth + 1, AMRWB_SFR_SIZE - 1);
+
+    if (tmp > 0) {
+        tilt = tmp / ctx->celpm_ctx.dot_productf(synth, synth, AMRWB_SFR_SIZE);
+    } else
+        tilt = 0;
 
     /* return gain bounded by [0.1, 1.0] */
-    return av_clipf((1.0 - FFMAX(0.0, tilt)) * (1.25 - 0.25 * wsp), 0.1, 1.0);
+    return av_clipf((1.0 - tilt) * (1.25 - 0.25 * wsp), 0.1, 1.0);
 }
 
 /**
@@ -1089,191 +1109,204 @@ static void update_sub_state(AMRWBContext *ctx)
             LP_ORDER_16k * sizeof(float));
 }
 
-static int amrwb_decode_frame(AVCodecContext *avctx, void *data,
+static int amrwb_decode_frame(AVCodecContext *avctx, AVFrame *frame,
                               int *got_frame_ptr, AVPacket *avpkt)
 {
-    AMRWBContext *ctx  = avctx->priv_data;
-    AVFrame *frame     = data;
-    AMRWBFrame   *cf   = &ctx->frame;
+    AMRWBChannelsContext *s  = avctx->priv_data;
     const uint8_t *buf = avpkt->data;
     int buf_size       = avpkt->size;
-    int expected_fr_size, header_size;
-    float *buf_out;
-    float spare_vector[AMRWB_SFR_SIZE];      // extra stack space to hold result from anti-sparseness processing
-    float fixed_gain_factor;                 // fixed gain correction factor (gamma)
-    float *synth_fixed_vector;               // pointer to the fixed vector that synthesis should use
-    float synth_fixed_gain;                  // the fixed gain that synthesis should use
-    float voice_fac, stab_fac;               // parameters used for gain smoothing
-    float synth_exc[AMRWB_SFR_SIZE];         // post-processed excitation for synthesis
-    float hb_exc[AMRWB_SFR_SIZE_16k];        // excitation for the high frequency band
-    float hb_samples[AMRWB_SFR_SIZE_16k];    // filtered high-band samples from synthesis
-    float hb_gain;
     int sub, i, ret;
 
     /* get output buffer */
     frame->nb_samples = 4 * AMRWB_SFR_SIZE_16k;
     if ((ret = ff_get_buffer(avctx, frame, 0)) < 0)
         return ret;
-    buf_out = (float *)frame->data[0];
 
-    header_size      = decode_mime_header(ctx, buf);
-    if (ctx->fr_cur_mode > MODE_SID) {
-        av_log(avctx, AV_LOG_ERROR,
-               "Invalid mode %d\n", ctx->fr_cur_mode);
-        return AVERROR_INVALIDDATA;
-    }
-    expected_fr_size = ((cf_sizes_wb[ctx->fr_cur_mode] + 7) >> 3) + 1;
+    for (int ch = 0; ch < avctx->ch_layout.nb_channels; ch++) {
+        AMRWBContext *ctx  = &s->ch[ch];
+        AMRWBFrame   *cf   = &ctx->frame;
+        int expected_fr_size, header_size;
+        float spare_vector[AMRWB_SFR_SIZE];      // extra stack space to hold result from anti-sparseness processing
+        float fixed_gain_factor;                 // fixed gain correction factor (gamma)
+        float *synth_fixed_vector;               // pointer to the fixed vector that synthesis should use
+        float synth_fixed_gain;                  // the fixed gain that synthesis should use
+        float voice_fac, stab_fac;               // parameters used for gain smoothing
+        float synth_exc[AMRWB_SFR_SIZE];         // post-processed excitation for synthesis
+        float hb_exc[AMRWB_SFR_SIZE_16k];        // excitation for the high frequency band
+        float hb_samples[AMRWB_SFR_SIZE_16k];    // filtered high-band samples from synthesis
+        float hb_gain;
+        float *buf_out = (float *)frame->extended_data[ch];
 
-    if (buf_size < expected_fr_size) {
-        av_log(avctx, AV_LOG_ERROR,
-            "Frame too small (%d bytes). Truncated file?\n", buf_size);
-        *got_frame_ptr = 0;
-        return AVERROR_INVALIDDATA;
-    }
+        header_size      = decode_mime_header(ctx, buf);
+        expected_fr_size = ((cf_sizes_wb[ctx->fr_cur_mode] + 7) >> 3) + 1;
 
-    if (!ctx->fr_quality || ctx->fr_cur_mode > MODE_SID)
-        av_log(avctx, AV_LOG_ERROR, "Encountered a bad or corrupted frame\n");
+        if (!ctx->fr_quality)
+            av_log(avctx, AV_LOG_ERROR, "Encountered a bad or corrupted frame\n");
 
-    if (ctx->fr_cur_mode == MODE_SID) { /* Comfort noise frame */
-        avpriv_request_sample(avctx, "SID mode");
-        return AVERROR_PATCHWELCOME;
-    }
-
-    ff_amr_bit_reorder((uint16_t *) &ctx->frame, sizeof(AMRWBFrame),
-        buf + header_size, amr_bit_orderings_by_mode[ctx->fr_cur_mode]);
-
-    /* Decode the quantized ISF vector */
-    if (ctx->fr_cur_mode == MODE_6k60) {
-        decode_isf_indices_36b(cf->isp_id, ctx->isf_cur);
-    } else {
-        decode_isf_indices_46b(cf->isp_id, ctx->isf_cur);
-    }
-
-    isf_add_mean_and_past(ctx->isf_cur, ctx->isf_q_past);
-    ff_set_min_dist_lsf(ctx->isf_cur, MIN_ISF_SPACING, LP_ORDER - 1);
-
-    stab_fac = stability_factor(ctx->isf_cur, ctx->isf_past_final);
-
-    ctx->isf_cur[LP_ORDER - 1] *= 2.0;
-    ff_acelp_lsf2lspd(ctx->isp[3], ctx->isf_cur, LP_ORDER);
-
-    /* Generate a ISP vector for each subframe */
-    if (ctx->first_frame) {
-        ctx->first_frame = 0;
-        memcpy(ctx->isp_sub4_past, ctx->isp[3], LP_ORDER * sizeof(double));
-    }
-    interpolate_isp(ctx->isp, ctx->isp_sub4_past);
-
-    for (sub = 0; sub < 4; sub++)
-        ff_amrwb_lsp2lpc(ctx->isp[sub], ctx->lp_coef[sub], LP_ORDER);
-
-    for (sub = 0; sub < 4; sub++) {
-        const AMRWBSubFrame *cur_subframe = &cf->subframe[sub];
-        float *sub_buf = buf_out + sub * AMRWB_SFR_SIZE_16k;
-
-        /* Decode adaptive codebook (pitch vector) */
-        decode_pitch_vector(ctx, cur_subframe, sub);
-        /* Decode innovative codebook (fixed vector) */
-        decode_fixed_vector(ctx->fixed_vector, cur_subframe->pul_ih,
-                            cur_subframe->pul_il, ctx->fr_cur_mode);
-
-        pitch_sharpening(ctx, ctx->fixed_vector);
-
-        decode_gains(cur_subframe->vq_gain, ctx->fr_cur_mode,
-                     &fixed_gain_factor, &ctx->pitch_gain[0]);
-
-        ctx->fixed_gain[0] =
-            ff_amr_set_fixed_gain(fixed_gain_factor,
-                                  ctx->celpm_ctx.dot_productf(ctx->fixed_vector,
-                                                               ctx->fixed_vector,
-                                                               AMRWB_SFR_SIZE) /
-                                  AMRWB_SFR_SIZE,
-                       ctx->prediction_error,
-                       ENERGY_MEAN, energy_pred_fac);
-
-        /* Calculate voice factor and store tilt for next subframe */
-        voice_fac      = voice_factor(ctx->pitch_vector, ctx->pitch_gain[0],
-                                      ctx->fixed_vector, ctx->fixed_gain[0],
-                                      &ctx->celpm_ctx);
-        ctx->tilt_coef = voice_fac * 0.25 + 0.25;
-
-        /* Construct current excitation */
-        for (i = 0; i < AMRWB_SFR_SIZE; i++) {
-            ctx->excitation[i] *= ctx->pitch_gain[0];
-            ctx->excitation[i] += ctx->fixed_gain[0] * ctx->fixed_vector[i];
-            ctx->excitation[i] = truncf(ctx->excitation[i]);
+        if (ctx->fr_cur_mode == NO_DATA || !ctx->fr_quality) {
+            /* The specification suggests a "random signal" and
+               "a muting technique" to "gradually decrease the output level". */
+            av_samples_set_silence(&frame->extended_data[ch], 0, frame->nb_samples, 1, AV_SAMPLE_FMT_FLT);
+            buf += expected_fr_size;
+            buf_size -= expected_fr_size;
+            continue;
+        }
+        if (ctx->fr_cur_mode > MODE_SID) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "Invalid mode %d\n", ctx->fr_cur_mode);
+            return AVERROR_INVALIDDATA;
         }
 
-        /* Post-processing of excitation elements */
-        synth_fixed_gain = noise_enhancer(ctx->fixed_gain[0], &ctx->prev_tr_gain,
-                                          voice_fac, stab_fac);
+        if (buf_size < expected_fr_size) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "Frame too small (%d bytes). Truncated file?\n", buf_size);
+            *got_frame_ptr = 0;
+            return AVERROR_INVALIDDATA;
+        }
 
-        synth_fixed_vector = anti_sparseness(ctx, ctx->fixed_vector,
-                                             spare_vector);
+        if (ctx->fr_cur_mode == MODE_SID) { /* Comfort noise frame */
+            avpriv_request_sample(avctx, "SID mode");
+            return AVERROR_PATCHWELCOME;
+        }
 
-        pitch_enhancer(synth_fixed_vector, voice_fac);
+        ff_amr_bit_reorder((uint16_t *) &ctx->frame, sizeof(AMRWBFrame),
+                           buf + header_size, amr_bit_orderings_by_mode[ctx->fr_cur_mode]);
 
-        synthesis(ctx, ctx->lp_coef[sub], synth_exc, synth_fixed_gain,
-                  synth_fixed_vector, &ctx->samples_az[LP_ORDER]);
+        /* Decode the quantized ISF vector */
+        if (ctx->fr_cur_mode == MODE_6k60) {
+            decode_isf_indices_36b(cf->isp_id, ctx->isf_cur);
+        } else {
+            decode_isf_indices_46b(cf->isp_id, ctx->isf_cur);
+        }
 
-        /* Synthesis speech post-processing */
-        de_emphasis(&ctx->samples_up[UPS_MEM_SIZE],
-                    &ctx->samples_az[LP_ORDER], PREEMPH_FAC, ctx->demph_mem);
+        isf_add_mean_and_past(ctx->isf_cur, ctx->isf_q_past);
+        ff_set_min_dist_lsf(ctx->isf_cur, MIN_ISF_SPACING, LP_ORDER - 1);
 
-        ctx->acelpf_ctx.acelp_apply_order_2_transfer_function(&ctx->samples_up[UPS_MEM_SIZE],
-            &ctx->samples_up[UPS_MEM_SIZE], hpf_zeros, hpf_31_poles,
-            hpf_31_gain, ctx->hpf_31_mem, AMRWB_SFR_SIZE);
+        stab_fac = stability_factor(ctx->isf_cur, ctx->isf_past_final);
 
-        upsample_5_4(sub_buf, &ctx->samples_up[UPS_FIR_SIZE],
-                     AMRWB_SFR_SIZE_16k, &ctx->celpm_ctx);
+        ctx->isf_cur[LP_ORDER - 1] *= 2.0;
+        ff_acelp_lsf2lspd(ctx->isp[3], ctx->isf_cur, LP_ORDER);
 
-        /* High frequency band (6.4 - 7.0 kHz) generation part */
-        ctx->acelpf_ctx.acelp_apply_order_2_transfer_function(hb_samples,
-            &ctx->samples_up[UPS_MEM_SIZE], hpf_zeros, hpf_400_poles,
-            hpf_400_gain, ctx->hpf_400_mem, AMRWB_SFR_SIZE);
+        /* Generate a ISP vector for each subframe */
+        if (ctx->first_frame) {
+            ctx->first_frame = 0;
+            memcpy(ctx->isp_sub4_past, ctx->isp[3], LP_ORDER * sizeof(double));
+        }
+        interpolate_isp(ctx->isp, ctx->isp_sub4_past);
 
-        hb_gain = find_hb_gain(ctx, hb_samples,
-                               cur_subframe->hb_gain, cf->vad);
+        for (sub = 0; sub < 4; sub++)
+            ff_amrwb_lsp2lpc(ctx->isp[sub], ctx->lp_coef[sub], LP_ORDER);
 
-        scaled_hb_excitation(ctx, hb_exc, synth_exc, hb_gain);
+        for (sub = 0; sub < 4; sub++) {
+            const AMRWBSubFrame *cur_subframe = &cf->subframe[sub];
+            float *sub_buf = buf_out + sub * AMRWB_SFR_SIZE_16k;
 
-        hb_synthesis(ctx, sub, &ctx->samples_hb[LP_ORDER_16k],
-                     hb_exc, ctx->isf_cur, ctx->isf_past_final);
+            /* Decode adaptive codebook (pitch vector) */
+            decode_pitch_vector(ctx, cur_subframe, sub);
+            /* Decode innovative codebook (fixed vector) */
+            decode_fixed_vector(ctx->fixed_vector, cur_subframe->pul_ih,
+                                cur_subframe->pul_il, ctx->fr_cur_mode);
 
-        /* High-band post-processing filters */
-        hb_fir_filter(hb_samples, bpf_6_7_coef, ctx->bpf_6_7_mem,
-                      &ctx->samples_hb[LP_ORDER_16k]);
+            pitch_sharpening(ctx, ctx->fixed_vector);
 
-        if (ctx->fr_cur_mode == MODE_23k85)
-            hb_fir_filter(hb_samples, lpf_7_coef, ctx->lpf_7_mem,
-                          hb_samples);
+            decode_gains(cur_subframe->vq_gain, ctx->fr_cur_mode,
+                         &fixed_gain_factor, &ctx->pitch_gain[0]);
 
-        /* Add the low and high frequency bands */
-        for (i = 0; i < AMRWB_SFR_SIZE_16k; i++)
-            sub_buf[i] = (sub_buf[i] + hb_samples[i]) * (1.0f / (1 << 15));
+            ctx->fixed_gain[0] =
+                ff_amr_set_fixed_gain(fixed_gain_factor,
+                                      ctx->celpm_ctx.dot_productf(ctx->fixed_vector,
+                                                                  ctx->fixed_vector,
+                                                                  AMRWB_SFR_SIZE) /
+                                      AMRWB_SFR_SIZE,
+                                      ctx->prediction_error,
+                                      ENERGY_MEAN, energy_pred_fac);
 
-        /* Update buffers and history */
-        update_sub_state(ctx);
+            /* Calculate voice factor and store tilt for next subframe */
+            voice_fac      = voice_factor(ctx->pitch_vector, ctx->pitch_gain[0],
+                                          ctx->fixed_vector, ctx->fixed_gain[0],
+                                          &ctx->celpm_ctx);
+            ctx->tilt_coef = voice_fac * 0.25 + 0.25;
+
+            /* Construct current excitation */
+            for (i = 0; i < AMRWB_SFR_SIZE; i++) {
+                ctx->excitation[i] *= ctx->pitch_gain[0];
+                ctx->excitation[i] += ctx->fixed_gain[0] * ctx->fixed_vector[i];
+                ctx->excitation[i] = truncf(ctx->excitation[i]);
+            }
+
+            /* Post-processing of excitation elements */
+            synth_fixed_gain = noise_enhancer(ctx->fixed_gain[0], &ctx->prev_tr_gain,
+                                              voice_fac, stab_fac);
+
+            synth_fixed_vector = anti_sparseness(ctx, ctx->fixed_vector,
+                                                 spare_vector);
+
+            pitch_enhancer(synth_fixed_vector, voice_fac);
+
+            synthesis(ctx, ctx->lp_coef[sub], synth_exc, synth_fixed_gain,
+                      synth_fixed_vector, &ctx->samples_az[LP_ORDER]);
+
+            /* Synthesis speech post-processing */
+            de_emphasis(&ctx->samples_up[UPS_MEM_SIZE],
+                        &ctx->samples_az[LP_ORDER], PREEMPH_FAC, ctx->demph_mem);
+
+            ctx->acelpf_ctx.acelp_apply_order_2_transfer_function(&ctx->samples_up[UPS_MEM_SIZE],
+                                                                  &ctx->samples_up[UPS_MEM_SIZE], hpf_zeros, hpf_31_poles,
+                                                                  hpf_31_gain, ctx->hpf_31_mem, AMRWB_SFR_SIZE);
+
+            upsample_5_4(sub_buf, &ctx->samples_up[UPS_FIR_SIZE],
+                         AMRWB_SFR_SIZE_16k, &ctx->celpm_ctx);
+
+            /* High frequency band (6.4 - 7.0 kHz) generation part */
+            ctx->acelpf_ctx.acelp_apply_order_2_transfer_function(hb_samples,
+                                                                  &ctx->samples_up[UPS_MEM_SIZE], hpf_zeros, hpf_400_poles,
+                                                                  hpf_400_gain, ctx->hpf_400_mem, AMRWB_SFR_SIZE);
+
+            hb_gain = find_hb_gain(ctx, hb_samples,
+                                   cur_subframe->hb_gain, cf->vad);
+
+            scaled_hb_excitation(ctx, hb_exc, synth_exc, hb_gain);
+
+            hb_synthesis(ctx, sub, &ctx->samples_hb[LP_ORDER_16k],
+                         hb_exc, ctx->isf_cur, ctx->isf_past_final);
+
+            /* High-band post-processing filters */
+            hb_fir_filter(hb_samples, bpf_6_7_coef, ctx->bpf_6_7_mem,
+                          &ctx->samples_hb[LP_ORDER_16k]);
+
+            if (ctx->fr_cur_mode == MODE_23k85)
+                hb_fir_filter(hb_samples, lpf_7_coef, ctx->lpf_7_mem,
+                              hb_samples);
+
+            /* Add the low and high frequency bands */
+            for (i = 0; i < AMRWB_SFR_SIZE_16k; i++)
+                sub_buf[i] = (sub_buf[i] + hb_samples[i]) * (1.0f / (1 << 15));
+
+            /* Update buffers and history */
+            update_sub_state(ctx);
+        }
+
+        /* update state for next frame */
+        memcpy(ctx->isp_sub4_past, ctx->isp[3], LP_ORDER * sizeof(ctx->isp[3][0]));
+        memcpy(ctx->isf_past_final, ctx->isf_cur, LP_ORDER * sizeof(float));
+
+        buf += expected_fr_size;
+        buf_size -= expected_fr_size;
     }
-
-    /* update state for next frame */
-    memcpy(ctx->isp_sub4_past, ctx->isp[3], LP_ORDER * sizeof(ctx->isp[3][0]));
-    memcpy(ctx->isf_past_final, ctx->isf_cur, LP_ORDER * sizeof(float));
 
     *got_frame_ptr = 1;
 
-    return expected_fr_size;
+    return buf - avpkt->data;
 }
 
-AVCodec ff_amrwb_decoder = {
-    .name           = "amrwb",
-    .long_name      = NULL_IF_CONFIG_SMALL("AMR-WB (Adaptive Multi-Rate WideBand)"),
-    .type           = AVMEDIA_TYPE_AUDIO,
-    .id             = AV_CODEC_ID_AMR_WB,
-    .priv_data_size = sizeof(AMRWBContext),
+const FFCodec ff_amrwb_decoder = {
+    .p.name         = "amrwb",
+    CODEC_LONG_NAME("AMR-WB (Adaptive Multi-Rate WideBand)"),
+    .p.type         = AVMEDIA_TYPE_AUDIO,
+    .p.id           = AV_CODEC_ID_AMR_WB,
+    .priv_data_size = sizeof(AMRWBChannelsContext),
     .init           = amrwb_decode_init,
-    .decode         = amrwb_decode_frame,
-    .capabilities   = CODEC_CAP_DR1,
-    .sample_fmts    = (const enum AVSampleFormat[]){ AV_SAMPLE_FMT_FLT,
-                                                     AV_SAMPLE_FMT_NONE },
+    FF_CODEC_DECODE_CB(amrwb_decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_CHANNEL_CONF,
+    CODEC_SAMPLEFMTS(AV_SAMPLE_FMT_FLTP),
 };

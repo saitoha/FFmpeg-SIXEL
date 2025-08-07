@@ -12,7 +12,7 @@
 
 @chapter Synopsis
 
-ffprobe [@var{options}] [@file{input_file}]
+ffprobe [@var{options}] @file{input_url}
 
 @chapter Description
 @c man begin DESCRIPTION
@@ -24,9 +24,12 @@ For example it can be used to check the format of the container used
 by a multimedia stream and the format and type of each media stream
 contained in it.
 
-If a filename is specified in input, ffprobe will try to open and
-probe the file content. If the file cannot be opened or recognized as
+If a url is specified in input, ffprobe will try to open and
+probe the url content. If the url cannot be opened or recognized as
 a multimedia file, a positive exit code is returned.
+
+If no output is specified as output with @option{o} ffprobe will write
+to stdout.
 
 ffprobe may be employed both as a standalone application or in
 combination with a textual filter, which may perform more
@@ -38,15 +41,15 @@ ffprobe will show it.
 
 ffprobe output is designed to be easily parsable by a textual filter,
 and consists of one or more sections of a form defined by the selected
-writer, which is specified by the @option{print_format} option.
+writer, which is specified by the @option{output_format} option.
 
 Sections may contain other nested sections, and are identified by a
 name (which may be shared by other sections), and an unique
 name. See the output of @option{sections}.
 
 Metadata tags stored in the container or in the streams are recognized
-and printed in the corresponding "FORMAT", "STREAM" or "PROGRAM_STREAM"
-section.
+and printed in the corresponding "FORMAT", "STREAM", "STREAM_GROUP_STREAM"
+or "PROGRAM_STREAM" section.
 
 @c man end
 
@@ -80,7 +83,7 @@ Use sexagesimal format HH:MM:SS.MICROSECONDS for time values.
 Prettify the format of the displayed values, it corresponds to the
 options "-unit -prefix -byte_binary_prefix -sexagesimal".
 
-@item -of, -print_format @var{writer_name}[=@var{writer_options}]
+@item -output_format, -of, -print_format @var{writer_name}[=@var{writer_options}]
 Set the output printing format.
 
 @var{writer_name} specifies the name of the writer, and
@@ -88,7 +91,7 @@ Set the output printing format.
 
 For example for printing the output in JSON format, specify:
 @example
--print_format json
+-output_format json
 @end example
 
 For more details on the available output printing formats, see the
@@ -135,13 +138,6 @@ stream.
 
 All the container format information is printed within a section with
 name "FORMAT".
-
-@item -show_format_entry @var{name}
-Like @option{-show_format}, but only prints the specified entry of the
-container format information, rather than all. This option may be given more
-than once, then all specified entries will be shown.
-
-This option is deprecated, use @code{show_entries} instead.
 
 @item -show_entries @var{section_entries}
 Set list of entries to show.
@@ -208,6 +204,13 @@ multimedia stream.
 The information for each single frame is printed within a dedicated
 section with name "FRAME" or "SUBTITLE".
 
+@item -show_log @var{loglevel}
+Show logging information from the decoder about each frame according to
+the value set in @var{loglevel}, (see @code{-loglevel}). This option requires @code{-show_frames}.
+
+The information for each log message is printed within a dedicated
+section with name "LOG".
+
 @item -show_streams
 Show information about each media stream contained in the input
 multimedia stream.
@@ -221,6 +224,13 @@ multimedia stream.
 
 Each media stream information is printed within a dedicated section
 with name "PROGRAM_STREAM".
+
+@item -show_stream_groups
+Show information about stream groups and their streams contained in the
+input multimedia stream.
+
+Each media stream information is printed within a dedicated section
+with name "STREAM_GROUP_STREAM".
 
 @item -show_chapters
 Show information about chapters stored in the format.
@@ -245,7 +255,7 @@ continue reading from that.
 Each interval is specified by two optional parts, separated by "%".
 
 The first part specifies the interval start position. It is
-interpreted as an abolute position, or as a relative offset from the
+interpreted as an absolute position, or as a relative offset from the
 current position if it is preceded by the "+" character. If this first
 part is not specified, no seeking will be performed when reading this
 interval.
@@ -328,12 +338,35 @@ Show information about all pixel formats supported by FFmpeg.
 Pixel format information for each format is printed within a section
 with name "PIXEL_FORMAT".
 
+@item -show_optional_fields @var{value}
+Some writers viz. JSON and XML, omit the printing of fields with invalid or non-applicable values,
+while other writers always print them. This option enables one to control this behaviour.
+Valid values are @code{always}/@code{1}, @code{never}/@code{0} and @code{auto}/@code{-1}.
+Default is @var{auto}.
+
+@item -analyze_frames
+Analyze frames and/or their side data up to the provided read interval,
+providing additional information that may be useful at a stream level.
+Must be paired with the @option{-show_streams} option or it will have no effect.
+
+Currently, the additional fields provided by this option when enabled are the
+@code{closed_captions} and @code{film_grain} fields.
+
+For example, to analyze the first 20 seconds and populate these fields:
+@example
+ffprobe -show_streams -analyze_frames -read_intervals "%+20" INPUT
+@end example
+
 @item -bitexact
 Force bitexact output, useful to produce output which is not dependent
 on the specific build.
 
-@item -i @var{input_file}
-Read @var{input_file}.
+@item -i @var{input_url}
+Read @var{input_url}.
+
+@item -o @var{output_url}
+Write output to @var{output_url}. If not specified, the output is sent
+to stdout.
 
 @end table
 @c man end
@@ -395,8 +428,9 @@ keyN=valN
 [/SECTION]
 @end example
 
-Metadata tags are printed as a line in the corresponding FORMAT, STREAM or
-PROGRAM_STREAM section, and are prefixed by the string "TAG:".
+Metadata tags are printed as a line in the corresponding FORMAT, STREAM,
+STREAM_GROUP_STREAM or PROGRAM_STREAM section, and are prefixed by the
+string "TAG:".
 
 A description of the accepted options follows.
 
@@ -418,7 +452,7 @@ The @code{csv} writer is equivalent to @code{compact}, but supports
 different defaults.
 
 Each section is printed on a single line.
-If no option is specifid, the output has the form:
+If no option is specified, the output has the form:
 @example
 section|key1=val1| ... |keyN=valN
 @end example
@@ -464,7 +498,7 @@ Perform no escaping.
 @end table
 
 @item print_section, p
-Print the section name at the begin of each line if the value is
+Print the section name at the beginning of each line if the value is
 @code{1}, disable it with value set to @code{0}. Default value is
 @code{1}.
 
@@ -577,14 +611,14 @@ value is 0.
 This is required for generating an XML file which can be validated
 through an XSD file.
 
-@item xsd_compliant, x
+@item xsd_strict, x
 If set to 1 perform more checks for ensuring that the output is XSD
 compliant. Default value is 0.
 This option automatically sets @option{fully_qualified} to 1.
 @end table
 
 For more information about the XML format, see
-@url{http://www.w3.org/XML/}.
+@url{https://www.w3.org/XML/}.
 @c man end WRITERS
 
 @chapter Timecode
@@ -635,6 +669,7 @@ DV, GXF and AVI timecodes are available in format metadata
 @ifset config-avfilter
 @include filters.texi
 @end ifset
+@include general_contents.texi
 @end ifset
 
 @chapter See Also
@@ -646,7 +681,7 @@ DV, GXF and AVI timecodes are available in format metadata
 @ifset config-not-all
 @url{ffprobe-all.html,ffprobe-all},
 @end ifset
-@url{ffmpeg.html,ffmpeg}, @url{ffplay.html,ffplay}, @url{ffserver.html,ffserver},
+@url{ffmpeg.html,ffmpeg}, @url{ffplay.html,ffplay},
 @url{ffmpeg-utils.html,ffmpeg-utils},
 @url{ffmpeg-scaler.html,ffmpeg-scaler},
 @url{ffmpeg-resampler.html,ffmpeg-resampler},
@@ -665,7 +700,7 @@ ffprobe(1),
 @ifset config-not-all
 ffprobe-all(1),
 @end ifset
-ffmpeg(1), ffplay(1), ffserver(1),
+ffmpeg(1), ffplay(1),
 ffmpeg-utils(1), ffmpeg-scaler(1), ffmpeg-resampler(1),
 ffmpeg-codecs(1), ffmpeg-bitstream-filters(1), ffmpeg-formats(1),
 ffmpeg-devices(1), ffmpeg-protocols(1), ffmpeg-filters(1)

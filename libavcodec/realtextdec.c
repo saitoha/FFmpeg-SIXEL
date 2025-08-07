@@ -26,6 +26,7 @@
 
 #include "avcodec.h"
 #include "ass.h"
+#include "codec_internal.h"
 #include "libavutil/avstring.h"
 #include "libavutil/bprint.h"
 
@@ -55,19 +56,17 @@ static int rt_event_to_ass(AVBPrint *buf, const char *p)
     return 0;
 }
 
-static int realtext_decode_frame(AVCodecContext *avctx,
-                                 void *data, int *got_sub_ptr, AVPacket *avpkt)
+static int realtext_decode_frame(AVCodecContext *avctx, AVSubtitle *sub,
+                                 int *got_sub_ptr, const AVPacket *avpkt)
 {
     int ret = 0;
-    AVSubtitle *sub = data;
     const char *ptr = avpkt->data;
+    FFASSDecoderContext *s = avctx->priv_data;
     AVBPrint buf;
 
     av_bprint_init(&buf, 0, 4096);
-    // note: no need to rescale pts & duration since they are in the same
-    // timebase as ASS (1/100)
     if (ptr && avpkt->size > 0 && !rt_event_to_ass(&buf, ptr))
-        ret = ff_ass_add_rect_bprint(sub, &buf, avpkt->pts, avpkt->duration);
+        ret = ff_ass_add_rect(sub, buf.str, s->readorder++, 0, NULL, NULL);
     av_bprint_finalize(&buf, NULL);
     if (ret < 0)
         return ret;
@@ -75,11 +74,13 @@ static int realtext_decode_frame(AVCodecContext *avctx,
     return avpkt->size;
 }
 
-AVCodec ff_realtext_decoder = {
-    .name           = "realtext",
-    .long_name      = NULL_IF_CONFIG_SMALL("RealText subtitle"),
-    .type           = AVMEDIA_TYPE_SUBTITLE,
-    .id             = AV_CODEC_ID_REALTEXT,
-    .decode         = realtext_decode_frame,
+const FFCodec ff_realtext_decoder = {
+    .p.name         = "realtext",
+    CODEC_LONG_NAME("RealText subtitle"),
+    .p.type         = AVMEDIA_TYPE_SUBTITLE,
+    .p.id           = AV_CODEC_ID_REALTEXT,
+    FF_CODEC_DECODE_SUB_CB(realtext_decode_frame),
     .init           = ff_ass_subtitle_header_default,
+    .flush          = ff_ass_decoder_flush,
+    .priv_data_size = sizeof(FFASSDecoderContext),
 };

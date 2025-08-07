@@ -22,8 +22,16 @@
 #define AVFILTER_VIDEO_H
 
 #include "avfilter.h"
+#include "filters.h"
+
+/**
+ * An AVFilterPad array whose only entry has name "default"
+ * and is of type AVMEDIA_TYPE_VIDEO.
+ */
+extern const AVFilterPad ff_video_default_filterpad[1];
 
 AVFrame *ff_default_get_video_buffer(AVFilterLink *link, int w, int h);
+AVFrame *ff_default_get_video_buffer2(AVFilterLink *link, int w, int h, int align);
 AVFrame *ff_null_get_video_buffer(AVFilterLink *link, int w, int h);
 
 /**
@@ -33,9 +41,19 @@ AVFrame *ff_null_get_video_buffer(AVFilterLink *link, int w, int h);
  *              be requested
  * @param w     the minimum width of the buffer to allocate
  * @param h     the minimum height of the buffer to allocate
- * @return      A reference to the buffer. This must be unreferenced with
- *              avfilter_unref_buffer when you are finished with it.
+ * @return      on success, an AVFrame owned by the caller, NULL on error
  */
 AVFrame *ff_get_video_buffer(AVFilterLink *link, int w, int h);
+
+/**
+ * Returns true if a pixel format is "regular YUV", which includes all pixel
+ * formats that are affected by YUV colorspace negotiation.
+ */
+int ff_fmt_is_regular_yuv(enum AVPixelFormat fmt);
+
+/**
+ * Returns true if a YUV pixel format is forced full range (i.e. YUVJ).
+ */
+int ff_fmt_is_forced_full_range(enum AVPixelFormat fmt);
 
 #endif /* AVFILTER_VIDEO_H */

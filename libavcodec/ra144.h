@@ -1,6 +1,6 @@
 /*
  * Real Audio 1.0 (14.4K)
- * Copyright (c) 2003 The FFmpeg Project
+ * Copyright (c) 2003 The FFmpeg project
  *
  * This file is part of FFmpeg.
  *
@@ -23,6 +23,9 @@
 #define AVCODEC_RA144_H
 
 #include <stdint.h>
+
+#include "libavutil/mem_internal.h"
+
 #include "lpc.h"
 #include "audio_frame_queue.h"
 #include "audiodsp.h"

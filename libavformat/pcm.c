@@ -24,17 +24,45 @@
 #include "internal.h"
 #include "pcm.h"
 
-#define RAW_SAMPLES     1024
+#define PCM_DEMUX_TARGET_FPS  10
+
+int ff_pcm_default_packet_size(AVCodecParameters *par)
+{
+    int nb_samples, max_samples, bits_per_sample;
+    int64_t bitrate;
+
+    if (par->block_align <= 0)
+        return AVERROR(EINVAL);
+
+    max_samples = INT_MAX / par->block_align;
+    bits_per_sample = av_get_bits_per_sample(par->codec_id);
+    bitrate = par->bit_rate;
+
+    /* Don't trust the codecpar bitrate if we can calculate it ourselves */
+    if (bits_per_sample > 0 && par->sample_rate > 0 && par->ch_layout.nb_channels > 0)
+        if ((int64_t)par->sample_rate * par->ch_layout.nb_channels < INT64_MAX / bits_per_sample)
+            bitrate = bits_per_sample * (int64_t)par->sample_rate * par->ch_layout.nb_channels;
+
+    if (bitrate > 0) {
+        nb_samples = av_clip64(bitrate / 8 / PCM_DEMUX_TARGET_FPS / par->block_align, 1, max_samples);
+        nb_samples = 1 << av_log2(nb_samples);
+    } else {
+        /* Fallback to a size based method for a non-pcm codec with unknown bitrate */
+        nb_samples = av_clip(4096 / par->block_align, 1, max_samples);
+    }
+
+    return par->block_align * nb_samples;
+}
 
 int ff_pcm_read_packet(AVFormatContext *s, AVPacket *pkt)
 {
     int ret, size;
 
-    size= RAW_SAMPLES*s->streams[0]->codec->block_align;
-    if (size <= 0)
-        return AVERROR(EINVAL);
+    size = ff_pcm_default_packet_size(s->streams[0]->codecpar);
+    if (size < 0)
+        return size;
 
-    ret= av_get_packet(s->pb, pkt, size);
+    ret = av_get_packet(s->pb, pkt, size);
 
     pkt->flags &= ~AV_PKT_FLAG_CORRUPT;
     pkt->stream_index = 0;
@@ -51,10 +79,10 @@ int ff_pcm_read_seek(AVFormatContext *s,
 
     st = s->streams[0];
 
-    block_align = st->codec->block_align ? st->codec->block_align :
-        (av_get_bits_per_sample(st->codec->codec_id) * st->codec->channels) >> 3;
-    byte_rate = st->codec->bit_rate ? st->codec->bit_rate >> 3 :
-        block_align * st->codec->sample_rate;
+    block_align = st->codecpar->block_align ? st->codecpar->block_align :
+        (av_get_bits_per_sample(st->codecpar->codec_id) * st->codecpar->ch_layout.nb_channels) >> 3;
+    byte_rate = st->codecpar->bit_rate ? st->codecpar->bit_rate >> 3 :
+        block_align * st->codecpar->sample_rate;
 
     if (block_align <= 0 || byte_rate <= 0)
         return -1;
@@ -68,8 +96,8 @@ int ff_pcm_read_seek(AVFormatContext *s,
     pos *= block_align;
 
     /* recompute exact position */
-    st->cur_dts = av_rescale(pos, st->time_base.den, byte_rate * (int64_t)st->time_base.num);
-    if ((ret = avio_seek(s->pb, pos + s->internal->data_offset, SEEK_SET)) < 0)
+    ffstream(st)->cur_dts = av_rescale(pos, st->time_base.den, byte_rate * (int64_t)st->time_base.num);
+    if ((ret = avio_seek(s->pb, pos + ffformatcontext(s)->data_offset, SEEK_SET)) < 0)
         return ret;
     return 0;
 }

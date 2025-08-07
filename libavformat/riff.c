@@ -19,9 +19,13 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "libavutil/error.h"
-#include "libavcodec/avcodec.h"
+#include <stddef.h>
+#include "config.h"
+#include "config_components.h"
+#include "libavutil/macros.h"
 #include "avformat.h"
+#include "internal.h"
+#include "metadata.h"
 #include "riff.h"
 
 /* Note: When encoding, the first matching tag is used, so order is
@@ -56,6 +60,7 @@ const AVCodecTag ff_codec_bmp_tags[] = {
     { AV_CODEC_ID_H263I,        MKTAG('I', '2', '6', '3') }, /* Intel H.263 */
     { AV_CODEC_ID_H261,         MKTAG('H', '2', '6', '1') },
     { AV_CODEC_ID_H263,         MKTAG('U', '2', '6', '3') },
+    { AV_CODEC_ID_H263,         MKTAG('V', 'S', 'M', '4') }, /* needs -vf il=l=i:c=i */
     { AV_CODEC_ID_MPEG4,        MKTAG('F', 'M', 'P', '4') },
     { AV_CODEC_ID_MPEG4,        MKTAG('D', 'I', 'V', 'X') },
     { AV_CODEC_ID_MPEG4,        MKTAG('D', 'X', '5', '0') },
@@ -112,6 +117,8 @@ const AVCodecTag ff_codec_bmp_tags[] = {
     { AV_CODEC_ID_MPEG4,        MKTAG('P', 'L', 'V', '1') }, /* Pelco DVR MPEG-4 */
     { AV_CODEC_ID_MPEG4,        MKTAG('G', 'L', 'V', '4') },
     { AV_CODEC_ID_MPEG4,        MKTAG('G', 'M', 'P', '4') }, /* GeoVision camera */
+    { AV_CODEC_ID_MPEG4,        MKTAG('M', 'N', 'M', '4') }, /* March Networks DVR */
+    { AV_CODEC_ID_MPEG4,        MKTAG('G', 'T', 'M', '4') }, /* Telefactor */
     { AV_CODEC_ID_MSMPEG4V3,    MKTAG('M', 'P', '4', '3') },
     { AV_CODEC_ID_MSMPEG4V3,    MKTAG('D', 'I', 'V', '3') },
     { AV_CODEC_ID_MSMPEG4V3,    MKTAG('M', 'P', 'G', '3') },
@@ -148,13 +155,13 @@ const AVCodecTag ff_codec_bmp_tags[] = {
     { AV_CODEC_ID_DVVIDEO,      MKTAG('p', 'd', 'v', 'c') },
     { AV_CODEC_ID_DVVIDEO,      MKTAG('S', 'L', '2', '5') },
     { AV_CODEC_ID_DVVIDEO,      MKTAG('S', 'L', 'D', 'V') },
+    { AV_CODEC_ID_DVVIDEO,      MKTAG('A', 'V', 'd', '1') },
     { AV_CODEC_ID_MPEG1VIDEO,   MKTAG('m', 'p', 'g', '1') },
-    { AV_CODEC_ID_MPEG1VIDEO,   MKTAG('m', 'p', 'g', '2') },
     { AV_CODEC_ID_MPEG2VIDEO,   MKTAG('m', 'p', 'g', '2') },
     { AV_CODEC_ID_MPEG2VIDEO,   MKTAG('M', 'P', 'E', 'G') },
     { AV_CODEC_ID_MPEG1VIDEO,   MKTAG('P', 'I', 'M', '1') },
     { AV_CODEC_ID_MPEG2VIDEO,   MKTAG('P', 'I', 'M', '2') },
-    { AV_CODEC_ID_MPEG1VIDEO,   MKTAG('V', 'C', 'R', '2') },
+    { AV_CODEC_ID_MPEG2VIDEO,   MKTAG('V', 'C', 'R', '2') },
     { AV_CODEC_ID_MPEG1VIDEO,   MKTAG( 1 ,  0 ,  0 ,  16) },
     { AV_CODEC_ID_MPEG2VIDEO,   MKTAG( 2 ,  0 ,  0 ,  16) },
     { AV_CODEC_ID_MPEG4,        MKTAG( 4 ,  0 ,  0 ,  16) },
@@ -166,6 +173,9 @@ const AVCodecTag ff_codec_bmp_tags[] = {
     { AV_CODEC_ID_MPEG2VIDEO,   MKTAG('E', 'M', '2', 'V') },
     /* Matrox MPEG-2 intra-only */
     { AV_CODEC_ID_MPEG2VIDEO,   MKTAG('M', '7', '0', '1') },
+    { AV_CODEC_ID_MPEG2VIDEO,   MKTAG('M', '7', '0', '2') },
+    { AV_CODEC_ID_MPEG2VIDEO,   MKTAG('M', '7', '0', '3') },
+    { AV_CODEC_ID_MPEG2VIDEO,   MKTAG('M', '7', '0', '4') },
     { AV_CODEC_ID_MPEG2VIDEO,   MKTAG('M', '7', '0', '5') },
     { AV_CODEC_ID_MPEG2VIDEO,   MKTAG('m', 'p', 'g', 'v') },
     { AV_CODEC_ID_MPEG1VIDEO,   MKTAG('B', 'W', '1', '0') },
@@ -175,6 +185,7 @@ const AVCodecTag ff_codec_bmp_tags[] = {
     { AV_CODEC_ID_MJPEG,        MKTAG('L', 'J', 'P', 'G') },
     { AV_CODEC_ID_MJPEG,        MKTAG('d', 'm', 'b', '1') },
     { AV_CODEC_ID_MJPEG,        MKTAG('m', 'j', 'p', 'a') },
+    { AV_CODEC_ID_MJPEG,        MKTAG('J', 'R', '2', '4') }, /* Quadrox Mjpeg */
     { AV_CODEC_ID_LJPEG,        MKTAG('L', 'J', 'P', 'G') },
     /* Pegasus lossless JPEG */
     { AV_CODEC_ID_MJPEG,        MKTAG('J', 'P', 'G', 'L') },
@@ -209,8 +220,12 @@ const AVCodecTag ff_codec_bmp_tags[] = {
     { AV_CODEC_ID_RAWVIDEO,     MKTAG( 3 ,  0 ,  0 ,  0 ) },
     { AV_CODEC_ID_RAWVIDEO,     MKTAG('I', '4', '2', '0') },
     { AV_CODEC_ID_RAWVIDEO,     MKTAG('Y', 'U', 'Y', '2') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('Y', '2', '1', '0') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('Y', '2', '1', '6') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('Y', '4', '1', '6') },
     { AV_CODEC_ID_RAWVIDEO,     MKTAG('Y', '4', '2', '2') },
     { AV_CODEC_ID_RAWVIDEO,     MKTAG('V', '4', '2', '2') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('Y', '4', '1', '0') },
     { AV_CODEC_ID_RAWVIDEO,     MKTAG('Y', 'U', 'N', 'V') },
     { AV_CODEC_ID_RAWVIDEO,     MKTAG('U', 'Y', 'N', 'V') },
     { AV_CODEC_ID_RAWVIDEO,     MKTAG('U', 'Y', 'N', 'Y') },
@@ -226,6 +241,7 @@ const AVCodecTag ff_codec_bmp_tags[] = {
     { AV_CODEC_ID_RAWVIDEO,     MKTAG('U', 'Y', 'V', 'Y') },
     { AV_CODEC_ID_RAWVIDEO,     MKTAG('V', 'Y', 'U', 'Y') },
     { AV_CODEC_ID_RAWVIDEO,     MKTAG('I', 'Y', 'U', 'V') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('A', 'Y', 'U', 'V') },
     { AV_CODEC_ID_RAWVIDEO,     MKTAG('Y', '8', '0', '0') },
     { AV_CODEC_ID_RAWVIDEO,     MKTAG('Y', '8', ' ', ' ') },
     { AV_CODEC_ID_RAWVIDEO,     MKTAG('H', 'D', 'Y', 'C') },
@@ -241,14 +257,63 @@ const AVCodecTag ff_codec_bmp_tags[] = {
     { AV_CODEC_ID_RAWVIDEO,     MKTAG('Y', 'V', 'U', '9') },
     { AV_CODEC_ID_RAWVIDEO,     MKTAG('a', 'u', 'v', '2') },
     { AV_CODEC_ID_RAWVIDEO,     MKTAG('Y', 'V', 'Y', 'U') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('Y', 'U', 'Y', 'V') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('I', '4', '1', '0') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('I', '4', '1', '1') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('I', '4', '2', '2') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('I', '4', '4', '0') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('I', '4', '4', '4') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('J', '4', '2', '0') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('J', '4', '2', '2') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('J', '4', '4', '0') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('J', '4', '4', '4') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('Y', 'U', 'V', 'A') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('I', '4', '0', 'A') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('I', '4', '2', 'A') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('R', 'G', 'B', '2') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('R', 'V', '1', '5') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('R', 'V', '1', '6') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('R', 'V', '2', '4') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('R', 'V', '3', '2') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('R', 'G', 'B', 'A') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('A', 'V', '3', '2') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('G', 'R', 'E', 'Y') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('I', '0', '9', 'L') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('I', '0', '9', 'B') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('I', '2', '9', 'L') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('I', '2', '9', 'B') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('I', '4', '9', 'L') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('I', '4', '9', 'B') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('I', '0', 'A', 'L') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('I', '0', 'A', 'B') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('I', '2', 'A', 'L') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('I', '2', 'A', 'B') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('I', '4', 'A', 'L') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('I', '4', 'A', 'B') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('I', '4', 'F', 'L') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('I', '4', 'F', 'B') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('I', '0', 'C', 'L') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('I', '0', 'C', 'B') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('I', '2', 'C', 'L') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('I', '2', 'C', 'B') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('I', '4', 'C', 'L') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('I', '4', 'C', 'B') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('I', '0', 'F', 'L') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('I', '0', 'F', 'B') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('v', '3', '0', '8') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('v', '4', '0', '8') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('v', '4', '1', '0') },
+    { AV_CODEC_ID_RAWVIDEO,     MKTAG('y', '4', '0', '8') },
     { AV_CODEC_ID_FRWU,         MKTAG('F', 'R', 'W', 'U') },
     { AV_CODEC_ID_R10K,         MKTAG('R', '1', '0', 'k') },
     { AV_CODEC_ID_R210,         MKTAG('r', '2', '1', '0') },
     { AV_CODEC_ID_V210,         MKTAG('v', '2', '1', '0') },
+    { AV_CODEC_ID_V210,         MKTAG('C', '2', '1', '0') },
+#if FF_API_V408_CODECID
     { AV_CODEC_ID_V308,         MKTAG('v', '3', '0', '8') },
     { AV_CODEC_ID_V408,         MKTAG('v', '4', '0', '8') },
-    { AV_CODEC_ID_AYUV,         MKTAG('A', 'Y', 'U', 'V') },
     { AV_CODEC_ID_V410,         MKTAG('v', '4', '1', '0') },
+#endif
     { AV_CODEC_ID_YUV4,         MKTAG('y', 'u', 'v', '4') },
     { AV_CODEC_ID_INDEO3,       MKTAG('I', 'V', '3', '1') },
     { AV_CODEC_ID_INDEO3,       MKTAG('I', 'V', '3', '2') },
@@ -256,6 +321,7 @@ const AVCodecTag ff_codec_bmp_tags[] = {
     { AV_CODEC_ID_INDEO5,       MKTAG('I', 'V', '5', '0') },
     { AV_CODEC_ID_VP3,          MKTAG('V', 'P', '3', '1') },
     { AV_CODEC_ID_VP3,          MKTAG('V', 'P', '3', '0') },
+    { AV_CODEC_ID_VP4,          MKTAG('V', 'P', '4', '0') },
     { AV_CODEC_ID_VP5,          MKTAG('V', 'P', '5', '0') },
     { AV_CODEC_ID_VP6,          MKTAG('V', 'P', '6', '0') },
     { AV_CODEC_ID_VP6,          MKTAG('V', 'P', '6', '1') },
@@ -313,15 +379,18 @@ const AVCodecTag ff_codec_bmp_tags[] = {
     { AV_CODEC_ID_FRAPS,        MKTAG('F', 'P', 'S', '1') },
     { AV_CODEC_ID_THEORA,       MKTAG('t', 'h', 'e', 'o') },
     { AV_CODEC_ID_TRUEMOTION2,  MKTAG('T', 'M', '2', '0') },
+    { AV_CODEC_ID_TRUEMOTION2RT,MKTAG('T', 'R', '2', '0') },
     { AV_CODEC_ID_CSCD,         MKTAG('C', 'S', 'C', 'D') },
     { AV_CODEC_ID_ZMBV,         MKTAG('Z', 'M', 'B', 'V') },
     { AV_CODEC_ID_KMVC,         MKTAG('K', 'M', 'V', 'C') },
     { AV_CODEC_ID_CAVS,         MKTAG('C', 'A', 'V', 'S') },
+    { AV_CODEC_ID_AVS2,         MKTAG('A', 'V', 'S', '2') },
     { AV_CODEC_ID_JPEG2000,     MKTAG('m', 'j', 'p', '2') },
     { AV_CODEC_ID_JPEG2000,     MKTAG('M', 'J', '2', 'C') },
     { AV_CODEC_ID_JPEG2000,     MKTAG('L', 'J', '2', 'C') },
     { AV_CODEC_ID_JPEG2000,     MKTAG('L', 'J', '2', 'K') },
     { AV_CODEC_ID_JPEG2000,     MKTAG('I', 'P', 'J', '2') },
+    { AV_CODEC_ID_JPEG2000,     MKTAG('A', 'V', 'j', '2') }, /* Avid jpeg2000 */
     { AV_CODEC_ID_VMNC,         MKTAG('V', 'M', 'n', 'c') },
     { AV_CODEC_ID_TARGA,        MKTAG('t', 'g', 'a', ' ') },
     { AV_CODEC_ID_PNG,          MKTAG('M', 'P', 'N', 'G') },
@@ -343,10 +412,21 @@ const AVCodecTag ff_codec_bmp_tags[] = {
     { AV_CODEC_ID_UTVIDEO,      MKTAG('U', 'L', 'R', 'G') },
     { AV_CODEC_ID_UTVIDEO,      MKTAG('U', 'L', 'Y', '0') },
     { AV_CODEC_ID_UTVIDEO,      MKTAG('U', 'L', 'Y', '2') },
+    { AV_CODEC_ID_UTVIDEO,      MKTAG('U', 'L', 'Y', '4') },
     /* Ut Video version 13.0.1 BT.709 codecs */
     { AV_CODEC_ID_UTVIDEO,      MKTAG('U', 'L', 'H', '0') },
     { AV_CODEC_ID_UTVIDEO,      MKTAG('U', 'L', 'H', '2') },
+    { AV_CODEC_ID_UTVIDEO,      MKTAG('U', 'L', 'H', '4') },
+    { AV_CODEC_ID_UTVIDEO,      MKTAG('U', 'Q', 'Y', '0') },
     { AV_CODEC_ID_UTVIDEO,      MKTAG('U', 'Q', 'Y', '2') },
+    { AV_CODEC_ID_UTVIDEO,      MKTAG('U', 'Q', 'R', 'A') },
+    { AV_CODEC_ID_UTVIDEO,      MKTAG('U', 'Q', 'R', 'G') },
+    { AV_CODEC_ID_UTVIDEO,      MKTAG('U', 'M', 'Y', '2') },
+    { AV_CODEC_ID_UTVIDEO,      MKTAG('U', 'M', 'H', '2') },
+    { AV_CODEC_ID_UTVIDEO,      MKTAG('U', 'M', 'Y', '4') },
+    { AV_CODEC_ID_UTVIDEO,      MKTAG('U', 'M', 'H', '4') },
+    { AV_CODEC_ID_UTVIDEO,      MKTAG('U', 'M', 'R', 'A') },
+    { AV_CODEC_ID_UTVIDEO,      MKTAG('U', 'M', 'R', 'G') },
     { AV_CODEC_ID_VBLE,         MKTAG('V', 'B', 'L', 'E') },
     { AV_CODEC_ID_ESCAPE130,    MKTAG('E', '1', '3', '0') },
     { AV_CODEC_ID_DXTORY,       MKTAG('x', 't', 'o', 'r') },
@@ -370,6 +450,80 @@ const AVCodecTag ff_codec_bmp_tags[] = {
     { AV_CODEC_ID_HQX,          MKTAG('C', 'H', 'Q', 'X') },
     { AV_CODEC_ID_TDSC,         MKTAG('T', 'D', 'S', 'C') },
     { AV_CODEC_ID_HQ_HQA,       MKTAG('C', 'U', 'V', 'C') },
+    { AV_CODEC_ID_RV40,         MKTAG('R', 'V', '4', '0') },
+    { AV_CODEC_ID_SCREENPRESSO, MKTAG('S', 'P', 'V', '1') },
+    { AV_CODEC_ID_RSCC,         MKTAG('R', 'S', 'C', 'C') },
+    { AV_CODEC_ID_RSCC,         MKTAG('I', 'S', 'C', 'C') },
+    { AV_CODEC_ID_CFHD,         MKTAG('C', 'F', 'H', 'D') },
+    { AV_CODEC_ID_M101,         MKTAG('M', '1', '0', '1') },
+    { AV_CODEC_ID_M101,         MKTAG('M', '1', '0', '2') },
+    { AV_CODEC_ID_MAGICYUV,     MKTAG('M', 'A', 'G', 'Y') },
+    { AV_CODEC_ID_MAGICYUV,     MKTAG('M', '8', 'R', 'G') },
+    { AV_CODEC_ID_MAGICYUV,     MKTAG('M', '8', 'R', 'A') },
+    { AV_CODEC_ID_MAGICYUV,     MKTAG('M', '8', 'G', '0') },
+    { AV_CODEC_ID_MAGICYUV,     MKTAG('M', '8', 'Y', '0') },
+    { AV_CODEC_ID_MAGICYUV,     MKTAG('M', '8', 'Y', '2') },
+    { AV_CODEC_ID_MAGICYUV,     MKTAG('M', '8', 'Y', '4') },
+    { AV_CODEC_ID_MAGICYUV,     MKTAG('M', '8', 'Y', 'A') },
+    { AV_CODEC_ID_MAGICYUV,     MKTAG('M', '0', 'R', 'A') },
+    { AV_CODEC_ID_MAGICYUV,     MKTAG('M', '0', 'R', 'G') },
+    { AV_CODEC_ID_MAGICYUV,     MKTAG('M', '0', 'G', '0') },
+    { AV_CODEC_ID_MAGICYUV,     MKTAG('M', '0', 'Y', '0') },
+    { AV_CODEC_ID_MAGICYUV,     MKTAG('M', '0', 'Y', '2') },
+    { AV_CODEC_ID_MAGICYUV,     MKTAG('M', '0', 'Y', '4') },
+    { AV_CODEC_ID_MAGICYUV,     MKTAG('M', '2', 'R', 'A') },
+    { AV_CODEC_ID_MAGICYUV,     MKTAG('M', '2', 'R', 'G') },
+    { AV_CODEC_ID_MAGICYUV,     MKTAG('M', '4', 'R', 'A') },
+    { AV_CODEC_ID_MAGICYUV,     MKTAG('M', '4', 'R', 'G') },
+    { AV_CODEC_ID_YLC,          MKTAG('Y', 'L', 'C', '0') },
+    { AV_CODEC_ID_SPEEDHQ,      MKTAG('S', 'H', 'Q', '0') },
+    { AV_CODEC_ID_SPEEDHQ,      MKTAG('S', 'H', 'Q', '1') },
+    { AV_CODEC_ID_SPEEDHQ,      MKTAG('S', 'H', 'Q', '2') },
+    { AV_CODEC_ID_SPEEDHQ,      MKTAG('S', 'H', 'Q', '3') },
+    { AV_CODEC_ID_SPEEDHQ,      MKTAG('S', 'H', 'Q', '4') },
+    { AV_CODEC_ID_SPEEDHQ,      MKTAG('S', 'H', 'Q', '5') },
+    { AV_CODEC_ID_SPEEDHQ,      MKTAG('S', 'H', 'Q', '7') },
+    { AV_CODEC_ID_SPEEDHQ,      MKTAG('S', 'H', 'Q', '9') },
+    { AV_CODEC_ID_FMVC,         MKTAG('F', 'M', 'V', 'C') },
+    { AV_CODEC_ID_SCPR,         MKTAG('S', 'C', 'P', 'R') },
+    { AV_CODEC_ID_CLEARVIDEO,   MKTAG('U', 'C', 'O', 'D') },
+    { AV_CODEC_ID_AV1,          MKTAG('A', 'V', '0', '1') },
+    { AV_CODEC_ID_MSCC,         MKTAG('M', 'S', 'C', 'C') },
+    { AV_CODEC_ID_SRGC,         MKTAG('S', 'R', 'G', 'C') },
+    { AV_CODEC_ID_IMM4,         MKTAG('I', 'M', 'M', '4') },
+    { AV_CODEC_ID_PROSUMER,     MKTAG('B', 'T', '2', '0') },
+    { AV_CODEC_ID_MWSC,         MKTAG('M', 'W', 'S', 'C') },
+    { AV_CODEC_ID_WCMV,         MKTAG('W', 'C', 'M', 'V') },
+    { AV_CODEC_ID_RASC,         MKTAG('R', 'A', 'S', 'C') },
+    { AV_CODEC_ID_HYMT,         MKTAG('H', 'Y', 'M', 'T') },
+    { AV_CODEC_ID_ARBC,         MKTAG('A', 'R', 'B', 'C') },
+    { AV_CODEC_ID_AGM,          MKTAG('A', 'G', 'M', '0') },
+    { AV_CODEC_ID_AGM,          MKTAG('A', 'G', 'M', '1') },
+    { AV_CODEC_ID_AGM,          MKTAG('A', 'G', 'M', '2') },
+    { AV_CODEC_ID_AGM,          MKTAG('A', 'G', 'M', '3') },
+    { AV_CODEC_ID_AGM,          MKTAG('A', 'G', 'M', '4') },
+    { AV_CODEC_ID_AGM,          MKTAG('A', 'G', 'M', '5') },
+    { AV_CODEC_ID_AGM,          MKTAG('A', 'G', 'M', '6') },
+    { AV_CODEC_ID_AGM,          MKTAG('A', 'G', 'M', '7') },
+    { AV_CODEC_ID_LSCR,         MKTAG('L', 'S', 'C', 'R') },
+    { AV_CODEC_ID_IMM5,         MKTAG('I', 'M', 'M', '5') },
+    { AV_CODEC_ID_MVDV,         MKTAG('M', 'V', 'D', 'V') },
+    { AV_CODEC_ID_MVHA,         MKTAG('M', 'V', 'H', 'A') },
+    { AV_CODEC_ID_MV30,         MKTAG('M', 'V', '3', '0') },
+    { AV_CODEC_ID_NOTCHLC,      MKTAG('n', 'l', 'c', '1') },
+    { AV_CODEC_ID_VQC,          MKTAG('V', 'Q', 'C', '1') },
+    { AV_CODEC_ID_VQC,          MKTAG('V', 'Q', 'C', '2') },
+    { AV_CODEC_ID_RTV1,         MKTAG('R', 'T', 'V', '1') },
+    { AV_CODEC_ID_VMIX,         MKTAG('V', 'M', 'X', '1') },
+    { AV_CODEC_ID_LEAD,         MKTAG('L', 'E', 'A', 'D') },
+    { AV_CODEC_ID_EVC,          MKTAG('e', 'v', 'c', '1') },
+    { AV_CODEC_ID_RV60,         MKTAG('R', 'V', '6', '0') },
+    { AV_CODEC_ID_NONE,         0 }
+};
+
+const AVCodecTag ff_codec_bmp_tags_unofficial[] = {
+    { AV_CODEC_ID_HEVC,         MKTAG('H', 'E', 'V', 'C') },
+    { AV_CODEC_ID_HEVC,         MKTAG('H', '2', '6', '5') },
     { AV_CODEC_ID_NONE,         0 }
 };
 
@@ -379,6 +533,7 @@ const AVCodecTag ff_codec_wav_tags[] = {
     { AV_CODEC_ID_PCM_U8,          0x0001 },
     { AV_CODEC_ID_PCM_S24LE,       0x0001 },
     { AV_CODEC_ID_PCM_S32LE,       0x0001 },
+    { AV_CODEC_ID_PCM_S64LE,       0x0001 },
     { AV_CODEC_ID_ADPCM_MS,        0x0002 },
     { AV_CODEC_ID_PCM_F32LE,       0x0003 },
     /* must come after f32le in this list */
@@ -389,7 +544,7 @@ const AVCodecTag ff_codec_wav_tags[] = {
     { AV_CODEC_ID_ADPCM_IMA_OKI,   0x0010 },
     { AV_CODEC_ID_ADPCM_IMA_WAV,   0x0011 },
     /* must come after adpcm_ima_wav in this list */
-    { AV_CODEC_ID_PCM_ZORK,        0x0011 },
+    { AV_CODEC_ID_ADPCM_ZORK,      0x0011 },
     { AV_CODEC_ID_ADPCM_IMA_OKI,   0x0017 },
     { AV_CODEC_ID_ADPCM_YAMAHA,    0x0020 },
     { AV_CODEC_ID_TRUESPEECH,      0x0022 },
@@ -398,6 +553,9 @@ const AVCodecTag ff_codec_wav_tags[] = {
     { AV_CODEC_ID_AMR_NB,          0x0038 },  /* rogue format number */
     { AV_CODEC_ID_G723_1,          0x0042 },
     { AV_CODEC_ID_ADPCM_G726,      0x0045 },
+    { AV_CODEC_ID_ADPCM_G726,      0x0014 },  /* g723 Antex */
+    { AV_CODEC_ID_ADPCM_G726,      0x0040 },  /* g721 Antex */
+    { AV_CODEC_ID_G728,            0x0041 },
     { AV_CODEC_ID_MP2,             0x0050 },
     { AV_CODEC_ID_MP3,             0x0055 },
     { AV_CODEC_ID_AMR_NB,          0x0057 },
@@ -407,19 +565,28 @@ const AVCodecTag ff_codec_wav_tags[] = {
     /* rogue format number */
     { AV_CODEC_ID_ADPCM_IMA_DK3,   0x0062 },
     { AV_CODEC_ID_ADPCM_G726,      0x0064 },
-    { AV_CODEC_ID_ADPCM_IMA_WAV,   0x0069 },
+    { AV_CODEC_ID_ADPCM_IMA_XBOX,  0x0069 },
     { AV_CODEC_ID_METASOUND,       0x0075 },
     { AV_CODEC_ID_G729,            0x0083 },
     { AV_CODEC_ID_AAC,             0x00ff },
     { AV_CODEC_ID_G723_1,          0x0111 },
+    { AV_CODEC_ID_ADPCM_SANYO,     0x0125 },
     { AV_CODEC_ID_SIPR,            0x0130 },
+    { AV_CODEC_ID_ACELP_KELVIN,    0x0135 },
     { AV_CODEC_ID_WMAV1,           0x0160 },
     { AV_CODEC_ID_WMAV2,           0x0161 },
     { AV_CODEC_ID_WMAPRO,          0x0162 },
     { AV_CODEC_ID_WMALOSSLESS,     0x0163 },
+    { AV_CODEC_ID_XMA1,            0x0165 },
+    { AV_CODEC_ID_XMA2,            0x0166 },
+    { AV_CODEC_ID_FTR,             0x0180 },
     { AV_CODEC_ID_ADPCM_CT,        0x0200 },
+    { AV_CODEC_ID_DVAUDIO,         0x0215 },
+    { AV_CODEC_ID_DVAUDIO,         0x0216 },
     { AV_CODEC_ID_ATRAC3,          0x0270 },
+    { AV_CODEC_ID_MSNSIREN,        0x028E },
     { AV_CODEC_ID_ADPCM_G722,      0x028F },
+    { AV_CODEC_ID_MISC4,           0x0350 },
     { AV_CODEC_ID_IMC,             0x0401 },
     { AV_CODEC_ID_IAC,             0x0402 },
     { AV_CODEC_ID_ON2AVC,          0x0500 },
@@ -435,20 +602,36 @@ const AVCodecTag ff_codec_wav_tags[] = {
     { AV_CODEC_ID_DTS,             0x2001 },
     { AV_CODEC_ID_SONIC,           0x2048 },
     { AV_CODEC_ID_SONIC_LS,        0x2048 },
+    { AV_CODEC_ID_G729,            0x2222 },
     { AV_CODEC_ID_PCM_MULAW,       0x6c75 },
     { AV_CODEC_ID_AAC,             0x706d },
     { AV_CODEC_ID_AAC,             0x4143 },
+    { AV_CODEC_ID_FTR,             0x4180 },
     { AV_CODEC_ID_XAN_DPCM,        0x594a },
     { AV_CODEC_ID_G729,            0x729A },
+    { AV_CODEC_ID_FTR,             0x8180 },
     { AV_CODEC_ID_G723_1,          0xA100 }, /* Comverse Infosys Ltd. G723 1 */
     { AV_CODEC_ID_AAC,             0xA106 },
     { AV_CODEC_ID_SPEEX,           0xA109 },
+    { AV_CODEC_ID_G728,            0xCD02 },
     { AV_CODEC_ID_FLAC,            0xF1AC },
+    /* DFPWM does not have an assigned format tag; it uses a GUID in WAVEFORMATEX instead */
+    { AV_CODEC_ID_DFPWM,           0xFFFE },
     { AV_CODEC_ID_ADPCM_SWF,       ('S' << 8) + 'F' },
     /* HACK/FIXME: Does Vorbis in WAV/AVI have an (in)official ID? */
     { AV_CODEC_ID_VORBIS,          ('V' << 8) + 'o' },
     { AV_CODEC_ID_NONE,      0 },
 };
+
+#if CONFIG_AVI_MUXER || CONFIG_WTV_MUXER
+const AVCodecTag *const ff_riff_codec_tags_list[] = {
+    ff_codec_bmp_tags, ff_codec_wav_tags, NULL
+};
+#endif
+
+#if CONFIG_WAV_DEMUXER || CONFIG_WAV_MUXER || CONFIG_W64_DEMUXER || CONFIG_W64_MUXER
+const AVCodecTag *const ff_wav_codec_tags_list[] = { ff_codec_wav_tags, NULL };
+#endif
 
 const AVMetadataConv ff_riff_info_conv[] = {
     { "IART", "artist"     },
@@ -480,7 +663,10 @@ const struct AVCodecTag *avformat_get_riff_audio_tags(void)
 const AVCodecGuid ff_codec_wav_guids[] = {
     { AV_CODEC_ID_AC3,      { 0x2C, 0x80, 0x6D, 0xE0, 0x46, 0xDB, 0xCF, 0x11, 0xB4, 0xD1, 0x00, 0x80, 0x5F, 0x6C, 0xBB, 0xEA } },
     { AV_CODEC_ID_ATRAC3P,  { 0xBF, 0xAA, 0x23, 0xE9, 0x58, 0xCB, 0x71, 0x44, 0xA1, 0x19, 0xFF, 0xFA, 0x01, 0xE4, 0xCE, 0x62 } },
+    { AV_CODEC_ID_ATRAC9,   { 0xD2, 0x42, 0xE1, 0x47, 0xBA, 0x36, 0x8D, 0x4D, 0x88, 0xFC, 0x61, 0x65, 0x4F, 0x8C, 0x83, 0x6C } },
     { AV_CODEC_ID_EAC3,     { 0xAF, 0x87, 0xFB, 0xA7, 0x02, 0x2D, 0xFB, 0x42, 0xA4, 0xD4, 0x05, 0xCD, 0x93, 0x84, 0x3B, 0xDD } },
     { AV_CODEC_ID_MP2,      { 0x2B, 0x80, 0x6D, 0xE0, 0x46, 0xDB, 0xCF, 0x11, 0xB4, 0xD1, 0x00, 0x80, 0x5F, 0x6C, 0xBB, 0xEA } },
+    { AV_CODEC_ID_ADPCM_AGM,{ 0x82, 0xEC, 0x1F, 0x6A, 0xCA, 0xDB, 0x19, 0x45, 0xBD, 0xE7, 0x56, 0xD3, 0xB3, 0xEF, 0x98, 0x1D } },
+    { AV_CODEC_ID_DFPWM,    { 0x3A, 0xC1, 0xFA, 0x38, 0x81, 0x1D, 0x43, 0x61, 0xA4, 0x0D, 0xCE, 0x53, 0xCA, 0x60, 0x7C, 0xD1 } },
     { AV_CODEC_ID_NONE }
 };

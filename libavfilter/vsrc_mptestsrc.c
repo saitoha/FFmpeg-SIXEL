@@ -23,13 +23,10 @@
  * MP test source, ported from MPlayer libmpcodecs/vf_test.c
  */
 
-#include "libavutil/avstring.h"
 #include "libavutil/opt.h"
-#include "libavutil/parseutils.h"
 #include "libavutil/pixdesc.h"
 #include "avfilter.h"
-#include "internal.h"
-#include "formats.h"
+#include "filters.h"
 #include "video.h"
 
 #define WIDTH 512
@@ -54,6 +51,7 @@ typedef struct MPTestContext {
     const AVClass *class;
     AVRational frame_rate;
     int64_t pts, max_pts, duration;
+    int64_t max_frames;
     int hsub, vsub;
     int test;           ///< test_type
 } MPTestContext;
@@ -61,24 +59,28 @@ typedef struct MPTestContext {
 #define OFFSET(x) offsetof(MPTestContext, x)
 #define FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM
 static const AVOption mptestsrc_options[]= {
-    { "rate",     "set video rate",     OFFSET(frame_rate), AV_OPT_TYPE_VIDEO_RATE, {.str = "25"}, 0, 0, FLAGS },
-    { "r",        "set video rate",     OFFSET(frame_rate), AV_OPT_TYPE_VIDEO_RATE, {.str = "25"}, 0, 0, FLAGS },
+    { "rate",     "set video rate",     OFFSET(frame_rate), AV_OPT_TYPE_VIDEO_RATE, {.str = "25"}, 0, INT_MAX, FLAGS },
+    { "r",        "set video rate",     OFFSET(frame_rate), AV_OPT_TYPE_VIDEO_RATE, {.str = "25"}, 0, INT_MAX, FLAGS },
     { "duration", "set video duration", OFFSET(duration), AV_OPT_TYPE_DURATION, {.i64 = -1}, -1, INT64_MAX, FLAGS },
     { "d",        "set video duration", OFFSET(duration), AV_OPT_TYPE_DURATION, {.i64 = -1}, -1, INT64_MAX, FLAGS },
 
-    { "test", "set test to perform", OFFSET(test),  AV_OPT_TYPE_INT,   {.i64=TEST_ALL}, 0, INT_MAX, FLAGS, "test" },
-    { "t",    "set test to perform", OFFSET(test),  AV_OPT_TYPE_INT,   {.i64=TEST_ALL}, 0, INT_MAX, FLAGS, "test" },
-        { "dc_luma",     "", 0, AV_OPT_TYPE_CONST, {.i64=TEST_DC_LUMA},     INT_MIN, INT_MAX, FLAGS, "test" },
-        { "dc_chroma",   "", 0, AV_OPT_TYPE_CONST, {.i64=TEST_DC_CHROMA},   INT_MIN, INT_MAX, FLAGS, "test" },
-        { "freq_luma",   "", 0, AV_OPT_TYPE_CONST, {.i64=TEST_FREQ_LUMA},   INT_MIN, INT_MAX, FLAGS, "test" },
-        { "freq_chroma", "", 0, AV_OPT_TYPE_CONST, {.i64=TEST_FREQ_CHROMA}, INT_MIN, INT_MAX, FLAGS, "test" },
-        { "amp_luma",    "", 0, AV_OPT_TYPE_CONST, {.i64=TEST_AMP_LUMA},    INT_MIN, INT_MAX, FLAGS, "test" },
-        { "amp_chroma",  "", 0, AV_OPT_TYPE_CONST, {.i64=TEST_AMP_CHROMA},  INT_MIN, INT_MAX, FLAGS, "test" },
-        { "cbp",         "", 0, AV_OPT_TYPE_CONST, {.i64=TEST_CBP},         INT_MIN, INT_MAX, FLAGS, "test" },
-        { "mv",          "", 0, AV_OPT_TYPE_CONST, {.i64=TEST_MV},          INT_MIN, INT_MAX, FLAGS, "test" },
-        { "ring1",       "", 0, AV_OPT_TYPE_CONST, {.i64=TEST_RING1},       INT_MIN, INT_MAX, FLAGS, "test" },
-        { "ring2",       "", 0, AV_OPT_TYPE_CONST, {.i64=TEST_RING2},       INT_MIN, INT_MAX, FLAGS, "test" },
-        { "all",         "", 0, AV_OPT_TYPE_CONST, {.i64=TEST_ALL},         INT_MIN, INT_MAX, FLAGS, "test" },
+    { "test", "set test to perform", OFFSET(test),  AV_OPT_TYPE_INT,   {.i64=TEST_ALL}, 0, INT_MAX, FLAGS, .unit = "test" },
+    { "t",    "set test to perform", OFFSET(test),  AV_OPT_TYPE_INT,   {.i64=TEST_ALL}, 0, INT_MAX, FLAGS, .unit = "test" },
+        { "dc_luma",     "", 0, AV_OPT_TYPE_CONST, {.i64=TEST_DC_LUMA},     INT_MIN, INT_MAX, FLAGS, .unit = "test" },
+        { "dc_chroma",   "", 0, AV_OPT_TYPE_CONST, {.i64=TEST_DC_CHROMA},   INT_MIN, INT_MAX, FLAGS, .unit = "test" },
+        { "freq_luma",   "", 0, AV_OPT_TYPE_CONST, {.i64=TEST_FREQ_LUMA},   INT_MIN, INT_MAX, FLAGS, .unit = "test" },
+        { "freq_chroma", "", 0, AV_OPT_TYPE_CONST, {.i64=TEST_FREQ_CHROMA}, INT_MIN, INT_MAX, FLAGS, .unit = "test" },
+        { "amp_luma",    "", 0, AV_OPT_TYPE_CONST, {.i64=TEST_AMP_LUMA},    INT_MIN, INT_MAX, FLAGS, .unit = "test" },
+        { "amp_chroma",  "", 0, AV_OPT_TYPE_CONST, {.i64=TEST_AMP_CHROMA},  INT_MIN, INT_MAX, FLAGS, .unit = "test" },
+        { "cbp",         "", 0, AV_OPT_TYPE_CONST, {.i64=TEST_CBP},         INT_MIN, INT_MAX, FLAGS, .unit = "test" },
+        { "mv",          "", 0, AV_OPT_TYPE_CONST, {.i64=TEST_MV},          INT_MIN, INT_MAX, FLAGS, .unit = "test" },
+        { "ring1",       "", 0, AV_OPT_TYPE_CONST, {.i64=TEST_RING1},       INT_MIN, INT_MAX, FLAGS, .unit = "test" },
+        { "ring2",       "", 0, AV_OPT_TYPE_CONST, {.i64=TEST_RING2},       INT_MIN, INT_MAX, FLAGS, .unit = "test" },
+        { "all",         "", 0, AV_OPT_TYPE_CONST, {.i64=TEST_ALL},         INT_MIN, INT_MAX, FLAGS, .unit = "test" },
+    { "max_frames", "Set the maximum number of frames generated for each test", OFFSET(max_frames),
+        AV_OPT_TYPE_INT64, {.i64 = 30}, 1, INT64_MAX, FLAGS },
+    { "m",          "Set the maximum number of frames generated for each test", OFFSET(max_frames),
+        AV_OPT_TYPE_INT64, {.i64 = 30}, 1, INT64_MAX, FLAGS },
     { NULL }
 };
 
@@ -121,7 +123,7 @@ static void idct(uint8_t *dst, int dst_linesize, int src[64])
             for (k = 0; k < 8; k++)
                 sum += c[k*8+i]*tmp[8*k+j];
 
-            dst[dst_linesize*i + j] = av_clip_uint8((int)floor(sum+0.5));
+            dst[dst_linesize*i + j] = av_clip_uint8(lrint(sum));
         }
     }
 }
@@ -240,7 +242,7 @@ static void ring2_test(uint8_t *dst, int dst_linesize, int off)
 
     for (y = 0; y < 16*16; y++) {
         for (x = 0; x < 16*16; x++) {
-            double d = sqrt((x-8*16)*(x-8*16) + (y-8*16)*(y-8*16));
+            double d = hypot(x-8*16, y-8*16);
             double r = d/20 - (int)(d/20);
             if (r < off/30.0) {
                 dst[x + y*dst_linesize]     = 255;
@@ -272,6 +274,7 @@ static av_cold int init(AVFilterContext *ctx)
 static int config_props(AVFilterLink *outlink)
 {
     AVFilterContext *ctx = outlink->src;
+    FilterLink *l = ff_filter_link(outlink);
     MPTestContext *test = ctx->priv;
     const AVPixFmtDescriptor *pix_desc = av_pix_fmt_desc_get(outlink->format);
 
@@ -281,29 +284,20 @@ static int config_props(AVFilterLink *outlink)
     outlink->w = WIDTH;
     outlink->h = HEIGHT;
     outlink->time_base = av_inv_q(test->frame_rate);
+    l->frame_rate = test->frame_rate;
 
     return 0;
 }
 
-static int query_formats(AVFilterContext *ctx)
-{
-    static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_YUV420P, AV_PIX_FMT_NONE
-    };
-
-    AVFilterFormats *fmts_list = ff_make_format_list(pix_fmts);
-    if (!fmts_list)
-        return AVERROR(ENOMEM);
-    return ff_set_common_formats(ctx, fmts_list);
-}
-
 static int request_frame(AVFilterLink *outlink)
 {
+    FilterLink *outl = ff_filter_link(outlink);
     MPTestContext *test = outlink->src->priv;
     AVFrame *picref;
     int w = WIDTH, h = HEIGHT,
-        cw = FF_CEIL_RSHIFT(w, test->hsub), ch = FF_CEIL_RSHIFT(h, test->vsub);
-    unsigned int frame = outlink->frame_count;
+        cw = AV_CEIL_RSHIFT(w, test->hsub), ch = AV_CEIL_RSHIFT(h, test->vsub);
+    uint64_t frame = outl->frame_count_in / test->max_frames;
+    uint64_t mod = outl->frame_count_in % test->max_frames;
     enum test_type tt = test->test;
     int i;
 
@@ -313,6 +307,7 @@ static int request_frame(AVFilterLink *outlink)
     if (!picref)
         return AVERROR(ENOMEM);
     picref->pts = test->pts++;
+    picref->duration = 1;
 
     // clean image
     for (i = 0; i < h; i++)
@@ -322,20 +317,20 @@ static int request_frame(AVFilterLink *outlink)
         memset(picref->data[2] + i*picref->linesize[2], 128, cw);
     }
 
-    if (tt == TEST_ALL && frame%30) /* draw a black frame at the beginning of each test */
-        tt = (frame/30)%(TEST_NB-1);
+    if (tt == TEST_ALL && mod) /* draw a black frame at the beginning of each test */
+        tt = frame%(TEST_NB-1);
 
     switch (tt) {
-    case TEST_DC_LUMA:       dc_test(picref->data[0], picref->linesize[0], 256, 256, frame%30); break;
-    case TEST_DC_CHROMA:     dc_test(picref->data[1], picref->linesize[1], 256, 256, frame%30); break;
-    case TEST_FREQ_LUMA:   freq_test(picref->data[0], picref->linesize[0], frame%30); break;
-    case TEST_FREQ_CHROMA: freq_test(picref->data[1], picref->linesize[1], frame%30); break;
-    case TEST_AMP_LUMA:     amp_test(picref->data[0], picref->linesize[0], frame%30); break;
-    case TEST_AMP_CHROMA:   amp_test(picref->data[1], picref->linesize[1], frame%30); break;
-    case TEST_CBP:          cbp_test(picref->data   , picref->linesize   , frame%30); break;
-    case TEST_MV:            mv_test(picref->data[0], picref->linesize[0], frame%30); break;
-    case TEST_RING1:      ring1_test(picref->data[0], picref->linesize[0], frame%30); break;
-    case TEST_RING2:      ring2_test(picref->data[0], picref->linesize[0], frame%30); break;
+    case TEST_DC_LUMA:       dc_test(picref->data[0], picref->linesize[0], 256, 256, mod); break;
+    case TEST_DC_CHROMA:     dc_test(picref->data[1], picref->linesize[1], 256, 256, mod); break;
+    case TEST_FREQ_LUMA:   freq_test(picref->data[0], picref->linesize[0], mod); break;
+    case TEST_FREQ_CHROMA: freq_test(picref->data[1], picref->linesize[1], mod); break;
+    case TEST_AMP_LUMA:     amp_test(picref->data[0], picref->linesize[0], mod); break;
+    case TEST_AMP_CHROMA:   amp_test(picref->data[1], picref->linesize[1], mod); break;
+    case TEST_CBP:          cbp_test(picref->data   , picref->linesize   , mod); break;
+    case TEST_MV:            mv_test(picref->data[0], picref->linesize[0], mod); break;
+    case TEST_RING1:      ring1_test(picref->data[0], picref->linesize[0], mod); break;
+    case TEST_RING2:      ring2_test(picref->data[0], picref->linesize[0], mod); break;
     }
 
     return ff_filter_frame(outlink, picref);
@@ -348,16 +343,15 @@ static const AVFilterPad mptestsrc_outputs[] = {
         .request_frame = request_frame,
         .config_props  = config_props,
     },
-    { NULL }
 };
 
-AVFilter ff_vsrc_mptestsrc = {
-    .name          = "mptestsrc",
-    .description   = NULL_IF_CONFIG_SMALL("Generate various test pattern."),
+const FFFilter ff_vsrc_mptestsrc = {
+    .p.name        = "mptestsrc",
+    .p.description = NULL_IF_CONFIG_SMALL("Generate various test pattern."),
+    .p.priv_class  = &mptestsrc_class,
+    .p.inputs      = NULL,
     .priv_size     = sizeof(MPTestContext),
-    .priv_class    = &mptestsrc_class,
     .init          = init,
-    .query_formats = query_formats,
-    .inputs        = NULL,
-    .outputs       = mptestsrc_outputs,
+    FILTER_OUTPUTS(mptestsrc_outputs),
+    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_YUV420P),
 };

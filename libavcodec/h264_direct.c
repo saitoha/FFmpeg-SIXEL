@@ -21,29 +21,39 @@
 
 /**
  * @file
- * H.264 / AVC / MPEG4 part10 direct mb/block decoding.
+ * H.264 / AVC / MPEG-4 part10 direct mb/block decoding.
  * @author Michael Niedermayer <michaelni@gmx.at>
  */
 
-#include "internal.h"
 #include "avcodec.h"
-#include "h264.h"
+#include "h264dec.h"
+#include "h264_ps.h"
 #include "mpegutils.h"
 #include "rectangle.h"
-#include "thread.h"
+#include "threadframe.h"
 
 #include <assert.h>
 
-static int get_scale_factor(H264SliceContext *sl,
+static int get_scale_factor(const H264SliceContext *sl,
                             int poc, int poc1, int i)
 {
     int poc0 = sl->ref_list[0][i].poc;
-    int td = av_clip_int8(poc1 - poc0);
+    int64_t pocdiff = poc1 - (int64_t)poc0;
+    int td = av_clip_int8(pocdiff);
+
+    if (pocdiff != (int)pocdiff)
+        avpriv_request_sample(sl->h264->avctx, "pocdiff overflow");
+
     if (td == 0 || sl->ref_list[0][i].parent->long_ref) {
         return 256;
     } else {
-        int tb = av_clip_int8(poc - poc0);
+        int64_t pocdiff0 = poc - (int64_t)poc0;
+        int tb = av_clip_int8(pocdiff0);
         int tx = (16384 + (FFABS(td) >> 1)) / td;
+
+        if (pocdiff0 != (int)pocdiff0)
+            av_log(sl->h264->avctx, AV_LOG_DEBUG, "pocdiff0 overflow\n");
+
         return av_clip_intp2((tb * tx + 32) >> 6, 10);
     }
 }
@@ -73,7 +83,7 @@ static void fill_colmap(const H264Context *h, H264SliceContext *sl,
                         int map[2][16 + 32], int list,
                         int field, int colfield, int mbafi)
 {
-    H264Picture *const ref1 = sl->ref_list[1][0].parent;
+    const H264Picture *const ref1 = sl->ref_list[1][0].parent;
     int j, old_ref, rfield;
     int start  = mbafi ? 16                       : 0;
     int end    = mbafi ? 16 + 2 * sl->ref_count[0] : sl->ref_count[0];
@@ -127,7 +137,11 @@ void ff_h264_direct_ref_list_init(const H264Context *const h, H264SliceContext *
         memcpy(cur->ref_poc[1],   cur->ref_poc[0],   sizeof(cur->ref_poc[0]));
     }
 
-    cur->mbaff = FRAME_MBAFF(h);
+    if (h->current_slice == 0) {
+        cur->mbaff = FRAME_MBAFF(h);
+    } else {
+        av_assert0(cur->mbaff == FRAME_MBAFF(h));
+    }
 
     sl->col_fieldoff = 0;
 
@@ -136,9 +150,13 @@ void ff_h264_direct_ref_list_init(const H264Context *const h, H264SliceContext *
 
     if (h->picture_structure == PICT_FRAME) {
         int cur_poc  = h->cur_pic_ptr->poc;
-        int *col_poc = sl->ref_list[1][0].parent->field_poc;
-        sl->col_parity = (FFABS(col_poc[0] - cur_poc) >=
-                          FFABS(col_poc[1] - cur_poc));
+        const int *col_poc = sl->ref_list[1][0].parent->field_poc;
+        if (col_poc[0] == INT_MAX && col_poc[1] == INT_MAX) {
+            av_log(h->avctx, AV_LOG_ERROR, "co located POCs unavailable\n");
+            sl->col_parity = 1;
+        } else
+            sl->col_parity = (FFABS(col_poc[0] - (int64_t)cur_poc) >=
+                              FFABS(col_poc[1] - (int64_t)cur_poc));
         ref1sidx =
         sidx     = sl->col_parity;
     // FL -> FL & differ parity
@@ -311,7 +329,7 @@ single_col:
                 *mb_type |= MB_TYPE_DIRECT2 |
                             (mb_type_col[0] & (MB_TYPE_16x8 | MB_TYPE_8x16));
             } else {
-                if (!h->sps.direct_8x8_inference_flag) {
+                if (!h->ps.sps->direct_8x8_inference_flag) {
                     /* FIXME: Save sub mb types from previous frames (or derive
                      * from MVs) so we know exactly what block size to use. */
                     sub_mb_type += (MB_TYPE_8x8 - MB_TYPE_16x16); /* B_SUB_4x4 */
@@ -534,7 +552,7 @@ single_col:
                 *mb_type |= MB_TYPE_L0L1 | MB_TYPE_DIRECT2 |
                             (mb_type_col[0] & (MB_TYPE_16x8 | MB_TYPE_8x16));
             } else {
-                if (!h->sps.direct_8x8_inference_flag) {
+                if (!h->ps.sps->direct_8x8_inference_flag) {
                     /* FIXME: save sub mb types from previous frames (or derive
                      * from MVs) so we know exactly what block size to use */
                     sub_mb_type = MB_TYPE_8x8 | MB_TYPE_P0L0 | MB_TYPE_P0L1 |
@@ -575,7 +593,7 @@ single_col:
 
         if (IS_INTERLACED(*mb_type) != IS_INTERLACED(mb_type_col[0])) {
             int y_shift = 2 * !IS_INTERLACED(*mb_type);
-            assert(h->sps.direct_8x8_inference_flag);
+            assert(h->ps.sps->direct_8x8_inference_flag);
 
             for (i8 = 0; i8 < 4; i8++) {
                 const int x8 = i8 & 1;
@@ -609,7 +627,7 @@ single_col:
 
                 {
                     const int16_t *mv_col = l1mv[x8 * 3 + y8 * b4_stride];
-                    int my_col            = (mv_col[1] << y_shift) / 2;
+                    int my_col            = (mv_col[1] * (1 << y_shift)) / 2;
                     int mx                = (scale * mv_col[0] + 128) >> 8;
                     int my                = (scale * my_col    + 128) >> 8;
                     fill_rectangle(&sl->mv_cache[0][scan8[i8 * 4]], 2, 2, 8,

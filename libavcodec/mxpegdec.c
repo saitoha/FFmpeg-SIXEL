@@ -25,7 +25,9 @@
  * MxPEG decoder
  */
 
-#include "internal.h"
+#include "libavutil/mem.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include "mjpeg.h"
 #include "mjpegdec.h"
 
@@ -45,10 +47,8 @@ typedef struct MXpegDecodeContext {
 static av_cold int mxpeg_decode_end(AVCodecContext *avctx)
 {
     MXpegDecodeContext *s = avctx->priv_data;
-    MJpegDecodeContext *jpg = &s->jpg;
     int i;
 
-    jpg->picture_ptr = NULL;
     ff_mjpeg_decode_end(avctx);
 
     for (i = 0; i < 2; ++i)
@@ -67,10 +67,8 @@ static av_cold int mxpeg_decode_init(AVCodecContext *avctx)
 
     s->picture[0] = av_frame_alloc();
     s->picture[1] = av_frame_alloc();
-    if (!s->picture[0] || !s->picture[1]) {
-        mxpeg_decode_end(avctx);
+    if (!s->picture[0] || !s->picture[1])
         return AVERROR(ENOMEM);
-    }
 
     s->jpg.picture_ptr      = s->picture[0];
     return ff_mjpeg_decode_init(avctx);
@@ -181,9 +179,8 @@ static int mxpeg_check_dimensions(MXpegDecodeContext *s, MJpegDecodeContext *jpg
     return 0;
 }
 
-static int mxpeg_decode_frame(AVCodecContext *avctx,
-                          void *data, int *got_frame,
-                          AVPacket *avpkt)
+static int mxpeg_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
+                              int *got_frame, AVPacket *avpkt)
 {
     const uint8_t *buf = avpkt->data;
     int buf_size = avpkt->size;
@@ -195,10 +192,14 @@ static int mxpeg_decode_frame(AVCodecContext *avctx,
     int start_code;
     int ret;
 
+    if (avctx->skip_frame == AVDISCARD_ALL)
+        return AVERROR_PATCHWELCOME;
+
     buf_ptr = buf;
     buf_end = buf + buf_size;
     jpg->got_picture = 0;
     s->got_mxm_bitmask = 0;
+    s->got_sof_data = !!s->got_sof_data;
     while (buf_ptr < buf_end) {
         start_code = ff_mjpeg_find_marker(jpg, &buf_ptr, buf_end,
                                           &unescaped_buf_ptr, &unescaped_buf_size);
@@ -241,19 +242,25 @@ static int mxpeg_decode_frame(AVCodecContext *avctx,
                     return ret;
                 break;
             case SOF0:
-                s->got_sof_data = 0;
+                if (s->got_sof_data > 1) {
+                    av_log(avctx, AV_LOG_ERROR,
+                           "Multiple SOF in a frame\n");
+                    return AVERROR_INVALIDDATA;
+                }
                 ret = ff_mjpeg_decode_sof(jpg);
                 if (ret < 0) {
                     av_log(avctx, AV_LOG_ERROR,
                            "SOF data decode error\n");
+                    s->got_sof_data = 0;
                     return ret;
                 }
                 if (jpg->interlaced) {
                     av_log(avctx, AV_LOG_ERROR,
                            "Interlaced mode not supported in MxPEG\n");
+                    s->got_sof_data = 0;
                     return AVERROR(EINVAL);
                 }
-                s->got_sof_data = 1;
+                s->got_sof_data ++;
                 break;
             case SOS:
                 if (!s->got_sof_data) {
@@ -278,11 +285,11 @@ static int mxpeg_decode_frame(AVCodecContext *avctx,
                                              AV_GET_BUFFER_FLAG_REF)) < 0)
                         return ret;
                     jpg->picture_ptr->pict_type = AV_PICTURE_TYPE_P;
-                    jpg->picture_ptr->key_frame = 0;
+                    jpg->picture_ptr->flags &= ~AV_FRAME_FLAG_KEY;
                     jpg->got_picture = 1;
                 } else {
                     jpg->picture_ptr->pict_type = AV_PICTURE_TYPE_I;
-                    jpg->picture_ptr->key_frame = 1;
+                    jpg->picture_ptr->flags |= AV_FRAME_FLAG_KEY;
                 }
 
                 if (s->got_mxm_bitmask) {
@@ -315,7 +322,7 @@ static int mxpeg_decode_frame(AVCodecContext *avctx,
 
 the_end:
     if (jpg->got_picture) {
-        int ret = av_frame_ref(data, jpg->picture_ptr);
+        int ret = av_frame_ref(rframe, jpg->picture_ptr);
         if (ret < 0)
             return ret;
         *got_frame = 1;
@@ -334,16 +341,16 @@ the_end:
     return buf_ptr - buf;
 }
 
-AVCodec ff_mxpeg_decoder = {
-    .name           = "mxpeg",
-    .long_name      = NULL_IF_CONFIG_SMALL("Mobotix MxPEG video"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_MXPEG,
+const FFCodec ff_mxpeg_decoder = {
+    .p.name         = "mxpeg",
+    CODEC_LONG_NAME("Mobotix MxPEG video"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_MXPEG,
     .priv_data_size = sizeof(MXpegDecodeContext),
     .init           = mxpeg_decode_init,
     .close          = mxpeg_decode_end,
-    .decode         = mxpeg_decode_frame,
-    .capabilities   = CODEC_CAP_DR1,
-    .max_lowres     = 3,
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE,
+    FF_CODEC_DECODE_CB(mxpeg_decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1,
+    .p.max_lowres   = 3,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };

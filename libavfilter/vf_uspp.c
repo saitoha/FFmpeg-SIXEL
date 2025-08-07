@@ -29,31 +29,43 @@
 
 #include "libavutil/avassert.h"
 #include "libavutil/imgutils.h"
+#include "libavutil/mem.h"
+#include "libavutil/mem_internal.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
-#include "internal.h"
+#include "libavutil/video_enc_params.h"
+#include "libavcodec/avcodec.h"
+
+#include "filters.h"
+#include "qp_table.h"
 #include "avfilter.h"
+#include "video.h"
 
 #define MAX_LEVEL 8 /* quality levels */
 #define BLOCK 16
 
-typedef struct {
+typedef struct USPPContext {
     const AVClass *av_class;
     int log2_count;
+    int count;
     int hsub, vsub;
     int qp;
-    int qscale_type;
+    char *codec_name;
+    enum AVVideoEncParamsType qscale_type;
     int temp_stride[3];
     uint8_t *src[3];
     uint16_t *temp[3];
     int outbuf_size;
     uint8_t *outbuf;
     AVCodecContext *avctx_enc[BLOCK*BLOCK];
-    AVFrame *frame;
-    AVFrame *frame_dec;
-    uint8_t *non_b_qp_table;
-    int non_b_qp_alloc_size;
+    AVCodecContext *avctx_dec[BLOCK*BLOCK];
+    AVPacket *pkt            [BLOCK*BLOCK];
+    AVFrame *frame           [BLOCK*BLOCK];
+    AVFrame *frame_dec       [BLOCK*BLOCK];
+    int8_t *non_b_qp_table;
+    int non_b_qp_stride;
     int use_bframe_qp;
+    int quality;
 } USPPContext;
 
 #define OFFSET(x) offsetof(USPPContext, x)
@@ -61,7 +73,8 @@ typedef struct {
 static const AVOption uspp_options[] = {
     { "quality",       "set quality",                          OFFSET(log2_count),    AV_OPT_TYPE_INT, {.i64 = 3}, 0, MAX_LEVEL, FLAGS },
     { "qp",            "force a constant quantizer parameter", OFFSET(qp),            AV_OPT_TYPE_INT, {.i64 = 0}, 0, 63,        FLAGS },
-    { "use_bframe_qp", "use B-frames' QP",                     OFFSET(use_bframe_qp), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 1,         FLAGS },
+    { "use_bframe_qp", "use B-frames' QP",                     OFFSET(use_bframe_qp), AV_OPT_TYPE_BOOL,{.i64 = 0}, 0, 1,         FLAGS },
+    { "codec",         "Codec name",                           OFFSET(codec_name),    AV_OPT_TYPE_STRING, {.str = "snow"}, 0, 0, FLAGS },
     { NULL }
 };
 
@@ -180,17 +193,101 @@ static void store_slice_c(uint8_t *dst, const uint16_t *src,
     }
 }
 
-static void filter(USPPContext *p, uint8_t *dst[3], uint8_t *src[3],
+static int filter_1phase(AVFilterContext *ctx, void *arg, int i, int nb_jobs)
+{
+    USPPContext *p = ctx->priv;
+    int ret, x, y;
+    int width  = ctx->inputs[0]->w;
+    int height = ctx->inputs[0]->h;
+
+    const int x1 = offset[i+nb_jobs-1][0];
+    const int y1 = offset[i+nb_jobs-1][1];
+    const int x1c = x1 >> p->hsub;
+    const int y1c = y1 >> p->vsub;
+    const int BLOCKc = BLOCK >> p->hsub;
+    int offset;
+    AVPacket *pkt = p->pkt[i];
+
+    av_packet_unref(pkt);
+    pkt->data = p->outbuf;
+    pkt->size = p->outbuf_size;
+
+    p->frame[i]->linesize[0] = p->temp_stride[0];
+    p->frame[i]->linesize[1] = p->temp_stride[1];
+    p->frame[i]->linesize[2] = p->temp_stride[2];
+    p->frame[i]->height = height + BLOCK;
+    p->frame[i]->width  = width + BLOCK;
+    p->frame[i]->data[0] = p->src[0] + x1   + y1   * p->frame[i]->linesize[0];
+    p->frame[i]->data[1] = p->src[1] + x1c  + y1c  * p->frame[i]->linesize[1];
+    p->frame[i]->data[2] = p->src[2] + x1c  + y1c  * p->frame[i]->linesize[2];
+    p->frame[i]->format  = p->avctx_enc[i]->pix_fmt;
+    p->frame[i]->quality = p->quality;
+
+    ret = avcodec_send_frame(p->avctx_enc[i], p->frame[i]);
+    if (ret < 0) {
+        av_log(p->avctx_enc[i], AV_LOG_ERROR, "Error sending a frame for encoding\n");
+        return ret;
+    }
+    ret = avcodec_receive_packet(p->avctx_enc[i], pkt);
+    if (ret < 0) {
+        av_log(p->avctx_enc[i], AV_LOG_ERROR, "Error receiving a packet from encoding\n");
+        return ret;
+    }
+
+    if (p->avctx_enc[i]->flags & AV_CODEC_FLAG_RECON_FRAME) {
+        av_packet_unref(pkt);
+        ret = avcodec_receive_frame(p->avctx_enc[i], p->frame_dec[i]);
+        if (ret < 0) {
+            av_log(p->avctx_dec[i], AV_LOG_ERROR, "Error receiving a frame from encoding\n");
+            return ret;
+        }
+    } else {
+        ret = avcodec_send_packet(p->avctx_dec[i], pkt);
+        av_packet_unref(pkt);
+        if (ret < 0) {
+            av_log(p->avctx_dec[i], AV_LOG_ERROR, "Error sending a packet for decoding\n");
+            return ret;
+        }
+        ret = avcodec_receive_frame(p->avctx_dec[i], p->frame_dec[i]);
+        if (ret < 0) {
+            av_log(p->avctx_dec[i], AV_LOG_ERROR, "Error receiving a frame from decoding\n");
+            return ret;
+        }
+    }
+
+    offset = (BLOCK-x1) + (BLOCK-y1) * p->frame_dec[i]->linesize[0];
+
+    for (y = 0; y < height; y++)
+        for (x = 0; x < width; x++)
+            p->temp[0][x + y * p->temp_stride[0]] += p->frame_dec[i]->data[0][x + y * p->frame_dec[i]->linesize[0] + offset];
+
+
+    if (!p->frame_dec[i]->data[2] || !p->temp[2])
+        return 0;
+
+    offset = (BLOCKc-x1c) + (BLOCKc-y1c) * p->frame_dec[i]->linesize[1];
+
+    for (y = 0; y < AV_CEIL_RSHIFT(height, p->vsub); y++) {
+        for (x = 0; x < AV_CEIL_RSHIFT(width, p->hsub); x++) {
+            p->temp[1][x + y * p->temp_stride[1]] += p->frame_dec[i]->data[1][x + y * p->frame_dec[i]->linesize[1] + offset];
+            p->temp[2][x + y * p->temp_stride[2]] += p->frame_dec[i]->data[2][x + y * p->frame_dec[i]->linesize[2] + offset];
+        }
+    }
+
+    return 0;
+}
+
+static void filter(AVFilterContext *ctx, uint8_t *dst[3], uint8_t *src[3],
                    int dst_stride[3], int src_stride[3], int width,
                    int height, uint8_t *qp_store, int qp_stride)
 {
+    USPPContext *p = ctx->priv;
     int x, y, i, j;
-    const int count = 1<<p->log2_count;
 
     for (i = 0; i < 3; i++) {
         int is_chroma = !!i;
-        int w = FF_CEIL_RSHIFT(width,  is_chroma ? p->hsub : 0);
-        int h = FF_CEIL_RSHIFT(height, is_chroma ? p->vsub : 0);
+        int w = AV_CEIL_RSHIFT(width,  is_chroma ? p->hsub : 0);
+        int h = AV_CEIL_RSHIFT(height, is_chroma ? p->vsub : 0);
         int stride = p->temp_stride[i];
         int block = BLOCK >> (is_chroma ? p->hsub : 0);
 
@@ -210,12 +307,11 @@ static void filter(USPPContext *p, uint8_t *dst[3], uint8_t *src[3],
             memcpy(p->src[i] + (h+block  +y) * stride, p->src[i] + (h-y+block-1) * stride, stride);
         }
 
-        p->frame->linesize[i] = stride;
         memset(p->temp[i], 0, (h + 2 * block) * stride * sizeof(int16_t));
     }
 
     if (p->qp)
-        p->frame->quality = p->qp * FF_QP2LAMBDA;
+        p->quality = p->qp * FF_QP2LAMBDA;
     else {
         int qpsum=0;
         int qpcount = (height>>4) * (height>>4);
@@ -224,81 +320,32 @@ static void filter(USPPContext *p, uint8_t *dst[3], uint8_t *src[3],
             for (x = 0; x < (width>>4); x++)
                 qpsum += qp_store[x + y * qp_stride];
         }
-        p->frame->quality = ff_norm_qscale((qpsum + qpcount/2) / qpcount, p->qscale_type) * FF_QP2LAMBDA;
+        p->quality = ff_norm_qscale((qpsum + qpcount/2) / qpcount, p->qscale_type) * FF_QP2LAMBDA;
     }
 //    init per MB qscale stuff FIXME
-    p->frame->height = height;
-    p->frame->width  = width;
 
-    for (i = 0; i < count; i++) {
-        const int x1 = offset[i+count-1][0];
-        const int y1 = offset[i+count-1][1];
-        const int x1c = x1 >> p->hsub;
-        const int y1c = y1 >> p->vsub;
-        const int BLOCKc = BLOCK >> p->hsub;
-        int offset;
-        AVPacket pkt = {0};
-        int got_pkt_ptr;
-
-        av_init_packet(&pkt);
-        pkt.data = p->outbuf;
-        pkt.size = p->outbuf_size;
-
-        p->frame->data[0] = p->src[0] + x1   + y1   * p->frame->linesize[0];
-        p->frame->data[1] = p->src[1] + x1c  + y1c  * p->frame->linesize[1];
-        p->frame->data[2] = p->src[2] + x1c  + y1c  * p->frame->linesize[2];
-        p->frame->format  = p->avctx_enc[i]->pix_fmt;
-
-        avcodec_encode_video2(p->avctx_enc[i], &pkt, p->frame, &got_pkt_ptr);
-        p->frame_dec = p->avctx_enc[i]->coded_frame;
-
-        offset = (BLOCK-x1) + (BLOCK-y1) * p->frame_dec->linesize[0];
-
-        for (y = 0; y < height; y++)
-            for (x = 0; x < width; x++)
-                p->temp[0][x + y * p->temp_stride[0]] += p->frame_dec->data[0][x + y * p->frame_dec->linesize[0] + offset];
-
-        if (!src[2] || !dst[2])
-            continue;
-
-        offset = (BLOCKc-x1c) + (BLOCKc-y1c) * p->frame_dec->linesize[1];
-
-        for (y = 0; y < FF_CEIL_RSHIFT(height, p->vsub); y++) {
-            for (x = 0; x < FF_CEIL_RSHIFT(width, p->hsub); x++) {
-                p->temp[1][x + y * p->temp_stride[1]] += p->frame_dec->data[1][x + y * p->frame_dec->linesize[1] + offset];
-                p->temp[2][x + y * p->temp_stride[2]] += p->frame_dec->data[2][x + y * p->frame_dec->linesize[2] + offset];
-            }
-        }
-    }
+    ff_filter_execute(ctx, filter_1phase, NULL, NULL, p->count);
 
     for (j = 0; j < 3; j++) {
         int is_chroma = !!j;
         if (!dst[j])
             continue;
         store_slice_c(dst[j], p->temp[j], dst_stride[j], p->temp_stride[j],
-                      FF_CEIL_RSHIFT(width,  is_chroma ? p->hsub : 0),
-                      FF_CEIL_RSHIFT(height, is_chroma ? p->vsub : 0),
+                      AV_CEIL_RSHIFT(width,  is_chroma ? p->hsub : 0),
+                      AV_CEIL_RSHIFT(height, is_chroma ? p->vsub : 0),
                       8-p->log2_count);
     }
 }
 
-static int query_formats(AVFilterContext *ctx)
-{
-    static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_YUV444P,
-        AV_PIX_FMT_YUV420P,
-        AV_PIX_FMT_YUV410P,
-        AV_PIX_FMT_YUVJ444P,
-        AV_PIX_FMT_YUVJ420P,
-        AV_PIX_FMT_GRAY8,
-        AV_PIX_FMT_NONE
-    };
-
-    AVFilterFormats *fmts_list = ff_make_format_list(pix_fmts);
-    if (!fmts_list)
-        return AVERROR(ENOMEM);
-    return ff_set_common_formats(ctx, fmts_list);
-}
+static const enum AVPixelFormat pix_fmts[] = {
+    AV_PIX_FMT_YUV444P,
+    AV_PIX_FMT_YUV420P,
+    AV_PIX_FMT_YUV410P,
+    AV_PIX_FMT_YUVJ444P,
+    AV_PIX_FMT_YUVJ420P,
+    AV_PIX_FMT_GRAY8,
+    AV_PIX_FMT_NONE
+};
 
 static int config_input(AVFilterLink *inlink)
 {
@@ -309,15 +356,20 @@ static int config_input(AVFilterLink *inlink)
     const int width  = inlink->w;
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(inlink->format);
     int i;
-
-    AVCodec *enc = avcodec_find_encoder(AV_CODEC_ID_SNOW);
+    const AVCodec *enc = avcodec_find_encoder_by_name(uspp->codec_name);
+    const AVCodec *dec = avcodec_find_decoder_by_name(uspp->codec_name);
     if (!enc) {
-        av_log(ctx, AV_LOG_ERROR, "SNOW encoder not found.\n");
+        av_log(ctx, AV_LOG_ERROR, "encoder %s not found.\n", uspp->codec_name);
+        return AVERROR(EINVAL);
+    }
+    if (!dec) {
+        av_log(ctx, AV_LOG_ERROR, "decoder %s not found.\n", uspp->codec_name);
         return AVERROR(EINVAL);
     }
 
     uspp->hsub = desc->log2_chroma_w;
     uspp->vsub = desc->log2_chroma_h;
+    uspp->count = 1<<uspp->log2_count;
 
     for (i = 0; i < 3; i++) {
         int is_chroma = !!i;
@@ -325,8 +377,8 @@ static int config_input(AVFilterLink *inlink)
         int h = (height + 4 * BLOCK-1) & (~(2 * BLOCK-1));
 
         if (is_chroma) {
-            w = FF_CEIL_RSHIFT(w, uspp->hsub);
-            h = FF_CEIL_RSHIFT(h, uspp->vsub);
+            w = AV_CEIL_RSHIFT(w, uspp->hsub);
+            h = AV_CEIL_RSHIFT(h, uspp->vsub);
         }
 
         uspp->temp_stride[i] = w;
@@ -336,8 +388,8 @@ static int config_input(AVFilterLink *inlink)
             return AVERROR(ENOMEM);
     }
 
-    for (i = 0; i < (1<<uspp->log2_count); i++) {
-        AVCodecContext *avctx_enc;
+    for (i = 0; i < uspp->count; i++) {
+        AVCodecContext *avctx_enc, *avctx_dec;
         AVDictionary *opts = NULL;
         int ret;
 
@@ -351,20 +403,42 @@ static int config_input(AVFilterLink *inlink)
         avctx_enc->gop_size = INT_MAX;
         avctx_enc->max_b_frames = 0;
         avctx_enc->pix_fmt = inlink->format;
-        avctx_enc->flags = CODEC_FLAG_QSCALE | CODEC_FLAG_LOW_DELAY;
+        avctx_enc->flags = AV_CODEC_FLAG_QSCALE | AV_CODEC_FLAG_LOW_DELAY;
+        if (enc->capabilities & AV_CODEC_CAP_ENCODER_RECON_FRAME) {
+            avctx_enc->flags |= AV_CODEC_FLAG_RECON_FRAME;
+            av_dict_set(&opts, "no_bitstream", "1", 0);
+        }
         avctx_enc->strict_std_compliance = FF_COMPLIANCE_EXPERIMENTAL;
         avctx_enc->global_quality = 123;
-        av_dict_set(&opts, "no_bitstream", "1", 0);
+        avctx_enc->thread_count = 1; // We do threading in the filter with multiple codecs
         ret = avcodec_open2(avctx_enc, enc, &opts);
+        av_dict_free(&opts);
         if (ret < 0)
             return ret;
-        av_dict_free(&opts);
         av_assert0(avctx_enc->codec);
+
+
+        if (!(enc->capabilities & AV_CODEC_CAP_ENCODER_RECON_FRAME)) {
+            if (!(uspp->avctx_dec[i] = avcodec_alloc_context3(NULL)))
+                return AVERROR(ENOMEM);
+            avctx_dec = uspp->avctx_dec[i];
+            avctx_dec->width  = avctx_enc->width;
+            avctx_dec->height = avctx_enc->height;
+            avctx_dec->thread_count = 1;
+            ret = avcodec_open2(avctx_dec, dec, NULL);
+            if (ret < 0)
+                return ret;
+        }
+
+        if (!(uspp->frame[i] = av_frame_alloc()))
+            return AVERROR(ENOMEM);
+        if (!(uspp->frame_dec[i] = av_frame_alloc()))
+            return AVERROR(ENOMEM);
+        if (!(uspp->pkt[i] = av_packet_alloc()))
+            return AVERROR(ENOMEM);
     }
 
     uspp->outbuf_size = (width + BLOCK) * (height + BLOCK) * 10;
-    if (!(uspp->frame = av_frame_alloc()))
-        return AVERROR(ENOMEM);
     if (!(uspp->outbuf = av_malloc(uspp->outbuf_size)))
         return AVERROR(ENOMEM);
 
@@ -379,45 +453,32 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     AVFrame *out = in;
 
     int qp_stride = 0;
-    uint8_t *qp_table = NULL;
+    int8_t *qp_table = NULL;
+    int ret = 0;
 
     /* if we are not in a constant user quantizer mode and we don't want to use
      * the quantizers from the B-frames (B-frames often have a higher QP), we
      * need to save the qp table from the last non B-frame; this is what the
      * following code block does */
-    if (!uspp->qp) {
-        qp_table = av_frame_get_qp_table(in, &qp_stride, &uspp->qscale_type);
+    if (!uspp->qp && (uspp->use_bframe_qp || in->pict_type != AV_PICTURE_TYPE_B)) {
+        ret = ff_qp_table_extract(in, &qp_table, &qp_stride, NULL, &uspp->qscale_type);
+        if (ret < 0) {
+            av_frame_free(&in);
+            return ret;
+        }
 
-        if (qp_table && !uspp->use_bframe_qp && in->pict_type != AV_PICTURE_TYPE_B) {
-            int w, h;
-
-            /* if the qp stride is not set, it means the QP are only defined on
-             * a line basis */
-            if (!qp_stride) {
-                w = FF_CEIL_RSHIFT(inlink->w, 4);
-                h = 1;
-            } else {
-                w = qp_stride;
-                h = FF_CEIL_RSHIFT(inlink->h, 4);
-            }
-
-            if (w * h > uspp->non_b_qp_alloc_size) {
-                int ret = av_reallocp_array(&uspp->non_b_qp_table, w, h);
-                if (ret < 0) {
-                    uspp->non_b_qp_alloc_size = 0;
-                    return ret;
-                }
-                uspp->non_b_qp_alloc_size = w * h;
-            }
-
-            av_assert0(w * h <= uspp->non_b_qp_alloc_size);
-            memcpy(uspp->non_b_qp_table, qp_table, w * h);
+        if (!uspp->use_bframe_qp && in->pict_type != AV_PICTURE_TYPE_B) {
+            av_freep(&uspp->non_b_qp_table);
+            uspp->non_b_qp_table  = qp_table;
+            uspp->non_b_qp_stride = qp_stride;
         }
     }
 
     if (uspp->log2_count && !ctx->is_disabled) {
-        if (!uspp->use_bframe_qp && uspp->non_b_qp_table)
+        if (!uspp->use_bframe_qp && uspp->non_b_qp_table) {
             qp_table = uspp->non_b_qp_table;
+            qp_stride = uspp->non_b_qp_stride;
+        }
 
         if (qp_table || uspp->qp) {
 
@@ -430,6 +491,8 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
                 out = ff_get_video_buffer(outlink, aligned_w, aligned_h);
                 if (!out) {
                     av_frame_free(&in);
+                    if (qp_table != uspp->non_b_qp_table)
+                        av_free(qp_table);
                     return AVERROR(ENOMEM);
                 }
                 av_frame_copy_props(out, in);
@@ -437,7 +500,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
                 out->height = in->height;
             }
 
-            filter(uspp, out->data, in->data, out->linesize, in->linesize,
+            filter(ctx, out->data, in->data, out->linesize, in->linesize,
                    inlink->w, inlink->h, qp_table, qp_stride);
         }
     }
@@ -449,7 +512,10 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
                                 inlink->w, inlink->h);
         av_frame_free(&in);
     }
-    return ff_filter_frame(outlink, out);
+    ret = ff_filter_frame(outlink, out);
+    if (qp_table != uspp->non_b_qp_table)
+        av_freep(&qp_table);
+    return ret;
 }
 
 static av_cold void uninit(AVFilterContext *ctx)
@@ -462,14 +528,16 @@ static av_cold void uninit(AVFilterContext *ctx)
         av_freep(&uspp->src[i]);
     }
 
-    for (i = 0; i < (1 << uspp->log2_count); i++) {
-        avcodec_close(uspp->avctx_enc[i]);
-        av_freep(&uspp->avctx_enc[i]);
+    for (i = 0; i < uspp->count; i++) {
+        avcodec_free_context(&uspp->avctx_enc[i]);
+        avcodec_free_context(&uspp->avctx_dec[i]);
+        av_frame_free(&uspp->frame[i]);
+        av_frame_free(&uspp->frame_dec[i]);
+        av_packet_free(&uspp->pkt[i]);
     }
 
     av_freep(&uspp->non_b_qp_table);
     av_freep(&uspp->outbuf);
-    av_frame_free(&uspp->frame);
 }
 
 static const AVFilterPad uspp_inputs[] = {
@@ -479,25 +547,16 @@ static const AVFilterPad uspp_inputs[] = {
         .config_props = config_input,
         .filter_frame = filter_frame,
     },
-    { NULL }
 };
 
-static const AVFilterPad uspp_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-    { NULL }
-};
-
-AVFilter ff_vf_uspp = {
-    .name            = "uspp",
-    .description     = NULL_IF_CONFIG_SMALL("Apply Ultra Simple / Slow Post-processing filter."),
+const FFFilter ff_vf_uspp = {
+    .p.name          = "uspp",
+    .p.description   = NULL_IF_CONFIG_SMALL("Apply Ultra Simple / Slow Post-processing filter."),
+    .p.priv_class    = &uspp_class,
+    .p.flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL | AVFILTER_FLAG_SLICE_THREADS,
     .priv_size       = sizeof(USPPContext),
     .uninit          = uninit,
-    .query_formats   = query_formats,
-    .inputs          = uspp_inputs,
-    .outputs         = uspp_outputs,
-    .priv_class      = &uspp_class,
-    .flags           = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL,
+    FILTER_INPUTS(uspp_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_PIXFMTS_ARRAY(pix_fmts),
 };

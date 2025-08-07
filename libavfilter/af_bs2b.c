@@ -29,8 +29,10 @@
 
 #include "audio.h"
 #include "avfilter.h"
+#include "filters.h"
 #include "formats.h"
-#include "internal.h"
+
+typedef void (*filter_func)(t_bs2bdp bs2bdp, uint8_t *sample, int n);
 
 typedef struct Bs2bContext {
     const AVClass *class;
@@ -41,18 +43,18 @@ typedef struct Bs2bContext {
 
     t_bs2bdp bs2bp;
 
-    void (*filter)(t_bs2bdp bs2bdp, uint8_t *sample, int n);
+    filter_func filter;
 } Bs2bContext;
 
 #define OFFSET(x) offsetof(Bs2bContext, x)
-#define A AV_OPT_FLAG_AUDIO_PARAM
+#define A AV_OPT_FLAG_AUDIO_PARAM | AV_OPT_FLAG_FILTERING_PARAM
 
-static const AVOption options[] = {
+static const AVOption bs2b_options[] = {
     { "profile", "Apply a pre-defined crossfeed level",
-            OFFSET(profile), AV_OPT_TYPE_INT, { .i64 = BS2B_DEFAULT_CLEVEL }, 0, INT_MAX, A, "profile" },
-        { "default", "default profile", 0, AV_OPT_TYPE_CONST, { .i64 = BS2B_DEFAULT_CLEVEL }, 0, 0, A, "profile" },
-        { "cmoy",    "Chu Moy circuit", 0, AV_OPT_TYPE_CONST, { .i64 = BS2B_CMOY_CLEVEL    }, 0, 0, A, "profile" },
-        { "jmeier",  "Jan Meier circuit", 0, AV_OPT_TYPE_CONST, { .i64 = BS2B_JMEIER_CLEVEL  }, 0, 0, A, "profile" },
+            OFFSET(profile), AV_OPT_TYPE_INT, { .i64 = BS2B_DEFAULT_CLEVEL }, 0, INT_MAX, A, .unit = "profile" },
+        { "default", "default profile", 0, AV_OPT_TYPE_CONST, { .i64 = BS2B_DEFAULT_CLEVEL }, 0, 0, A, .unit = "profile" },
+        { "cmoy",    "Chu Moy circuit", 0, AV_OPT_TYPE_CONST, { .i64 = BS2B_CMOY_CLEVEL    }, 0, 0, A, .unit = "profile" },
+        { "jmeier",  "Jan Meier circuit", 0, AV_OPT_TYPE_CONST, { .i64 = BS2B_JMEIER_CLEVEL  }, 0, 0, A, .unit = "profile" },
     { "fcut", "Set cut frequency (in Hz)",
             OFFSET(fcut), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, BS2B_MAXFCUT, A },
     { "feed", "Set feed level (in Hz)",
@@ -60,12 +62,7 @@ static const AVOption options[] = {
     { NULL },
 };
 
-static const AVClass bs2b_class = {
-    .class_name = "bs2b filter",
-    .item_name  = av_default_item_name,
-    .option     = options,
-    .version    = LIBAVUTIL_VERSION_INT,
-};
+AVFILTER_DEFINE_CLASS(bs2b);
 
 static av_cold int init(AVFilterContext *ctx)
 {
@@ -93,10 +90,14 @@ static av_cold void uninit(AVFilterContext *ctx)
         bs2b_close(bs2b->bs2bp);
 }
 
-static int query_formats(AVFilterContext *ctx)
+static int query_formats(const AVFilterContext *ctx,
+                         AVFilterFormatsConfig **cfg_in,
+                         AVFilterFormatsConfig **cfg_out)
 {
-    AVFilterFormats *formats = NULL;
-    AVFilterChannelLayouts *layouts = NULL;
+    static const AVChannelLayout layouts[] = {
+        AV_CHANNEL_LAYOUT_STEREO,
+        { .nb_channels = 0 },
+    };
 
     static const enum AVSampleFormat sample_fmts[] = {
         AV_SAMPLE_FMT_U8,
@@ -108,23 +109,15 @@ static int query_formats(AVFilterContext *ctx)
     };
     int ret;
 
-    if (ff_add_channel_layout(&layouts, AV_CH_LAYOUT_STEREO) != 0)
-        return AVERROR(ENOMEM);
-    ret = ff_set_common_channel_layouts(ctx, layouts);
+    ret = ff_set_common_channel_layouts_from_list2(ctx, cfg_in, cfg_out, layouts);
     if (ret < 0)
         return ret;
 
-    formats = ff_make_format_list(sample_fmts);
-    if (!formats)
-        return AVERROR(ENOMEM);
-    ret = ff_set_common_formats(ctx, formats);
+    ret = ff_set_common_formats_from_list2(ctx, cfg_in, cfg_out, sample_fmts);
     if (ret < 0)
         return ret;
 
-    formats = ff_all_samplerates();
-    if (!formats)
-        return AVERROR(ENOMEM);
-    return ff_set_common_samplerates(ctx, formats);
+    return 0;
 }
 
 static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
@@ -138,9 +131,11 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
     if (av_frame_is_writable(frame)) {
         out_frame = frame;
     } else {
-        out_frame = ff_get_audio_buffer(inlink, frame->nb_samples);
-        if (!out_frame)
+        out_frame = ff_get_audio_buffer(outlink, frame->nb_samples);
+        if (!out_frame) {
+            av_frame_free(&frame);
             return AVERROR(ENOMEM);
+        }
         av_frame_copy(out_frame, frame);
         ret = av_frame_copy_props(out_frame, frame);
         if (ret < 0) {
@@ -168,19 +163,19 @@ static int config_output(AVFilterLink *outlink)
 
     switch (inlink->format) {
     case AV_SAMPLE_FMT_U8:
-        bs2b->filter = bs2b_cross_feed_u8;
+        bs2b->filter = (filter_func) bs2b_cross_feed_u8;
         break;
     case AV_SAMPLE_FMT_S16:
-        bs2b->filter = (void*)bs2b_cross_feed_s16;
+        bs2b->filter = (filter_func) bs2b_cross_feed_s16;
         break;
     case AV_SAMPLE_FMT_S32:
-        bs2b->filter = (void*)bs2b_cross_feed_s32;
+        bs2b->filter = (filter_func) bs2b_cross_feed_s32;
         break;
     case AV_SAMPLE_FMT_FLT:
-        bs2b->filter = (void*)bs2b_cross_feed_f;
+        bs2b->filter = (filter_func) bs2b_cross_feed_f;
         break;
     case AV_SAMPLE_FMT_DBL:
-        bs2b->filter = (void*)bs2b_cross_feed_d;
+        bs2b->filter = (filter_func) bs2b_cross_feed_d;
         break;
     default:
         return AVERROR_BUG;
@@ -200,7 +195,6 @@ static const AVFilterPad bs2b_inputs[] = {
         .type           = AVMEDIA_TYPE_AUDIO,
         .filter_frame   = filter_frame,
     },
-    { NULL }
 };
 
 static const AVFilterPad bs2b_outputs[] = {
@@ -209,17 +203,16 @@ static const AVFilterPad bs2b_outputs[] = {
         .type           = AVMEDIA_TYPE_AUDIO,
         .config_props   = config_output,
     },
-    { NULL }
 };
 
-AVFilter ff_af_bs2b = {
-    .name           = "bs2b",
-    .description    = NULL_IF_CONFIG_SMALL("Bauer stereo-to-binaural filter."),
-    .query_formats  = query_formats,
+const FFFilter ff_af_bs2b = {
+    .p.name         = "bs2b",
+    .p.description  = NULL_IF_CONFIG_SMALL("Bauer stereo-to-binaural filter."),
+    .p.priv_class   = &bs2b_class,
     .priv_size      = sizeof(Bs2bContext),
-    .priv_class     = &bs2b_class,
     .init           = init,
     .uninit         = uninit,
-    .inputs         = bs2b_inputs,
-    .outputs        = bs2b_outputs,
+    FILTER_INPUTS(bs2b_inputs),
+    FILTER_OUTPUTS(bs2b_outputs),
+    FILTER_QUERY_FUNC2(query_formats),
 };

@@ -21,127 +21,47 @@
 
 #include "libavutil/attributes.h"
 #include "libavutil/cpu.h"
+#include "libavutil/mem_internal.h"
 #include "libavutil/x86/asm.h"
 #include "libavutil/x86/cpu.h"
 #include "libavcodec/avcodec.h"
-#include "libavcodec/dct.h"
-#include "libavcodec/mpegvideo.h"
+#include "libavcodec/mpegvideoenc.h"
 
 /* not permutated inverse zigzag_direct + 1 for MMX quantizer */
-DECLARE_ALIGNED(16, static uint16_t, inv_zigzag_direct16)[64];
+DECLARE_ALIGNED(16, static const uint16_t, inv_zigzag_direct16)[64] = {
+    1,  2,  6,  7,  15, 16, 28, 29,
+    3,  5,  8,  14, 17, 27, 30, 43,
+    4,  9,  13, 18, 26, 31, 42, 44,
+    10, 12, 19, 25, 32, 41, 45, 54,
+    11, 20, 24, 33, 40, 46, 53, 55,
+    21, 23, 34, 39, 47, 52, 56, 61,
+    22, 35, 38, 48, 51, 57, 60, 62,
+    36, 37, 49, 50, 58, 59, 63, 64,
+};
 
 #if HAVE_6REGS
 
-#if HAVE_MMX_INLINE
-#define COMPILE_TEMPLATE_MMXEXT 0
-#define COMPILE_TEMPLATE_SSE2   0
-#define COMPILE_TEMPLATE_SSSE3  0
-#define RENAME(a)      a ## _mmx
-#define RENAME_FDCT(a) a ## _mmx
-#include "mpegvideoenc_template.c"
-#endif /* HAVE_MMX_INLINE */
-
-#if HAVE_MMXEXT_INLINE
-#undef COMPILE_TEMPLATE_SSSE3
-#undef COMPILE_TEMPLATE_SSE2
-#undef COMPILE_TEMPLATE_MMXEXT
-#define COMPILE_TEMPLATE_MMXEXT 1
-#define COMPILE_TEMPLATE_SSE2   0
-#define COMPILE_TEMPLATE_SSSE3  0
-#undef RENAME
-#undef RENAME_FDCT
-#define RENAME(a)      a ## _mmxext
-#define RENAME_FDCT(a) a ## _mmxext
-#include "mpegvideoenc_template.c"
-#endif /* HAVE_MMXEXT_INLINE */
-
 #if HAVE_SSE2_INLINE
-#undef COMPILE_TEMPLATE_MMXEXT
-#undef COMPILE_TEMPLATE_SSE2
-#undef COMPILE_TEMPLATE_SSSE3
-#define COMPILE_TEMPLATE_MMXEXT 0
-#define COMPILE_TEMPLATE_SSE2   1
 #define COMPILE_TEMPLATE_SSSE3  0
-#undef RENAME
-#undef RENAME_FDCT
 #define RENAME(a)      a ## _sse2
-#define RENAME_FDCT(a) a ## _sse2
 #include "mpegvideoenc_template.c"
 #endif /* HAVE_SSE2_INLINE */
 
 #if HAVE_SSSE3_INLINE
-#undef COMPILE_TEMPLATE_MMXEXT
-#undef COMPILE_TEMPLATE_SSE2
 #undef COMPILE_TEMPLATE_SSSE3
-#define COMPILE_TEMPLATE_MMXEXT 0
-#define COMPILE_TEMPLATE_SSE2   1
 #define COMPILE_TEMPLATE_SSSE3  1
 #undef RENAME
-#undef RENAME_FDCT
 #define RENAME(a)      a ## _ssse3
-#define RENAME_FDCT(a) a ## _sse2
 #include "mpegvideoenc_template.c"
 #endif /* HAVE_SSSE3_INLINE */
 
 #endif /* HAVE_6REGS */
 
 #if HAVE_INLINE_ASM
-static void  denoise_dct_mmx(MpegEncContext *s, int16_t *block){
-    const int intra= s->mb_intra;
-    int *sum= s->dct_error_sum[intra];
-    uint16_t *offset= s->dct_offset[intra];
-
-    s->dct_count[intra]++;
-
-    __asm__ volatile(
-        "pxor %%mm7, %%mm7                      \n\t"
-        "1:                                     \n\t"
-        "pxor %%mm0, %%mm0                      \n\t"
-        "pxor %%mm1, %%mm1                      \n\t"
-        "movq (%0), %%mm2                       \n\t"
-        "movq 8(%0), %%mm3                      \n\t"
-        "pcmpgtw %%mm2, %%mm0                   \n\t"
-        "pcmpgtw %%mm3, %%mm1                   \n\t"
-        "pxor %%mm0, %%mm2                      \n\t"
-        "pxor %%mm1, %%mm3                      \n\t"
-        "psubw %%mm0, %%mm2                     \n\t"
-        "psubw %%mm1, %%mm3                     \n\t"
-        "movq %%mm2, %%mm4                      \n\t"
-        "movq %%mm3, %%mm5                      \n\t"
-        "psubusw (%2), %%mm2                    \n\t"
-        "psubusw 8(%2), %%mm3                   \n\t"
-        "pxor %%mm0, %%mm2                      \n\t"
-        "pxor %%mm1, %%mm3                      \n\t"
-        "psubw %%mm0, %%mm2                     \n\t"
-        "psubw %%mm1, %%mm3                     \n\t"
-        "movq %%mm2, (%0)                       \n\t"
-        "movq %%mm3, 8(%0)                      \n\t"
-        "movq %%mm4, %%mm2                      \n\t"
-        "movq %%mm5, %%mm3                      \n\t"
-        "punpcklwd %%mm7, %%mm4                 \n\t"
-        "punpckhwd %%mm7, %%mm2                 \n\t"
-        "punpcklwd %%mm7, %%mm5                 \n\t"
-        "punpckhwd %%mm7, %%mm3                 \n\t"
-        "paddd (%1), %%mm4                      \n\t"
-        "paddd 8(%1), %%mm2                     \n\t"
-        "paddd 16(%1), %%mm5                    \n\t"
-        "paddd 24(%1), %%mm3                    \n\t"
-        "movq %%mm4, (%1)                       \n\t"
-        "movq %%mm2, 8(%1)                      \n\t"
-        "movq %%mm5, 16(%1)                     \n\t"
-        "movq %%mm3, 24(%1)                     \n\t"
-        "add $16, %0                            \n\t"
-        "add $32, %1                            \n\t"
-        "add $16, %2                            \n\t"
-        "cmp %3, %0                             \n\t"
-            " jb 1b                             \n\t"
-        : "+r" (block), "+r" (sum), "+r" (offset)
-        : "r"(block+64)
-    );
-}
-
-static void  denoise_dct_sse2(MpegEncContext *s, int16_t *block){
-    const int intra= s->mb_intra;
+#if HAVE_SSE2_INLINE
+static void denoise_dct_sse2(MPVEncContext *const s, int16_t block[])
+{
+    const int intra = s->c.mb_intra;
     int *sum= s->dct_error_sum[intra];
     uint16_t *offset= s->dct_offset[intra];
 
@@ -195,30 +115,16 @@ static void  denoise_dct_sse2(MpegEncContext *s, int16_t *block){
                             "%xmm4", "%xmm5", "%xmm6", "%xmm7")
     );
 }
+#endif /* HAVE_SSE2_INLINE */
 #endif /* HAVE_INLINE_ASM */
 
-av_cold void ff_dct_encode_init_x86(MpegEncContext *s)
+av_cold void ff_dct_encode_init_x86(MPVEncContext *const s)
 {
-    const int dct_algo = s->avctx->dct_algo;
-    int i;
-
-    for (i = 0; i < 64; i++)
-        inv_zigzag_direct16[ff_zigzag_direct[i]] = i + 1;
+    const int dct_algo = s->c.avctx->dct_algo;
 
     if (dct_algo == FF_DCT_AUTO || dct_algo == FF_DCT_MMX) {
 #if HAVE_MMX_INLINE
         int cpu_flags = av_get_cpu_flags();
-        if (INLINE_MMX(cpu_flags)) {
-#if HAVE_6REGS
-            s->dct_quantize = dct_quantize_mmx;
-#endif
-            s->denoise_dct  = denoise_dct_mmx;
-        }
-#endif
-#if HAVE_6REGS && HAVE_MMXEXT_INLINE
-        if (INLINE_MMXEXT(cpu_flags))
-            s->dct_quantize = dct_quantize_mmxext;
-#endif
 #if HAVE_SSE2_INLINE
         if (INLINE_SSE2(cpu_flags)) {
 #if HAVE_6REGS
@@ -230,6 +136,7 @@ av_cold void ff_dct_encode_init_x86(MpegEncContext *s)
 #if HAVE_6REGS && HAVE_SSSE3_INLINE
         if (INLINE_SSSE3(cpu_flags))
             s->dct_quantize = dct_quantize_ssse3;
+#endif
 #endif
     }
 }

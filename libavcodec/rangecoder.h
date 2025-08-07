@@ -29,8 +29,8 @@
 
 #include <stdint.h>
 
-#include "libavutil/common.h"
 #include "libavutil/avassert.h"
+#include "libavutil/intmath.h"
 
 typedef struct RangeCoder {
     int low;
@@ -42,36 +42,38 @@ typedef struct RangeCoder {
     uint8_t *bytestream_start;
     uint8_t *bytestream;
     uint8_t *bytestream_end;
+    int overread;
+#define MAX_OVERREAD 2
 } RangeCoder;
 
 void ff_init_range_encoder(RangeCoder *c, uint8_t *buf, int buf_size);
 void ff_init_range_decoder(RangeCoder *c, const uint8_t *buf, int buf_size);
-int ff_rac_terminate(RangeCoder *c);
+
+/**
+ * Terminates the range coder
+ * @param version version 0 requires the decoder to know the data size in bytes
+ *                version 1 needs about 1 bit more space but does not need to
+ *                          carry the size from encoder to decoder
+ */
+int ff_rac_terminate(RangeCoder *c, int version);
+
 void ff_build_rac_states(RangeCoder *c, int factor, int max_p);
 
 static inline void renorm_encoder(RangeCoder *c)
 {
-    // FIXME: optimize
-    while (c->range < 0x100) {
-        if (c->outstanding_byte < 0) {
-            c->outstanding_byte = c->low >> 8;
-        } else if (c->low <= 0xFF00) {
-            *c->bytestream++ = c->outstanding_byte;
+        if (c->low - 0xFF01 >= 0x10000 - 0xFF01U) {
+            int mask = c->low - 0xFF01 >> 31;
+            *c->bytestream = c->outstanding_byte + 1 + mask;
+            c->bytestream += c->outstanding_byte >= 0;
             for (; c->outstanding_count; c->outstanding_count--)
-                *c->bytestream++ = 0xFF;
+                *c->bytestream++ = mask;
             c->outstanding_byte = c->low >> 8;
-        } else if (c->low >= 0x10000) {
-            *c->bytestream++ = c->outstanding_byte + 1;
-            for (; c->outstanding_count; c->outstanding_count--)
-                *c->bytestream++ = 0x00;
-            c->outstanding_byte = (c->low >> 8) & 0xFF;
         } else {
             c->outstanding_count++;
         }
 
         c->low     = (c->low & 0xFF) << 8;
         c->range <<= 8;
-    }
 }
 
 static inline int get_rac_count(RangeCoder *c)
@@ -98,18 +100,19 @@ static inline void put_rac(RangeCoder *c, uint8_t *const state, int bit)
         *state   = c->one_state[*state];
     }
 
-    renorm_encoder(c);
+    if (c->range < 0x100)
+        renorm_encoder(c);
 }
 
 static inline void refill(RangeCoder *c)
 {
-    if (c->range < 0x100) {
         c->range <<= 8;
         c->low   <<= 8;
-        if (c->bytestream < c->bytestream_end)
+        if (c->bytestream < c->bytestream_end) {
             c->low += c->bytestream[0];
-        c->bytestream++;
-    }
+            c->bytestream++;
+        } else
+            c->overread ++;
 }
 
 static inline int get_rac(RangeCoder *c, uint8_t *const state)
@@ -117,31 +120,19 @@ static inline int get_rac(RangeCoder *c, uint8_t *const state)
     int range1 = (c->range * (*state)) >> 8;
 
     c->range -= range1;
-#if 1
     if (c->low < c->range) {
         *state = c->zero_state[*state];
-        refill(c);
+        if (c->range < 0x100)
+            refill(c);
         return 0;
     } else {
         c->low  -= c->range;
         *state   = c->one_state[*state];
         c->range = range1;
-        refill(c);
+        if (c->range < 0x100)
+            refill(c);
         return 1;
     }
-#else
-    {
-        int one_mask one_mask = (c->range - c->low - 1) >> 31;
-
-        c->low   -=           c->range  & one_mask;
-        c->range += (range1 - c->range) & one_mask;
-
-        *state = c->zero_state[(*state) + (256 & one_mask)];
-    }
-    refill(c);
-
-    return one_mask & 1;
-#endif
 }
 
 #endif /* AVCODEC_RANGECODER_H */

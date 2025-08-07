@@ -17,6 +17,7 @@
  */
 
 #include "config.h"
+#include "config_components.h"
 #include "libavutil/attributes.h"
 #include "libavutil/common.h"
 #include "avcodec.h"
@@ -26,24 +27,12 @@
 #include "simple_idct.h"
 #include "xvididct.h"
 
-av_cold void ff_init_scantable(uint8_t *permutation, ScanTable *st,
-                               const uint8_t *src_scantable)
+av_cold void ff_permute_scantable(uint8_t dst[64], const uint8_t src[64],
+                                  const uint8_t permutation[64])
 {
-    int i, end;
-
-    st->scantable = src_scantable;
-
-    for (i = 0; i < 64; i++) {
-        int j = src_scantable[i];
-        st->permutated[i] = permutation[j];
-    }
-
-    end = -1;
-    for (i = 0; i < 64; i++) {
-        int j = st->permutated[i];
-        if (j > end)
-            end = j;
-        st->raster_end[i] = end;
+    for (int i = 0; i < 64; i++) {
+        int j = src[i];
+        dst[i] = permutation[j];
     }
 }
 
@@ -52,10 +41,11 @@ av_cold void ff_init_scantable_permutation(uint8_t *idct_permutation,
 {
     int i;
 
-    if (ARCH_X86)
-        if (ff_init_scantable_permutation_x86(idct_permutation,
-                                              perm_type))
-            return;
+#if ARCH_X86
+    if (ff_init_scantable_permutation_x86(idct_permutation,
+                                          perm_type))
+        return;
+#endif
 
     switch (perm_type) {
     case FF_IDCT_PERM_NONE:
@@ -80,11 +70,8 @@ av_cold void ff_init_scantable_permutation(uint8_t *idct_permutation,
     }
 }
 
-void (*ff_put_pixels_clamped)(const int16_t *block, uint8_t *pixels, ptrdiff_t line_size);
-void (*ff_add_pixels_clamped)(const int16_t *block, uint8_t *pixels, ptrdiff_t line_size);
-
-static void put_pixels_clamped_c(const int16_t *block, uint8_t *av_restrict pixels,
-                                 ptrdiff_t line_size)
+void ff_put_pixels_clamped_c(const int16_t *block, uint8_t *restrict pixels,
+                             ptrdiff_t line_size)
 {
     int i;
 
@@ -104,7 +91,7 @@ static void put_pixels_clamped_c(const int16_t *block, uint8_t *av_restrict pixe
     }
 }
 
-static void put_pixels_clamped4_c(const int16_t *block, uint8_t *av_restrict pixels,
+static void put_pixels_clamped4_c(const int16_t *block, uint8_t *restrict pixels,
                                  int line_size)
 {
     int i;
@@ -121,7 +108,7 @@ static void put_pixels_clamped4_c(const int16_t *block, uint8_t *av_restrict pix
     }
 }
 
-static void put_pixels_clamped2_c(const int16_t *block, uint8_t *av_restrict pixels,
+static void put_pixels_clamped2_c(const int16_t *block, uint8_t *restrict pixels,
                                  int line_size)
 {
     int i;
@@ -137,7 +124,7 @@ static void put_pixels_clamped2_c(const int16_t *block, uint8_t *av_restrict pix
 }
 
 static void put_signed_pixels_clamped_c(const int16_t *block,
-                                        uint8_t *av_restrict pixels,
+                                        uint8_t *restrict pixels,
                                         ptrdiff_t line_size)
 {
     int i, j;
@@ -157,8 +144,8 @@ static void put_signed_pixels_clamped_c(const int16_t *block,
     }
 }
 
-static void add_pixels_clamped_c(const int16_t *block, uint8_t *av_restrict pixels,
-                                 ptrdiff_t line_size)
+void ff_add_pixels_clamped_c(const int16_t *block, uint8_t *restrict pixels,
+                             ptrdiff_t line_size)
 {
     int i;
 
@@ -177,7 +164,7 @@ static void add_pixels_clamped_c(const int16_t *block, uint8_t *av_restrict pixe
     }
 }
 
-static void add_pixels_clamped4_c(const int16_t *block, uint8_t *av_restrict pixels,
+static void add_pixels_clamped4_c(const int16_t *block, uint8_t *restrict pixels,
                           int line_size)
 {
     int i;
@@ -193,7 +180,7 @@ static void add_pixels_clamped4_c(const int16_t *block, uint8_t *av_restrict pix
     }
 }
 
-static void add_pixels_clamped2_c(const int16_t *block, uint8_t *av_restrict pixels,
+static void add_pixels_clamped2_c(const int16_t *block, uint8_t *restrict pixels,
                           int line_size)
 {
     int i;
@@ -207,40 +194,40 @@ static void add_pixels_clamped2_c(const int16_t *block, uint8_t *av_restrict pix
     }
 }
 
-static void ff_jref_idct4_put(uint8_t *dest, int line_size, int16_t *block)
+static void ff_jref_idct4_put(uint8_t *dest, ptrdiff_t line_size, int16_t *block)
 {
     ff_j_rev_dct4 (block);
     put_pixels_clamped4_c(block, dest, line_size);
 }
-static void ff_jref_idct4_add(uint8_t *dest, int line_size, int16_t *block)
+static void ff_jref_idct4_add(uint8_t *dest, ptrdiff_t line_size, int16_t *block)
 {
     ff_j_rev_dct4 (block);
     add_pixels_clamped4_c(block, dest, line_size);
 }
 
-static void ff_jref_idct2_put(uint8_t *dest, int line_size, int16_t *block)
+static void ff_jref_idct2_put(uint8_t *dest, ptrdiff_t line_size, int16_t *block)
 {
     ff_j_rev_dct2 (block);
     put_pixels_clamped2_c(block, dest, line_size);
 }
-static void ff_jref_idct2_add(uint8_t *dest, int line_size, int16_t *block)
+static void ff_jref_idct2_add(uint8_t *dest, ptrdiff_t line_size, int16_t *block)
 {
     ff_j_rev_dct2 (block);
     add_pixels_clamped2_c(block, dest, line_size);
 }
 
-static void ff_jref_idct1_put(uint8_t *dest, int line_size, int16_t *block)
+static void ff_jref_idct1_put(uint8_t *dest, ptrdiff_t line_size, int16_t *block)
 {
     dest[0] = av_clip_uint8((block[0] + 4)>>3);
 }
-static void ff_jref_idct1_add(uint8_t *dest, int line_size, int16_t *block)
+static void ff_jref_idct1_add(uint8_t *dest, ptrdiff_t line_size, int16_t *block)
 {
     dest[0] = av_clip_uint8(dest[0] + ((block[0] + 4)>>3));
 }
 
 av_cold void ff_idctdsp_init(IDCTDSPContext *c, AVCodecContext *avctx)
 {
-    const unsigned high_bit_depth = avctx->bits_per_raw_sample > 8;
+    av_unused const unsigned high_bit_depth = avctx->bits_per_raw_sample > 8;
 
     if (avctx->lowres==1) {
         c->idct_put  = ff_jref_idct4_put;
@@ -259,14 +246,22 @@ av_cold void ff_idctdsp_init(IDCTDSPContext *c, AVCodecContext *avctx)
         c->perm_type = FF_IDCT_PERM_NONE;
     } else {
         if (avctx->bits_per_raw_sample == 10 || avctx->bits_per_raw_sample == 9) {
-            c->idct_put              = ff_simple_idct_put_10;
-            c->idct_add              = ff_simple_idct_add_10;
-            c->idct                  = ff_simple_idct_10;
+            /* 10-bit MPEG-4 Simple Studio Profile requires a higher precision IDCT
+               However, it only uses idct_put */
+            if (c->mpeg4_studio_profile) {
+                c->idct_put              = ff_simple_idct_put_int32_10bit;
+                c->idct_add              = NULL;
+                c->idct                  = NULL;
+            } else {
+                c->idct_put              = ff_simple_idct_put_int16_10bit;
+                c->idct_add              = ff_simple_idct_add_int16_10bit;
+                c->idct                  = ff_simple_idct_int16_10bit;
+            }
             c->perm_type             = FF_IDCT_PERM_NONE;
         } else if (avctx->bits_per_raw_sample == 12) {
-            c->idct_put              = ff_simple_idct_put_12;
-            c->idct_add              = ff_simple_idct_add_12;
-            c->idct                  = ff_simple_idct_12;
+            c->idct_put              = ff_simple_idct_put_int16_12bit;
+            c->idct_add              = ff_simple_idct_add_int16_12bit;
+            c->idct                  = ff_simple_idct_int16_12bit;
             c->perm_type             = FF_IDCT_PERM_NONE;
         } else {
             if (avctx->idct_algo == FF_IDCT_INT) {
@@ -281,33 +276,38 @@ av_cold void ff_idctdsp_init(IDCTDSPContext *c, AVCodecContext *avctx)
                 c->idct      = ff_faanidct;
                 c->perm_type = FF_IDCT_PERM_NONE;
 #endif /* CONFIG_FAANIDCT */
+#if CONFIG_MPEG4_DECODER
+            } else if (avctx->idct_algo == FF_IDCT_XVID) {
+                ff_xvid_idct_init(c);
+#endif
             } else { // accurate/default
-                c->idct_put  = ff_simple_idct_put_8;
-                c->idct_add  = ff_simple_idct_add_8;
-                c->idct      = ff_simple_idct_8;
+                c->idct_put  = ff_simple_idct_put_int16_8bit;
+                c->idct_add  = ff_simple_idct_add_int16_8bit;
+                c->idct      = ff_simple_idct_int16_8bit;
                 c->perm_type = FF_IDCT_PERM_NONE;
             }
         }
     }
 
-    c->put_pixels_clamped        = put_pixels_clamped_c;
+    c->put_pixels_clamped        = ff_put_pixels_clamped_c;
     c->put_signed_pixels_clamped = put_signed_pixels_clamped_c;
-    c->add_pixels_clamped        = add_pixels_clamped_c;
+    c->add_pixels_clamped        = ff_add_pixels_clamped_c;
 
-    if (CONFIG_MPEG4_DECODER && avctx->idct_algo == FF_IDCT_XVID)
-        ff_xvid_idct_init(c, avctx);
-
-    if (ARCH_ALPHA)
-        ff_idctdsp_init_alpha(c, avctx, high_bit_depth);
-    if (ARCH_ARM)
-        ff_idctdsp_init_arm(c, avctx, high_bit_depth);
-    if (ARCH_PPC)
-        ff_idctdsp_init_ppc(c, avctx, high_bit_depth);
-    if (ARCH_X86)
-        ff_idctdsp_init_x86(c, avctx, high_bit_depth);
-
-    ff_put_pixels_clamped = c->put_pixels_clamped;
-    ff_add_pixels_clamped = c->add_pixels_clamped;
+#if ARCH_AARCH64
+    ff_idctdsp_init_aarch64(c, avctx, high_bit_depth);
+#elif ARCH_ARM
+    ff_idctdsp_init_arm(c, avctx, high_bit_depth);
+#elif ARCH_PPC
+    ff_idctdsp_init_ppc(c, avctx, high_bit_depth);
+#elif ARCH_RISCV
+    ff_idctdsp_init_riscv(c, avctx, high_bit_depth);
+#elif ARCH_X86
+    ff_idctdsp_init_x86(c, avctx, high_bit_depth);
+#elif ARCH_MIPS
+    ff_idctdsp_init_mips(c, avctx, high_bit_depth);
+#elif ARCH_LOONGARCH
+    ff_idctdsp_init_loongarch(c, avctx, high_bit_depth);
+#endif
 
     ff_init_scantable_permutation(c->idct_permutation,
                                   c->perm_type);

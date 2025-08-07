@@ -20,7 +20,9 @@
  */
 
 #include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
 typedef struct {
@@ -32,7 +34,7 @@ typedef struct {
     int packet_sizes_alloc;
 } PMPContext;
 
-static int pmp_probe(AVProbeData *p) {
+static int pmp_probe(const AVProbeData *p) {
     if (AV_RN32(p->buf) == AV_RN32("pmpm") &&
         AV_RL32(p->buf + 4) == 1)
         return AVPROBE_SCORE_MAX;
@@ -54,22 +56,22 @@ static int pmp_header(AVFormatContext *s)
     AVStream *vst = avformat_new_stream(s, NULL);
     if (!vst)
         return AVERROR(ENOMEM);
-    vst->codec->codec_type = AVMEDIA_TYPE_VIDEO;
+    vst->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
     avio_skip(pb, 8);
     switch (avio_rl32(pb)) {
     case 0:
-        vst->codec->codec_id = AV_CODEC_ID_MPEG4;
+        vst->codecpar->codec_id = AV_CODEC_ID_MPEG4;
         break;
     case 1:
-        vst->codec->codec_id = AV_CODEC_ID_H264;
+        vst->codecpar->codec_id = AV_CODEC_ID_H264;
         break;
     default:
         av_log(s, AV_LOG_ERROR, "Unsupported video format\n");
         break;
     }
-    index_cnt = avio_rl32(pb);
-    vst->codec->width  = avio_rl32(pb);
-    vst->codec->height = avio_rl32(pb);
+    index_cnt          = avio_rl32(pb);
+    vst->codecpar->width  = avio_rl32(pb);
+    vst->codecpar->height = avio_rl32(pb);
 
     tb_num = avio_rl32(pb);
     tb_den = avio_rl32(pb);
@@ -117,10 +119,10 @@ static int pmp_header(AVFormatContext *s)
         AVStream *ast = avformat_new_stream(s, NULL);
         if (!ast)
             return AVERROR(ENOMEM);
-        ast->codec->codec_type = AVMEDIA_TYPE_AUDIO;
-        ast->codec->codec_id = audio_codec_id;
-        ast->codec->channels = channels;
-        ast->codec->sample_rate = srate;
+        ast->codecpar->codec_type  = AVMEDIA_TYPE_AUDIO;
+        ast->codecpar->codec_id    = audio_codec_id;
+        ast->codecpar->ch_layout.nb_channels = channels;
+        ast->codecpar->sample_rate = srate;
         avpriv_set_pts_info(ast, 32, 1, srate);
     }
     return 0;
@@ -183,9 +185,9 @@ static int pmp_close(AVFormatContext *s)
     return 0;
 }
 
-AVInputFormat ff_pmp_demuxer = {
-    .name           = "pmp",
-    .long_name      = NULL_IF_CONFIG_SMALL("Playstation Portable PMP"),
+const FFInputFormat ff_pmp_demuxer = {
+    .p.name         = "pmp",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Playstation Portable PMP"),
     .priv_data_size = sizeof(PMPContext),
     .read_probe     = pmp_probe,
     .read_header    = pmp_header,

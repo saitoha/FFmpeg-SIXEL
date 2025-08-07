@@ -21,9 +21,11 @@
 
 #include "libavutil/mathematics.h"
 #include "libavutil/imgutils.h"
+#include "libavutil/mem.h"
 #include "avcodec.h"
 #include "get_bits.h"
 #include "bytestream.h"
+#include "codec_internal.h"
 
 static av_cold int decode_init(AVCodecContext *avctx) {
     avctx->pix_fmt = AV_PIX_FMT_PAL8;
@@ -46,17 +48,19 @@ static int64_t parse_timecode(const uint8_t *buf, int64_t packet_time) {
     return ms - packet_time;
 }
 
-static int decode_frame(AVCodecContext *avctx, void *data, int *data_size,
-                        AVPacket *avpkt) {
+static int decode_frame(AVCodecContext *avctx, AVSubtitle *sub,
+                        int *got_sub_ptr, const AVPacket *avpkt)
+{
     const uint8_t *buf = avpkt->data;
     int buf_size = avpkt->size;
-    AVSubtitle *sub = data;
+    AVSubtitleRect *rect;
     const uint8_t *buf_end = buf + buf_size;
     uint8_t *bitmap;
-    int w, h, x, y, i;
+    int w, h, x, y, i, ret;
     int64_t packet_time = 0;
     GetBitContext gb;
     int has_alpha = avctx->codec_tag == MKTAG('D','X','S','A');
+    int64_t start_display_time, end_display_time;
 
     // check that at least header fits
     if (buf_size < 27 + 7 * 2 + 4 * (3 + has_alpha)) {
@@ -71,8 +75,14 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *data_size,
     }
     if (avpkt->pts != AV_NOPTS_VALUE)
         packet_time = av_rescale_q(avpkt->pts, AV_TIME_BASE_Q, (AVRational){1, 1000});
-    sub->start_display_time = parse_timecode(buf +  1, packet_time);
-    sub->end_display_time   = parse_timecode(buf + 14, packet_time);
+
+    sub->start_display_time = start_display_time = parse_timecode(buf +  1, packet_time);
+    sub->end_display_time   = end_display_time   = parse_timecode(buf + 14, packet_time);
+    if (sub->start_display_time != start_display_time ||
+        sub->  end_display_time !=   end_display_time) {
+        av_log(avctx, AV_LOG_ERROR, "time code not representable in 32bit\n");
+        return -1;
+    }
     buf += 27;
 
     // read header
@@ -91,50 +101,48 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *data_size,
     // we just ignore it
     bytestream_get_le16(&buf);
 
+    if (buf_end - buf < h + 3*4)
+        return AVERROR_INVALIDDATA;
+
     // allocate sub and set values
     sub->rects =  av_mallocz(sizeof(*sub->rects));
     if (!sub->rects)
         return AVERROR(ENOMEM);
 
-    sub->rects[0] = av_mallocz(sizeof(*sub->rects[0]));
-    if (!sub->rects[0]) {
-        av_freep(&sub->rects);
+    sub->rects[0] = rect = av_mallocz(sizeof(*sub->rects[0]));
+    if (!sub->rects[0])
         return AVERROR(ENOMEM);
-    }
-    sub->rects[0]->x = x; sub->rects[0]->y = y;
-    sub->rects[0]->w = w; sub->rects[0]->h = h;
-    sub->rects[0]->type = SUBTITLE_BITMAP;
-    sub->rects[0]->pict.linesize[0] = w;
-    sub->rects[0]->pict.data[0] = av_malloc(w * h);
-    sub->rects[0]->nb_colors = 4;
-    sub->rects[0]->pict.data[1] = av_mallocz(AVPALETTE_SIZE);
-    if (!sub->rects[0]->pict.data[0] || !sub->rects[0]->pict.data[1]) {
-        av_freep(&sub->rects[0]);
-        av_freep(&sub->rects);
-        return AVERROR(ENOMEM);
-
-    }
     sub->num_rects = 1;
+    rect->x = x; rect->y = y;
+    rect->w = w; rect->h = h;
+    rect->type = SUBTITLE_BITMAP;
+    rect->linesize[0] = w;
+    rect->data[0] = av_malloc(w * h);
+    rect->nb_colors = 4;
+    rect->data[1] = av_mallocz(AVPALETTE_SIZE);
+    if (!rect->data[0] || !rect->data[1])
+        return AVERROR(ENOMEM);
 
     // read palette
-    for (i = 0; i < sub->rects[0]->nb_colors; i++)
-        ((uint32_t*)sub->rects[0]->pict.data[1])[i] = bytestream_get_be24(&buf);
+    for (i = 0; i < rect->nb_colors; i++)
+        ((uint32_t*)rect->data[1])[i] = bytestream_get_be24(&buf);
 
     if (!has_alpha) {
         // make all except background (first entry) non-transparent
-        for (i = 1; i < sub->rects[0]->nb_colors; i++)
-            ((uint32_t *)sub->rects[0]->pict.data[1])[i] |= 0xff000000;
+        for (i = 1; i < rect->nb_colors; i++)
+            ((uint32_t *)rect->data[1])[i] |= 0xff000000;
     } else {
-        for (i = 0; i < sub->rects[0]->nb_colors; i++)
-            ((uint32_t *)sub->rects[0]->pict.data[1])[i] |= *buf++ << 24;
+        for (i = 0; i < rect->nb_colors; i++)
+            ((uint32_t *)rect->data[1])[i] |= (unsigned)*buf++ << 24;
     }
 
     // process RLE-compressed data
-    init_get_bits(&gb, buf, (buf_end - buf) * 8);
-    bitmap = sub->rects[0]->pict.data[0];
+    if ((ret = init_get_bits8(&gb, buf, buf_end - buf)) < 0)
+        return ret;
+    bitmap = rect->data[0];
     for (y = 0; y < h; y++) {
         // interlaced: do odd lines
-        if (y == (h + 1) / 2) bitmap = sub->rects[0]->pict.data[0] + w;
+        if (y == (h + 1) / 2) bitmap = rect->data[0] + w;
         for (x = 0; x < w; ) {
             int log2 = ff_log2_tab[show_bits(&gb, 8)];
             int run = get_bits(&gb, 14 - 4 * (log2 >> 1));
@@ -150,15 +158,15 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *data_size,
         bitmap += w;
         align_get_bits(&gb);
     }
-    *data_size = 1;
+    *got_sub_ptr = 1;
     return buf_size;
 }
 
-AVCodec ff_xsub_decoder = {
-    .name      = "xsub",
-    .long_name = NULL_IF_CONFIG_SMALL("XSUB"),
-    .type      = AVMEDIA_TYPE_SUBTITLE,
-    .id        = AV_CODEC_ID_XSUB,
+const FFCodec ff_xsub_decoder = {
+    .p.name    = "xsub",
+    CODEC_LONG_NAME("XSUB"),
+    .p.type    = AVMEDIA_TYPE_SUBTITLE,
+    .p.id      = AV_CODEC_ID_XSUB,
     .init      = decode_init,
-    .decode    = decode_frame,
+    FF_CODEC_DECODE_SUB_CB(decode_frame),
 };

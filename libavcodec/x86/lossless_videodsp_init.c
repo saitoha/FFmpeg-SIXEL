@@ -18,45 +18,53 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "config.h"
 #include "../lossless_videodsp.h"
-#include "libavutil/pixdesc.h"
 #include "libavutil/x86/cpu.h"
 
-void ff_add_int16_mmx(uint16_t *dst, const uint16_t *src, unsigned mask, int w);
-void ff_add_int16_sse2(uint16_t *dst, const uint16_t *src, unsigned mask, int w);
-void ff_diff_int16_mmx (uint16_t *dst, const uint16_t *src1, const uint16_t *src2, unsigned mask, int w);
-void ff_diff_int16_sse2(uint16_t *dst, const uint16_t *src1, const uint16_t *src2, unsigned mask, int w);
-int ff_add_hfyu_left_pred_int16_ssse3(uint16_t *dst, const uint16_t *src, unsigned mask, int w, unsigned acc);
-int ff_add_hfyu_left_pred_int16_sse4(uint16_t *dst, const uint16_t *src, unsigned mask, int w, unsigned acc);
-void ff_add_hfyu_median_pred_int16_mmxext(uint16_t *dst, const uint16_t *top, const uint16_t *diff, unsigned mask, int w, int *left, int *left_top);
-void ff_sub_hfyu_median_pred_int16_mmxext(uint16_t *dst, const uint16_t *src1, const uint16_t *src2, unsigned mask, int w, int *left, int *left_top);
+void ff_add_bytes_sse2(uint8_t *dst, uint8_t *src, ptrdiff_t w);
+void ff_add_bytes_avx2(uint8_t *dst, uint8_t *src, ptrdiff_t w);
 
+void ff_add_median_pred_sse2(uint8_t *dst, const uint8_t *top,
+                             const uint8_t *diff, ptrdiff_t w,
+                             int *left, int *left_top);
 
-void ff_llviddsp_init_x86(LLVidDSPContext *c, AVCodecContext *avctx)
+int  ff_add_left_pred_ssse3(uint8_t *dst, const uint8_t *src,
+                            ptrdiff_t w, int left);
+int  ff_add_left_pred_unaligned_ssse3(uint8_t *dst, const uint8_t *src,
+                                      ptrdiff_t w, int left);
+int  ff_add_left_pred_unaligned_avx2(uint8_t *dst, const uint8_t *src,
+                                     ptrdiff_t w, int left);
+
+int ff_add_left_pred_int16_ssse3(uint16_t *dst, const uint16_t *src, unsigned mask, ptrdiff_t w, unsigned acc);
+int ff_add_left_pred_int16_unaligned_ssse3(uint16_t *dst, const uint16_t *src, unsigned mask, ptrdiff_t w, unsigned acc);
+
+void ff_add_gradient_pred_ssse3(uint8_t *src, const ptrdiff_t stride, const ptrdiff_t width);
+void ff_add_gradient_pred_avx2(uint8_t *src, const ptrdiff_t stride, const ptrdiff_t width);
+
+void ff_llviddsp_init_x86(LLVidDSPContext *c)
 {
     int cpu_flags = av_get_cpu_flags();
-    const AVPixFmtDescriptor *pix_desc = av_pix_fmt_desc_get(avctx->pix_fmt);
-
-    if (EXTERNAL_MMX(cpu_flags)) {
-        c->add_int16 = ff_add_int16_mmx;
-        c->diff_int16 = ff_diff_int16_mmx;
-    }
-
-    if (EXTERNAL_MMXEXT(cpu_flags) && pix_desc->comp[0].depth_minus1<15) {
-        c->add_hfyu_median_pred_int16 = ff_add_hfyu_median_pred_int16_mmxext;
-        c->sub_hfyu_median_pred_int16 = ff_sub_hfyu_median_pred_int16_mmxext;
-    }
 
     if (EXTERNAL_SSE2(cpu_flags)) {
-        c->add_int16 = ff_add_int16_sse2;
-        c->diff_int16 = ff_diff_int16_sse2;
+        c->add_bytes       = ff_add_bytes_sse2;
+        c->add_median_pred = ff_add_median_pred_sse2;
     }
 
     if (EXTERNAL_SSSE3(cpu_flags)) {
-        c->add_hfyu_left_pred_int16 = ff_add_hfyu_left_pred_int16_ssse3;
+        c->add_left_pred = ff_add_left_pred_ssse3;
+        c->add_left_pred_int16 = ff_add_left_pred_int16_ssse3;
+        c->add_gradient_pred   = ff_add_gradient_pred_ssse3;
     }
 
-    if (EXTERNAL_SSE4(cpu_flags)) {
-        c->add_hfyu_left_pred_int16 = ff_add_hfyu_left_pred_int16_sse4;
+    if (EXTERNAL_SSSE3_FAST(cpu_flags)) {
+        c->add_left_pred = ff_add_left_pred_unaligned_ssse3;
+        c->add_left_pred_int16 = ff_add_left_pred_int16_unaligned_ssse3;
+    }
+
+    if (EXTERNAL_AVX2_FAST(cpu_flags)) {
+        c->add_bytes       = ff_add_bytes_avx2;
+        c->add_left_pred   = ff_add_left_pred_unaligned_avx2;
+        c->add_gradient_pred = ff_add_gradient_pred_avx2;
     }
 }

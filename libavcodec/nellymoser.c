@@ -28,14 +28,15 @@
 /**
  * @file
  * The 3 alphanumeric copyright notices are md5summed they are from the original
- * implementors. The original code is available from http://code.google.com/p/nelly2pcm/
+ * implementers. The original code is available from http://code.google.com/p/nelly2pcm/
  */
 
-#include "nellymoser.h"
-#include "avcodec.h"
+#include <stdlib.h>
 
-#define BITSTREAM_READER_LE
-#include "get_bits.h"
+#include "libavutil/intmath.h"
+#include "libavutil/common.h"
+
+#include "nellymoser.h"
 
 const float ff_nelly_dequantization_table[127] = {
  0.0000000000,
@@ -85,7 +86,7 @@ const int16_t ff_nelly_delta_table[32] = {
 
 static inline int signed_shift(int i, int shift) {
     if (shift > 0)
-        return i << shift;
+        return (unsigned)i << shift;
     return i >> -shift;
 }
 
@@ -109,7 +110,7 @@ static int headroom(int *la)
         return 31;
     }
     l = 30 - av_log2(FFABS(*la));
-    *la <<= l;
+    *la *= 1<<l;
     return l;
 }
 

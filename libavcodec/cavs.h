@@ -22,10 +22,16 @@
 #ifndef AVCODEC_CAVS_H
 #define AVCODEC_CAVS_H
 
+#include <stddef.h>
+#include <stdint.h>
+
+#include "libavutil/frame.h"
+#include "libavutil/mem_internal.h"
+
+#include "avcodec.h"
 #include "cavsdsp.h"
 #include "blockdsp.h"
 #include "h264chroma.h"
-#include "idctdsp.h"
 #include "get_bits.h"
 #include "videodsp.h"
 
@@ -140,7 +146,7 @@ enum cavs_mv_loc {
   MV_BWD_X3
 };
 
-DECLARE_ALIGNED(8, typedef, struct) {
+typedef struct cavs_vector {
     int16_t x;
     int16_t y;
     int16_t dist;
@@ -164,7 +170,6 @@ typedef struct AVSContext {
     AVCodecContext *avctx;
     BlockDSPContext bdsp;
     H264ChromaContext h264chroma;
-    IDCTDSPContext idsp;
     VideoDSPContext vdsp;
     CAVSDSPContext  cdsp;
     GetBitContext gb;
@@ -202,7 +207,7 @@ typedef struct AVSContext {
        D is the macroblock to the top-left (0)
 
        the same is repeated for backward motion vectors */
-    cavs_vector mv[2*4*3];
+    DECLARE_ALIGNED(8, cavs_vector, mv)[2*4*3];
     cavs_vector *top_mv[2];
     cavs_vector *col_mv;
 
@@ -218,7 +223,7 @@ typedef struct AVSContext {
     int qp_fixed;
     int pic_qp_fixed;
     int cbp;
-    ScanTable scantable;
+    uint8_t permutated_scantable[64];
 
     /** intra prediction is done with un-deblocked samples
      they are saved here before deblocking the MB  */
@@ -227,8 +232,8 @@ typedef struct AVSContext {
     uint8_t intern_border_y[26];
     uint8_t topleft_border_y, topleft_border_u, topleft_border_v;
 
-    void (*intra_pred_l[8])(uint8_t *d,uint8_t *top,uint8_t *left,int stride);
-    void (*intra_pred_c[7])(uint8_t *d,uint8_t *top,uint8_t *left,int stride);
+    void (*intra_pred_l[8])(uint8_t *d, uint8_t *top, uint8_t *left, ptrdiff_t stride);
+    void (*intra_pred_c[7])(uint8_t *d, uint8_t *top, uint8_t *left, ptrdiff_t stride);
     uint8_t *col_type_base;
 
     /* scaling factors for MV prediction */

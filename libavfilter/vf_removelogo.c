@@ -49,7 +49,7 @@
  * remove rough edges, is stored in each pixel. This is done using an in-place
  * erosion algorithm, and incrementing each pixel that survives any given
  * erosion.  Once every pixel is eroded, the maximum value is recorded, and a
- * set of masks from size 0 to this size are generaged. The masks are circular
+ * set of masks from size 0 to this size are generated. The masks are circular
  * binary masks, where each pixel within a radius N (where N is the size of the
  * mask) is a 1, and all other pixels are a 0. Although a gaussian mask would be
  * more mathematically accurate, a binary mask works better in practice because
@@ -64,22 +64,22 @@
  * condition is met (that the image function itself is continuous), even if the
  * second boundary condition (that the derivative of the image function is
  * continuous) is not met. A masking algorithm that does preserve the second
- * boundary coundition (perhaps something based on a highly-modified bi-cubic
+ * boundary condition (perhaps something based on a highly-modified bi-cubic
  * algorithm) should offer even better results on paper, but the noise in a
  * typical TV signal should make anything based on derivatives hopelessly noisy.
  */
 
 #include "libavutil/imgutils.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "avfilter.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
 #include "video.h"
 #include "bbox.h"
 #include "lavfutils.h"
 #include "lswsutils.h"
 
-typedef struct {
+typedef struct RemovelogoContext {
     const AVClass *class;
     char *filename;
     /* Stores our collection of masks. The first is for an array of
@@ -201,15 +201,6 @@ static void convert_mask_to_strength_mask(uint8_t *data, int linesize,
     /* Apply the fudge factor to this number too, since we must ensure
      * that enough masks are generated. */
     *max_mask_size = apply_mask_fudge_factor(current_pass + 1);
-}
-
-static int query_formats(AVFilterContext *ctx)
-{
-    static const enum AVPixelFormat pix_fmts[] = { AV_PIX_FMT_YUV420P, AV_PIX_FMT_NONE };
-    AVFilterFormats *fmts_list = ff_make_format_list(pix_fmts);
-    if (!fmts_list)
-        return AVERROR(ENOMEM);
-    return ff_set_common_formats(ctx, fmts_list);
 }
 
 static int load_mask(uint8_t **mask, int *w, int *h,
@@ -342,8 +333,8 @@ static av_cold int init(AVFilterContext *ctx)
 
     /* Calculate our bounding rectangles, which determine in what
      * region the logo resides for faster processing. */
-    ff_calculate_bounding_box(&s->full_mask_bbox, s->full_mask_data, w, w, h, 0);
-    ff_calculate_bounding_box(&s->half_mask_bbox, s->half_mask_data, w/2, w/2, h/2, 0);
+    ff_calculate_bounding_box(&s->full_mask_bbox, s->full_mask_data, w, w, h, 0, 8);
+    ff_calculate_bounding_box(&s->half_mask_bbox, s->half_mask_data, w/2, w/2, h/2, 0, 8);
 
 #define SHOW_LOGO_INFO(mask_type)                                       \
     av_log(ctx, AV_LOG_VERBOSE, #mask_type " x1:%d x2:%d y1:%d y2:%d max_mask_size:%d\n", \
@@ -562,26 +553,17 @@ static const AVFilterPad removelogo_inputs[] = {
         .config_props = config_props_input,
         .filter_frame = filter_frame,
     },
-    { NULL }
 };
 
-static const AVFilterPad removelogo_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-    { NULL }
-};
-
-AVFilter ff_vf_removelogo = {
-    .name          = "removelogo",
-    .description   = NULL_IF_CONFIG_SMALL("Remove a TV logo based on a mask image."),
+const FFFilter ff_vf_removelogo = {
+    .p.name        = "removelogo",
+    .p.description = NULL_IF_CONFIG_SMALL("Remove a TV logo based on a mask image."),
+    .p.priv_class  = &removelogo_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
     .priv_size     = sizeof(RemovelogoContext),
     .init          = init,
     .uninit        = uninit,
-    .query_formats = query_formats,
-    .inputs        = removelogo_inputs,
-    .outputs       = removelogo_outputs,
-    .priv_class    = &removelogo_class,
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
+    FILTER_INPUTS(removelogo_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_YUV420P),
 };

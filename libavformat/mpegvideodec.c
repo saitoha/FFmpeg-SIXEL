@@ -24,7 +24,7 @@
 #include "rawdec.h"
 
 #include "libavutil/intreadwrite.h"
-#include "libavcodec/internal.h"
+#include "libavcodec/startcode.h"
 
 #define SEQ_START_CODE          0x000001b3
 #define GOP_START_CODE          0x000001b8
@@ -34,7 +34,7 @@
 #define VIDEO_ID                0x000001e0
 #define AUDIO_ID                0x000001c0
 
-static int mpegvideo_probe(AVProbeData *p)
+static int mpegvideo_probe(const AVProbeData *p)
 {
     uint32_t code= -1;
     int pic=0, seq=0, slice=0, pspack=0, vpes=0, apes=0, res=0, sicle=0;

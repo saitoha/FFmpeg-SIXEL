@@ -31,8 +31,16 @@
 #include "libavutil/opt.h"
 #include "libavutil/parseutils.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 #include "sauce.h"
+
+static int isansicode(int x)
+{
+    return x == 0x1B || x == 0x0A || x == 0x0D || (x >= 0x20 && x < 0x7f);
+}
+
+static const char tty_extensions[31] = "ans,art,asc,diz,ice,nfo,txt,vt";
 
 typedef struct TtyDemuxContext {
     AVClass *class;
@@ -41,6 +49,26 @@ typedef struct TtyDemuxContext {
     int width, height; /**< Set by a private option. */
     AVRational framerate; /**< Set by a private option. */
 } TtyDemuxContext;
+
+static int read_probe(const AVProbeData *p)
+{
+    int cnt = 0;
+
+    if (!p->buf_size)
+        return 0;
+
+    for (int i = 0; i < 8 && i < p->buf_size; i++)
+        cnt += !!isansicode(p->buf[i]);
+
+    if (cnt != 8)
+        return 0;
+
+    for (int i = 8; i < p->buf_size; i++)
+        cnt += !!isansicode(p->buf[i]);
+
+    return (cnt * 99LL / p->buf_size) * (cnt > 400) *
+        !!av_match_ext(p->filename, tty_extensions);
+}
 
 /**
  * Parse EFI header
@@ -82,26 +110,29 @@ static int read_header(AVFormatContext *avctx)
         ret = AVERROR(ENOMEM);
         goto fail;
     }
-    st->codec->codec_tag   = 0;
-    st->codec->codec_type  = AVMEDIA_TYPE_VIDEO;
-    st->codec->codec_id    = AV_CODEC_ID_ANSI;
+    st->codecpar->codec_tag   = 0;
+    st->codecpar->codec_type  = AVMEDIA_TYPE_VIDEO;
+    st->codecpar->codec_id    = AV_CODEC_ID_ANSI;
 
-    st->codec->width  = s->width;
-    st->codec->height = s->height;
+    st->codecpar->width  = s->width;
+    st->codecpar->height = s->height;
     avpriv_set_pts_info(st, 60, s->framerate.den, s->framerate.num);
     st->avg_frame_rate = s->framerate;
 
     /* simulate tty display speed */
     s->chars_per_frame = FFMAX(av_q2d(st->time_base)*s->chars_per_frame, 1);
 
-    if (avctx->pb->seekable) {
-        s->fsize = avio_size(avctx->pb);
-        st->duration = (s->fsize + s->chars_per_frame - 1) / s->chars_per_frame;
+    if (avctx->pb->seekable & AVIO_SEEKABLE_NORMAL) {
+        int64_t fsize = avio_size(avctx->pb);
+        if (fsize > 0) {
+            s->fsize = fsize;
+            st->duration = (s->fsize + s->chars_per_frame - 1) / s->chars_per_frame;
 
-        if (ff_sauce_read(avctx, &s->fsize, 0, 0) < 0)
-            efi_read(avctx, s->fsize - 51);
+            if (ff_sauce_read(avctx, &s->fsize, 0, 0) < 0)
+                efi_read(avctx, s->fsize - 51);
 
-        avio_seek(avctx->pb, 0, SEEK_SET);
+            avio_seek(avctx->pb, 0, SEEK_SET);
+        }
     }
 
 fail:
@@ -129,6 +160,8 @@ static int read_packet(AVFormatContext *avctx, AVPacket *pkt)
     pkt->size = av_get_packet(avctx->pb, pkt, n);
     if (pkt->size < 0)
         return pkt->size;
+    pkt->stream_index = 0;
+    pkt->pts = pkt->pos / s->chars_per_frame;
     pkt->flags |= AV_PKT_FLAG_KEY;
     return 0;
 }
@@ -138,7 +171,7 @@ static int read_packet(AVFormatContext *avctx, AVPacket *pkt)
 static const AVOption options[] = {
     { "chars_per_frame", "", offsetof(TtyDemuxContext, chars_per_frame), AV_OPT_TYPE_INT, {.i64 = 6000}, 1, INT_MAX, AV_OPT_FLAG_DECODING_PARAM},
     { "video_size", "A string describing frame size, such as 640x480 or hd720.", OFFSET(width), AV_OPT_TYPE_IMAGE_SIZE, {.str = NULL}, 0, 0, DEC },
-    { "framerate", "", OFFSET(framerate), AV_OPT_TYPE_VIDEO_RATE, {.str = "25"}, 0, 0, DEC },
+    { "framerate", "", OFFSET(framerate), AV_OPT_TYPE_VIDEO_RATE, {.str = "25"}, 0, INT_MAX, DEC },
     { NULL },
 };
 
@@ -149,12 +182,14 @@ static const AVClass tty_demuxer_class = {
     .version        = LIBAVUTIL_VERSION_INT,
 };
 
-AVInputFormat ff_tty_demuxer = {
-    .name           = "tty",
-    .long_name      = NULL_IF_CONFIG_SMALL("Tele-typewriter"),
+const FFInputFormat ff_tty_demuxer = {
+    .p.name         = "tty",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Tele-typewriter"),
+    .p.extensions   = tty_extensions,
+    .p.priv_class   = &tty_demuxer_class,
+    .p.flags        = AVFMT_GENERIC_INDEX,
     .priv_data_size = sizeof(TtyDemuxContext),
+    .read_probe     = read_probe,
     .read_header    = read_header,
     .read_packet    = read_packet,
-    .extensions     = "ans,art,asc,diz,ice,nfo,txt,vt",
-    .priv_class     = &tty_demuxer_class,
 };

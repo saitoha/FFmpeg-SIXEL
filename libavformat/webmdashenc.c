@@ -29,15 +29,19 @@
 #include <float.h>
 #include <stdint.h>
 #include <string.h>
+#include <time.h>
 
 #include "avformat.h"
-#include "avio_internal.h"
 #include "matroska.h"
+#include "mux.h"
 
 #include "libavutil/avstring.h"
 #include "libavutil/dict.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/time_internal.h"
+
+#include "libavcodec/codec_desc.h"
 
 typedef struct AdaptationSet {
     char id[10];
@@ -57,22 +61,11 @@ typedef struct WebMDashMuxContext {
     char *utc_timing_url;
     double time_shift_buffer_depth;
     int minimum_update_period;
-    int debug_mode;
 } WebMDashMuxContext;
 
 static const char *get_codec_name(int codec_id)
 {
-    switch (codec_id) {
-        case AV_CODEC_ID_VP8:
-            return "vp8";
-        case AV_CODEC_ID_VP9:
-            return "vp9";
-        case AV_CODEC_ID_VORBIS:
-            return "vorbis";
-        case AV_CODEC_ID_OPUS:
-            return "opus";
-    }
-    return NULL;
+    return avcodec_descriptor_get(codec_id)->name;
 }
 
 static double get_duration(AVFormatContext *s)
@@ -91,20 +84,21 @@ static double get_duration(AVFormatContext *s)
 static int write_header(AVFormatContext *s)
 {
     WebMDashMuxContext *w = s->priv_data;
+    AVIOContext *pb = s->pb;
     double min_buffer_time = 1.0;
-    avio_printf(s->pb, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-    avio_printf(s->pb, "<MPD\n");
-    avio_printf(s->pb, "  xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"\n");
-    avio_printf(s->pb, "  xmlns=\"urn:mpeg:DASH:schema:MPD:2011\"\n");
-    avio_printf(s->pb, "  xsi:schemaLocation=\"urn:mpeg:DASH:schema:MPD:2011\"\n");
-    avio_printf(s->pb, "  type=\"%s\"\n", w->is_live ? "dynamic" : "static");
+    avio_printf(pb, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    avio_printf(pb, "<MPD\n");
+    avio_printf(pb, "  xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"\n");
+    avio_printf(pb, "  xmlns=\"urn:mpeg:DASH:schema:MPD:2011\"\n");
+    avio_printf(pb, "  xsi:schemaLocation=\"urn:mpeg:DASH:schema:MPD:2011\"\n");
+    avio_printf(pb, "  type=\"%s\"\n", w->is_live ? "dynamic" : "static");
     if (!w->is_live) {
-        avio_printf(s->pb, "  mediaPresentationDuration=\"PT%gS\"\n",
+        avio_printf(pb, "  mediaPresentationDuration=\"PT%gS\"\n",
                     get_duration(s));
     }
-    avio_printf(s->pb, "  minBufferTime=\"PT%gS\"\n", min_buffer_time);
-    avio_printf(s->pb, "  profiles=\"%s\"%s",
-                w->is_live ? "urn:mpeg:dash:profile:isoff-live:2011" : "urn:webm:dash:profile:webm-on-demand:2012",
+    avio_printf(pb, "  minBufferTime=\"PT%gS\"\n", min_buffer_time);
+    avio_printf(pb, "  profiles=\"%s\"%s",
+                w->is_live ? "urn:mpeg:dash:profile:isoff-live:2011" : "urn:mpeg:dash:profile:webm-on-demand:2012",
                 w->is_live ? "\n" : ">\n");
     if (w->is_live) {
         time_t local_time = time(NULL);
@@ -114,17 +108,17 @@ static int write_header(AVFormatContext *s)
         if (!strftime(gmt_iso, 21, "%Y-%m-%dT%H:%M:%SZ", gmt)) {
             return AVERROR_UNKNOWN;
         }
-        if (w->debug_mode) {
+        if (s->flags & AVFMT_FLAG_BITEXACT) {
             av_strlcpy(gmt_iso, "", 1);
         }
-        avio_printf(s->pb, "  availabilityStartTime=\"%s\"\n", gmt_iso);
-        avio_printf(s->pb, "  timeShiftBufferDepth=\"PT%gS\"\n", w->time_shift_buffer_depth);
-        avio_printf(s->pb, "  minimumUpdatePeriod=\"PT%dS\"", w->minimum_update_period);
-        avio_printf(s->pb, ">\n");
+        avio_printf(pb, "  availabilityStartTime=\"%s\"\n", gmt_iso);
+        avio_printf(pb, "  timeShiftBufferDepth=\"PT%gS\"\n", w->time_shift_buffer_depth);
+        avio_printf(pb, "  minimumUpdatePeriod=\"PT%dS\"", w->minimum_update_period);
+        avio_printf(pb, ">\n");
         if (w->utc_timing_url) {
-            avio_printf(s->pb, "<UTCTiming\n");
-            avio_printf(s->pb, "  schemeIdUri=\"urn:mpeg:dash:utc:http-iso:2014\"\n");
-            avio_printf(s->pb, "  value=\"%s\"/>\n", w->utc_timing_url);
+            avio_printf(pb, "<UTCTiming\n");
+            avio_printf(pb, "  schemeIdUri=\"urn:mpeg:dash:utc:http-iso:2014\"\n");
+            avio_printf(pb, "  value=\"%s\"/>\n", w->utc_timing_url);
         }
     }
     return 0;
@@ -135,7 +129,8 @@ static void write_footer(AVFormatContext *s)
     avio_printf(s->pb, "</MPD>\n");
 }
 
-static int subsegment_alignment(AVFormatContext *s, AdaptationSet *as) {
+static int subsegment_alignment(AVFormatContext *s, const AdaptationSet *as)
+{
     int i;
     AVDictionaryEntry *gold = av_dict_get(s->streams[as->streams[0]]->metadata,
                                           CUE_TIMESTAMPS, NULL, 0);
@@ -143,26 +138,30 @@ static int subsegment_alignment(AVFormatContext *s, AdaptationSet *as) {
     for (i = 1; i < as->nb_streams; i++) {
         AVDictionaryEntry *ts = av_dict_get(s->streams[as->streams[i]]->metadata,
                                             CUE_TIMESTAMPS, NULL, 0);
-        if (!ts || strncmp(gold->value, ts->value, strlen(gold->value))) return 0;
+        if (!ts || !av_strstart(ts->value, gold->value, NULL)) return 0;
     }
     return 1;
 }
 
-static int bitstream_switching(AVFormatContext *s, AdaptationSet *as) {
+static int bitstream_switching(AVFormatContext *s, const AdaptationSet *as)
+{
     int i;
-    AVDictionaryEntry *gold_track_num = av_dict_get(s->streams[as->streams[0]]->metadata,
+    const AVStream *gold_st = s->streams[as->streams[0]];
+    AVDictionaryEntry *gold_track_num = av_dict_get(gold_st->metadata,
                                                     TRACK_NUMBER, NULL, 0);
-    AVCodecContext *gold_codec = s->streams[as->streams[0]]->codec;
+    AVCodecParameters *gold_par = gold_st->codecpar;
     if (!gold_track_num) return 0;
     for (i = 1; i < as->nb_streams; i++) {
-        AVDictionaryEntry *track_num = av_dict_get(s->streams[as->streams[i]]->metadata,
+        const AVStream *st = s->streams[as->streams[i]];
+        AVDictionaryEntry *track_num = av_dict_get(st->metadata,
                                                    TRACK_NUMBER, NULL, 0);
-        AVCodecContext *codec = s->streams[as->streams[i]]->codec;
+        AVCodecParameters *par = st->codecpar;
         if (!track_num ||
-            strncmp(gold_track_num->value, track_num->value, strlen(gold_track_num->value)) ||
-            gold_codec->codec_id != codec->codec_id ||
-            gold_codec->extradata_size != codec->extradata_size ||
-            memcmp(gold_codec->extradata, codec->extradata, codec->extradata_size)) {
+            !av_strstart(track_num->value, gold_track_num->value, NULL) ||
+            gold_par->codec_id != par->codec_id ||
+            gold_par->extradata_size != par->extradata_size ||
+            (par->extradata_size > 0 &&
+             memcmp(gold_par->extradata, par->extradata, par->extradata_size))) {
             return 0;
         }
     }
@@ -173,60 +172,70 @@ static int bitstream_switching(AVFormatContext *s, AdaptationSet *as) {
  * Writes a Representation within an Adaptation Set. Returns 0 on success and
  * < 0 on failure.
  */
-static int write_representation(AVFormatContext *s, AVStream *stream, char *id,
+static int write_representation(AVFormatContext *s, AVStream *st, char *id,
                                 int output_width, int output_height,
-                                int output_sample_rate) {
+                                int output_sample_rate)
+{
     WebMDashMuxContext *w = s->priv_data;
-    AVDictionaryEntry *irange = av_dict_get(stream->metadata, INITIALIZATION_RANGE, NULL, 0);
-    AVDictionaryEntry *cues_start = av_dict_get(stream->metadata, CUES_START, NULL, 0);
-    AVDictionaryEntry *cues_end = av_dict_get(stream->metadata, CUES_END, NULL, 0);
-    AVDictionaryEntry *filename = av_dict_get(stream->metadata, FILENAME, NULL, 0);
-    AVDictionaryEntry *bandwidth = av_dict_get(stream->metadata, BANDWIDTH, NULL, 0);
-    if ((w->is_live && (!filename)) ||
-        (!w->is_live && (!irange || !cues_start || !cues_end || !filename || !bandwidth))) {
-        return AVERROR_INVALIDDATA;
+    AVIOContext *pb = s->pb;
+    const AVCodecParameters *par = st->codecpar;
+    AVDictionaryEntry *bandwidth = av_dict_get(st->metadata, BANDWIDTH, NULL, 0);
+    const char *bandwidth_str;
+    avio_printf(pb, "<Representation id=\"%s\"", id);
+    if (bandwidth) {
+        bandwidth_str = bandwidth->value;
+    } else if (w->is_live) {
+        // if bandwidth for live was not provided, use a default
+        bandwidth_str = (par->codec_type == AVMEDIA_TYPE_AUDIO) ? "128000" : "1000000";
+    } else {
+        return AVERROR(EINVAL);
     }
-    avio_printf(s->pb, "<Representation id=\"%s\"", id);
-    // FIXME: For live, This should be obtained from the input file or as an AVOption.
-    avio_printf(s->pb, " bandwidth=\"%s\"",
-                w->is_live ? (stream->codec->codec_type == AVMEDIA_TYPE_AUDIO ? "128000" : "1000000") : bandwidth->value);
-    if (stream->codec->codec_type == AVMEDIA_TYPE_VIDEO && output_width)
-        avio_printf(s->pb, " width=\"%d\"", stream->codec->width);
-    if (stream->codec->codec_type == AVMEDIA_TYPE_VIDEO && output_height)
-        avio_printf(s->pb, " height=\"%d\"", stream->codec->height);
-    if (stream->codec->codec_type = AVMEDIA_TYPE_AUDIO && output_sample_rate)
-        avio_printf(s->pb, " audioSamplingRate=\"%d\"", stream->codec->sample_rate);
+    avio_printf(pb, " bandwidth=\"%s\"", bandwidth_str);
+    if (par->codec_type == AVMEDIA_TYPE_VIDEO && output_width)
+        avio_printf(pb, " width=\"%d\"", par->width);
+    if (par->codec_type == AVMEDIA_TYPE_VIDEO && output_height)
+        avio_printf(pb, " height=\"%d\"", par->height);
+    if (par->codec_type == AVMEDIA_TYPE_AUDIO && output_sample_rate)
+        avio_printf(pb, " audioSamplingRate=\"%d\"", par->sample_rate);
     if (w->is_live) {
         // For live streams, Codec and Mime Type always go in the Representation tag.
-        avio_printf(s->pb, " codecs=\"%s\"", get_codec_name(stream->codec->codec_id));
-        avio_printf(s->pb, " mimeType=\"%s/webm\"",
-                    stream->codec->codec_type == AVMEDIA_TYPE_VIDEO ? "video" : "audio");
+        avio_printf(pb, " codecs=\"%s\"", get_codec_name(par->codec_id));
+        avio_printf(pb, " mimeType=\"%s/webm\"",
+                    par->codec_type == AVMEDIA_TYPE_VIDEO ? "video" : "audio");
         // For live streams, subsegments always start with key frames. So this
         // is always 1.
-        avio_printf(s->pb, " startsWithSAP=\"1\"");
-        avio_printf(s->pb, ">");
+        avio_printf(pb, " startsWithSAP=\"1\"");
+        avio_printf(pb, ">");
     } else {
-        avio_printf(s->pb, ">\n");
-        avio_printf(s->pb, "<BaseURL>%s</BaseURL>\n", filename->value);
-        avio_printf(s->pb, "<SegmentBase\n");
-        avio_printf(s->pb, "  indexRange=\"%s-%s\">\n", cues_start->value, cues_end->value);
-        avio_printf(s->pb, "<Initialization\n");
-        avio_printf(s->pb, "  range=\"0-%s\" />\n", irange->value);
-        avio_printf(s->pb, "</SegmentBase>\n");
+        AVDictionaryEntry *irange = av_dict_get(st->metadata, INITIALIZATION_RANGE, NULL, 0);
+        AVDictionaryEntry *cues_start = av_dict_get(st->metadata, CUES_START, NULL, 0);
+        AVDictionaryEntry *cues_end = av_dict_get(st->metadata, CUES_END, NULL, 0);
+        AVDictionaryEntry *filename = av_dict_get(st->metadata, FILENAME, NULL, 0);
+        if (!irange || !cues_start || !cues_end || !filename)
+            return AVERROR(EINVAL);
+
+        avio_printf(pb, ">\n");
+        avio_printf(pb, "<BaseURL>%s</BaseURL>\n", filename->value);
+        avio_printf(pb, "<SegmentBase\n");
+        avio_printf(pb, "  indexRange=\"%s-%s\">\n", cues_start->value, cues_end->value);
+        avio_printf(pb, "<Initialization\n");
+        avio_printf(pb, "  range=\"0-%s\" />\n", irange->value);
+        avio_printf(pb, "</SegmentBase>\n");
     }
-    avio_printf(s->pb, "</Representation>\n");
+    avio_printf(pb, "</Representation>\n");
     return 0;
 }
 
 /*
  * Checks if width of all streams are the same. Returns 1 if true, 0 otherwise.
  */
-static int check_matching_width(AVFormatContext *s, AdaptationSet *as) {
+static int check_matching_width(AVFormatContext *s, const AdaptationSet *as)
+{
     int first_width, i;
     if (as->nb_streams < 2) return 1;
-    first_width = s->streams[as->streams[0]]->codec->width;
+    first_width = s->streams[as->streams[0]]->codecpar->width;
     for (i = 1; i < as->nb_streams; i++)
-        if (first_width != s->streams[as->streams[i]]->codec->width)
+        if (first_width != s->streams[as->streams[i]]->codecpar->width)
           return 0;
     return 1;
 }
@@ -234,12 +243,13 @@ static int check_matching_width(AVFormatContext *s, AdaptationSet *as) {
 /*
  * Checks if height of all streams are the same. Returns 1 if true, 0 otherwise.
  */
-static int check_matching_height(AVFormatContext *s, AdaptationSet *as) {
+static int check_matching_height(AVFormatContext *s, const AdaptationSet *as)
+{
     int first_height, i;
     if (as->nb_streams < 2) return 1;
-    first_height = s->streams[as->streams[0]]->codec->height;
+    first_height = s->streams[as->streams[0]]->codecpar->height;
     for (i = 1; i < as->nb_streams; i++)
-        if (first_height != s->streams[as->streams[i]]->codec->height)
+        if (first_height != s->streams[as->streams[i]]->codecpar->height)
           return 0;
     return 1;
 }
@@ -247,17 +257,19 @@ static int check_matching_height(AVFormatContext *s, AdaptationSet *as) {
 /*
  * Checks if sample rate of all streams are the same. Returns 1 if true, 0 otherwise.
  */
-static int check_matching_sample_rate(AVFormatContext *s, AdaptationSet *as) {
+static int check_matching_sample_rate(AVFormatContext *s, const AdaptationSet *as)
+{
     int first_sample_rate, i;
     if (as->nb_streams < 2) return 1;
-    first_sample_rate = s->streams[as->streams[0]]->codec->sample_rate;
+    first_sample_rate = s->streams[as->streams[0]]->codecpar->sample_rate;
     for (i = 1; i < as->nb_streams; i++)
-        if (first_sample_rate != s->streams[as->streams[i]]->codec->sample_rate)
+        if (first_sample_rate != s->streams[as->streams[i]]->codecpar->sample_rate)
           return 0;
     return 1;
 }
 
-static void free_adaptation_sets(AVFormatContext *s) {
+static void free_adaptation_sets(AVFormatContext *s)
+{
     WebMDashMuxContext *w = s->priv_data;
     int i;
     for (i = 0; i < w->nb_as; i++) {
@@ -268,47 +280,23 @@ static void free_adaptation_sets(AVFormatContext *s) {
 }
 
 /*
- * Parses a live header filename and computes the representation id,
- * initialization pattern and the media pattern. Pass NULL if you don't want to
- * compute any of those 3. Returns 0 on success and non-zero on failure.
+ * Parses a live header filename and returns the position of the '_' and '.'
+ * delimiting <file_description> and <representation_id>.
  *
  * Name of the header file should conform to the following pattern:
  * <file_description>_<representation_id>.hdr where <file_description> can be
  * anything. The chunks should be named according to the following pattern:
  * <file_description>_<representation_id>_<chunk_number>.chk
  */
-static int parse_filename(char *filename, char **representation_id,
-                          char **initialization_pattern, char **media_pattern) {
-    char *underscore_pos = NULL;
-    char *period_pos = NULL;
-    char *temp_pos = NULL;
-    char *filename_str = av_strdup(filename);
-    if (!filename_str) return AVERROR(ENOMEM);
-    temp_pos = av_stristr(filename_str, "_");
-    while (temp_pos) {
-        underscore_pos = temp_pos + 1;
-        temp_pos = av_stristr(temp_pos + 1, "_");
-    }
-    if (!underscore_pos) return AVERROR_INVALIDDATA;
-    period_pos = av_stristr(underscore_pos, ".");
-    if (!period_pos) return AVERROR_INVALIDDATA;
-    *(underscore_pos - 1) = 0;
-    if (representation_id) {
-        *representation_id = av_malloc(period_pos - underscore_pos + 1);
-        if (!(*representation_id)) return AVERROR(ENOMEM);
-        av_strlcpy(*representation_id, underscore_pos, period_pos - underscore_pos + 1);
-    }
-    if (initialization_pattern) {
-        *initialization_pattern = av_asprintf("%s_$RepresentationID$.hdr",
-                                              filename_str);
-        if (!(*initialization_pattern)) return AVERROR(ENOMEM);
-    }
-    if (media_pattern) {
-        *media_pattern = av_asprintf("%s_$RepresentationID$_$Number$.chk",
-                                     filename_str);
-        if (!(*media_pattern)) return AVERROR(ENOMEM);
-    }
-    av_free(filename_str);
+static int split_filename(char *filename, char **underscore_pos,
+                          char **period_pos)
+{
+    *underscore_pos = strrchr(filename, '_');
+    if (!*underscore_pos)
+        return AVERROR(EINVAL);
+    *period_pos = strchr(*underscore_pos, '.');
+    if (!*period_pos)
+        return AVERROR(EINVAL);
     return 0;
 }
 
@@ -319,8 +307,10 @@ static int write_adaptation_set(AVFormatContext *s, int as_index)
 {
     WebMDashMuxContext *w = s->priv_data;
     AdaptationSet *as = &w->as[as_index];
-    AVCodecContext *codec = s->streams[as->streams[0]]->codec;
+    const AVStream *st = s->streams[as->streams[0]];
+    AVCodecParameters *par = st->codecpar;
     AVDictionaryEntry *lang;
+    AVIOContext *pb = s->pb;
     int i;
     static const char boolean[2][6] = { "false", "true" };
     int subsegmentStartsWithSAP = 1;
@@ -330,31 +320,32 @@ static int write_adaptation_set(AVFormatContext *s, int as_index)
     // on their respective Representation tag. For live streams, they always go
     // in the Representation tag.
     int width_in_as = 1, height_in_as = 1, sample_rate_in_as = 1;
-    if (codec->codec_type == AVMEDIA_TYPE_VIDEO) {
-      width_in_as = !w->is_live && check_matching_width(s, as);
+    if (par->codec_type == AVMEDIA_TYPE_VIDEO) {
+      width_in_as  = !w->is_live && check_matching_width (s, as);
       height_in_as = !w->is_live && check_matching_height(s, as);
     } else {
       sample_rate_in_as = !w->is_live && check_matching_sample_rate(s, as);
     }
 
-    avio_printf(s->pb, "<AdaptationSet id=\"%s\"", as->id);
-    avio_printf(s->pb, " mimeType=\"%s/webm\"",
-                codec->codec_type == AVMEDIA_TYPE_VIDEO ? "video" : "audio");
-    avio_printf(s->pb, " codecs=\"%s\"", get_codec_name(codec->codec_id));
+    avio_printf(pb, "<AdaptationSet id=\"%s\"", as->id);
+    avio_printf(pb, " mimeType=\"%s/webm\"",
+                par->codec_type == AVMEDIA_TYPE_VIDEO ? "video" : "audio");
+    avio_printf(pb, " codecs=\"%s\"", get_codec_name(par->codec_id));
 
-    lang = av_dict_get(s->streams[as->streams[0]]->metadata, "language", NULL, 0);
-    if (lang) avio_printf(s->pb, " lang=\"%s\"", lang->value);
+    lang = av_dict_get(st->metadata, "language", NULL, 0);
+    if (lang)
+        avio_printf(pb, " lang=\"%s\"", lang->value);
 
-    if (codec->codec_type == AVMEDIA_TYPE_VIDEO && width_in_as)
-        avio_printf(s->pb, " width=\"%d\"", codec->width);
-    if (codec->codec_type == AVMEDIA_TYPE_VIDEO && height_in_as)
-        avio_printf(s->pb, " height=\"%d\"", codec->height);
-    if (codec->codec_type == AVMEDIA_TYPE_AUDIO && sample_rate_in_as)
-        avio_printf(s->pb, " audioSamplingRate=\"%d\"", codec->sample_rate);
+    if (par->codec_type == AVMEDIA_TYPE_VIDEO && width_in_as)
+        avio_printf(pb, " width=\"%d\"", par->width);
+    if (par->codec_type == AVMEDIA_TYPE_VIDEO && height_in_as)
+        avio_printf(pb, " height=\"%d\"", par->height);
+    if (par->codec_type == AVMEDIA_TYPE_AUDIO && sample_rate_in_as)
+        avio_printf(pb, " audioSamplingRate=\"%d\"", par->sample_rate);
 
-    avio_printf(s->pb, " bitstreamSwitching=\"%s\"",
+    avio_printf(pb, " bitstreamSwitching=\"%s\"",
                 boolean[bitstream_switching(s, as)]);
-    avio_printf(s->pb, " subsegmentAlignment=\"%s\"",
+    avio_printf(pb, " subsegmentAlignment=\"%s\"",
                 boolean[w->is_live || subsegment_alignment(s, as)]);
 
     for (i = 0; i < as->nb_streams; i++) {
@@ -362,64 +353,58 @@ static int write_adaptation_set(AVFormatContext *s, int as_index)
                                             CLUSTER_KEYFRAME, NULL, 0);
         if (!w->is_live && (!kf || !strncmp(kf->value, "0", 1))) subsegmentStartsWithSAP = 0;
     }
-    avio_printf(s->pb, " subsegmentStartsWithSAP=\"%d\"", subsegmentStartsWithSAP);
-    avio_printf(s->pb, ">\n");
+    avio_printf(pb, " subsegmentStartsWithSAP=\"%d\"", subsegmentStartsWithSAP);
+    avio_printf(pb, ">\n");
 
     if (w->is_live) {
         AVDictionaryEntry *filename =
-            av_dict_get(s->streams[as->streams[0]]->metadata, FILENAME, NULL, 0);
-        char *initialization_pattern = NULL;
-        char *media_pattern = NULL;
-        int ret = parse_filename(filename->value, NULL, &initialization_pattern,
-                                 &media_pattern);
+            av_dict_get(st->metadata, FILENAME, NULL, 0);
+        char *underscore_pos, *period_pos;
+        int ret;
+        if (!filename)
+            return AVERROR(EINVAL);
+        ret = split_filename(filename->value, &underscore_pos, &period_pos);
         if (ret) return ret;
-        avio_printf(s->pb, "<ContentComponent id=\"1\" type=\"%s\"/>\n",
-                    codec->codec_type == AVMEDIA_TYPE_VIDEO ? "video" : "audio");
-        avio_printf(s->pb, "<SegmentTemplate");
-        avio_printf(s->pb, " timescale=\"1000\"");
-        avio_printf(s->pb, " duration=\"%d\"", w->chunk_duration);
-        avio_printf(s->pb, " media=\"%s\"", media_pattern);
-        avio_printf(s->pb, " startNumber=\"%d\"", w->chunk_start_index);
-        avio_printf(s->pb, " initialization=\"%s\"", initialization_pattern);
-        avio_printf(s->pb, "/>\n");
-        av_free(initialization_pattern);
-        av_free(media_pattern);
+        *underscore_pos = '\0';
+        avio_printf(pb, "<ContentComponent id=\"1\" type=\"%s\"/>\n",
+                    par->codec_type == AVMEDIA_TYPE_VIDEO ? "video" : "audio");
+        avio_printf(pb, "<SegmentTemplate");
+        avio_printf(pb, " timescale=\"1000\"");
+        avio_printf(pb, " duration=\"%d\"", w->chunk_duration);
+        avio_printf(pb, " media=\"%s_$RepresentationID$_$Number$.chk\"",
+                    filename->value);
+        avio_printf(pb, " startNumber=\"%d\"", w->chunk_start_index);
+        avio_printf(pb, " initialization=\"%s_$RepresentationID$.hdr\"",
+                    filename->value);
+        avio_printf(pb, "/>\n");
+        *underscore_pos = '_';
     }
 
     for (i = 0; i < as->nb_streams; i++) {
-        char *representation_id = NULL;
+        char buf[25], *representation_id = buf, *underscore_pos, *period_pos;
+        AVStream *st = s->streams[as->streams[i]];
         int ret;
         if (w->is_live) {
             AVDictionaryEntry *filename =
-                av_dict_get(s->streams[as->streams[i]]->metadata, FILENAME, NULL, 0);
-            if (!filename ||
-                (ret = parse_filename(filename->value, &representation_id, NULL, NULL))) {
+                av_dict_get(st->metadata, FILENAME, NULL, 0);
+            if (!filename)
+                return AVERROR(EINVAL);
+            ret = split_filename(filename->value, &underscore_pos, &period_pos);
+            if (ret < 0)
                 return ret;
-            }
+            representation_id = underscore_pos + 1;
+            *period_pos       = '\0';
         } else {
-            representation_id = av_asprintf("%d", w->representation_id++);
-            if (!representation_id) return AVERROR(ENOMEM);
+            snprintf(buf, sizeof(buf), "%d", w->representation_id++);
         }
-        ret = write_representation(s, s->streams[as->streams[i]],
-                                   representation_id, !width_in_as,
+        ret = write_representation(s, st, representation_id, !width_in_as,
                                    !height_in_as, !sample_rate_in_as);
-        av_free(representation_id);
         if (ret) return ret;
+        if (w->is_live)
+            *period_pos = '.';
     }
     avio_printf(s->pb, "</AdaptationSet>\n");
     return 0;
-}
-
-static int to_integer(char *p, int len)
-{
-    int ret;
-    char *q = av_malloc(sizeof(char) * len);
-    if (!q)
-        return AVERROR(ENOMEM);
-    av_strlcpy(q, p, len);
-    ret = atoi(q);
-    av_free(q);
-    return ret;
 }
 
 static int parse_adaptation_sets(AVFormatContext *s)
@@ -428,13 +413,24 @@ static int parse_adaptation_sets(AVFormatContext *s)
     char *p = w->adaptation_sets;
     char *q;
     enum { new_set, parsed_id, parsing_streams } state;
+    if (!w->adaptation_sets) {
+        av_log(s, AV_LOG_ERROR, "The 'adaptation_sets' option must be set.\n");
+        return AVERROR(EINVAL);
+    }
     // syntax id=0,streams=0,1,2 id=1,streams=3,4 and so on
     state = new_set;
-    while (p < w->adaptation_sets + strlen(w->adaptation_sets)) {
-        if (*p == ' ')
+    while (1) {
+        if (*p == '\0') {
+            if (state == new_set)
+                break;
+            else
+                return AVERROR(EINVAL);
+        } else if (state == new_set && *p == ' ') {
+            p++;
             continue;
-        else if (state == new_set && !strncmp(p, "id=", 3)) {
+        } else if (state == new_set && !strncmp(p, "id=", 3)) {
             void *mem = av_realloc(w->as, sizeof(*w->as) * (w->nb_as + 1));
+            const char *comma;
             if (mem == NULL)
                 return AVERROR(ENOMEM);
             w->as = mem;
@@ -443,6 +439,11 @@ static int parse_adaptation_sets(AVFormatContext *s)
             w->as[w->nb_as - 1].streams = NULL;
             p += 3; // consume "id="
             q = w->as[w->nb_as - 1].id;
+            comma = strchr(p, ',');
+            if (!comma || comma - p >= sizeof(w->as[w->nb_as - 1].id)) {
+                av_log(s, AV_LOG_ERROR, "'id' in 'adaptation_sets' is malformed.\n");
+                return AVERROR(EINVAL);
+            }
             while (*p != ',') *q++ = *p++;
             *q = 0;
             p++;
@@ -452,13 +453,18 @@ static int parse_adaptation_sets(AVFormatContext *s)
             state = parsing_streams;
         } else if (state == parsing_streams) {
             struct AdaptationSet *as = &w->as[w->nb_as - 1];
-            q = p;
-            while (*q != '\0' && *q != ',' && *q != ' ') q++;
-            as->streams = av_realloc(as->streams, sizeof(*as->streams) * ++as->nb_streams);
-            if (as->streams == NULL)
-                return AVERROR(ENOMEM);
-            as->streams[as->nb_streams - 1] = to_integer(p, q - p + 1);
-            if (as->streams[as->nb_streams - 1] < 0) return -1;
+            int64_t num;
+            int ret = av_reallocp_array(&as->streams, ++as->nb_streams,
+                                        sizeof(*as->streams));
+            if (ret < 0)
+                return ret;
+            num = strtoll(p, &q, 10);
+            if (!av_isdigit(*p) || (*q != ' ' && *q != '\0' && *q != ',') ||
+                num < 0 || num >= s->nb_streams) {
+                av_log(s, AV_LOG_ERROR, "Invalid value for 'streams' in adapation_sets.\n");
+                return AVERROR(EINVAL);
+            }
+            as->streams[as->nb_streams - 1] = num;
             if (*q == '\0') break;
             if (*q == ' ') state = new_set;
             p = ++q;
@@ -475,6 +481,15 @@ static int webm_dash_manifest_write_header(AVFormatContext *s)
     double start = 0.0;
     int ret;
     WebMDashMuxContext *w = s->priv_data;
+
+    for (unsigned i = 0; i < s->nb_streams; i++) {
+        enum AVCodecID codec_id = s->streams[i]->codecpar->codec_id;
+        if (codec_id != AV_CODEC_ID_VP8    && codec_id != AV_CODEC_ID_VP9 &&
+            codec_id != AV_CODEC_ID_AV1    && codec_id != AV_CODEC_ID_VORBIS &&
+            codec_id != AV_CODEC_ID_OPUS)
+            return AVERROR(EINVAL);
+    }
+
     ret = parse_adaptation_sets(s);
     if (ret < 0) {
         goto fail;
@@ -509,17 +524,10 @@ static int webm_dash_manifest_write_packet(AVFormatContext *s, AVPacket *pkt)
     return AVERROR_EOF;
 }
 
-static int webm_dash_manifest_write_trailer(AVFormatContext *s)
-{
-    free_adaptation_sets(s);
-    return 0;
-}
-
 #define OFFSET(x) offsetof(WebMDashMuxContext, x)
 static const AVOption options[] = {
     { "adaptation_sets", "Adaptation sets. Syntax: id=0,streams=0,1,2 id=1,streams=3,4 and so on", OFFSET(adaptation_sets), AV_OPT_TYPE_STRING, { 0 }, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
-    { "debug_mode", "[private option - users should never set this]. set this to 1 to create deterministic output", OFFSET(debug_mode), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 1, AV_OPT_FLAG_ENCODING_PARAM },
-    { "live", "set this to 1 to create a live stream manifest", OFFSET(is_live), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 1, AV_OPT_FLAG_ENCODING_PARAM },
+    { "live", "create a live stream manifest", OFFSET(is_live), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, AV_OPT_FLAG_ENCODING_PARAM },
     { "chunk_start_index",  "start index of the chunk", OFFSET(chunk_start_index), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, AV_OPT_FLAG_ENCODING_PARAM },
     { "chunk_duration_ms", "duration of each chunk (in milliseconds)", OFFSET(chunk_duration), AV_OPT_TYPE_INT, {.i64 = 1000}, 0, INT_MAX, AV_OPT_FLAG_ENCODING_PARAM },
     { "utc_timing_url", "URL of the page that will return the UTC timestamp in ISO format", OFFSET(utc_timing_url), AV_OPT_TYPE_STRING, { 0 }, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
@@ -528,7 +536,6 @@ static const AVOption options[] = {
     { NULL },
 };
 
-#if CONFIG_WEBM_DASH_MANIFEST_MUXER
 static const AVClass webm_dash_class = {
     .class_name = "WebM DASH Manifest muxer",
     .item_name  = av_default_item_name,
@@ -536,15 +543,13 @@ static const AVClass webm_dash_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-AVOutputFormat ff_webm_dash_manifest_muxer = {
-    .name              = "webm_dash_manifest",
-    .long_name         = NULL_IF_CONFIG_SMALL("WebM DASH Manifest"),
-    .mime_type         = "application/xml",
-    .extensions        = "xml",
+const FFOutputFormat ff_webm_dash_manifest_muxer = {
+    .p.name            = "webm_dash_manifest",
+    .p.long_name       = NULL_IF_CONFIG_SMALL("WebM DASH Manifest"),
+    .p.mime_type       = "application/xml",
+    .p.extensions      = "xml",
     .priv_data_size    = sizeof(WebMDashMuxContext),
     .write_header      = webm_dash_manifest_write_header,
     .write_packet      = webm_dash_manifest_write_packet,
-    .write_trailer     = webm_dash_manifest_write_trailer,
-    .priv_class        = &webm_dash_class,
+    .p.priv_class      = &webm_dash_class,
 };
-#endif

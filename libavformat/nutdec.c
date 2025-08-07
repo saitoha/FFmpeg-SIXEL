@@ -26,9 +26,11 @@
 #include "libavutil/dict.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mathematics.h"
+#include "libavutil/mem.h"
 #include "libavutil/tree.h"
 #include "libavcodec/bytestream.h"
 #include "avio_internal.h"
+#include "demux.h"
 #include "isom.h"
 #include "nut.h"
 #include "riff.h"
@@ -86,46 +88,10 @@ static uint64_t get_fourcc(AVIOContext *bc)
     }
 }
 
-#ifdef TRACE
-static inline uint64_t get_v_trace(AVIOContext *bc, const char *file,
-                                   const char *func, int line)
-{
-    uint64_t v = ffio_read_varlen(bc);
-
-    av_log(NULL, AV_LOG_DEBUG, "get_v %5"PRId64" / %"PRIX64" in %s %s:%d\n",
-           v, v, file, func, line);
-    return v;
-}
-
-static inline int64_t get_s_trace(AVIOContext *bc, const char *file,
-                                  const char *func, int line)
-{
-    int64_t v = get_s(bc);
-
-    av_log(NULL, AV_LOG_DEBUG, "get_s %5"PRId64" / %"PRIX64" in %s %s:%d\n",
-           v, v, file, func, line);
-    return v;
-}
-
-static inline uint64_t get_4cc_trace(AVIOContext *bc, char *file,
-                                    char *func, int line)
-{
-    uint64_t v = get_fourcc(bc);
-
-    av_log(NULL, AV_LOG_DEBUG, "get_fourcc %5"PRId64" / %"PRIX64" in %s %s:%d\n",
-           v, v, file, func, line);
-    return v;
-}
-#define ffio_read_varlen(bc) get_v_trace(bc,  __FILE__, __PRETTY_FUNCTION__, __LINE__)
-#define get_s(bc)            get_s_trace(bc,  __FILE__, __PRETTY_FUNCTION__, __LINE__)
-#define get_fourcc(bc)       get_4cc_trace(bc, __FILE__, __PRETTY_FUNCTION__, __LINE__)
-#endif
-
 static int get_packetheader(NUTContext *nut, AVIOContext *bc,
                             int calculate_checksum, uint64_t startcode)
 {
     int64_t size;
-//    start = avio_tell(bc) - 8;
 
     startcode = av_be2ne64(startcode);
     startcode = ff_crc04C11DB7_update(0, (uint8_t*) &startcode, 8);
@@ -185,7 +151,7 @@ static int64_t find_startcode(AVIOContext *bc, uint64_t code, int64_t pos)
     }
 }
 
-static int nut_probe(AVProbeData *p)
+static int nut_probe(const AVProbeData *p)
 {
     int i;
 
@@ -229,16 +195,18 @@ static int decode_main_header(NUTContext *nut)
 {
     AVFormatContext *s = nut->avf;
     AVIOContext *bc    = s->pb;
-    uint64_t tmp, end;
+    uint64_t tmp, end, length;
     unsigned int stream_count;
     int i, j, count, ret;
     int tmp_stream, tmp_mul, tmp_pts, tmp_size, tmp_res, tmp_head_idx;
 
-    end  = get_packetheader(nut, bc, 1, MAIN_STARTCODE);
-    end += avio_tell(bc);
+    length = get_packetheader(nut, bc, 1, MAIN_STARTCODE);
+    if (length == (uint64_t)-1)
+        return AVERROR_INVALIDDATA;
+    end = length + avio_tell(bc);
 
     nut->version = ffio_read_varlen(bc);
-    if (nut->version < NUT_MIN_VERSION &&
+    if (nut->version < NUT_MIN_VERSION ||
         nut->version > NUT_MAX_VERSION) {
         av_log(s, AV_LOG_ERROR, "Version %d not supported.\n",
                nut->version);
@@ -255,7 +223,7 @@ static int decode_main_header(NUTContext *nut)
         nut->max_distance = 65536;
     }
 
-    GET_V(nut->time_base_count, tmp > 0 && tmp < INT_MAX / sizeof(AVRational));
+    GET_V(nut->time_base_count, tmp > 0 && tmp < INT_MAX / sizeof(AVRational) && tmp < length/2);
     nut->time_base = av_malloc_array(nut->time_base_count, sizeof(AVRational));
     if (!nut->time_base)
         return AVERROR(ENOMEM);
@@ -264,7 +232,9 @@ static int decode_main_header(NUTContext *nut)
         GET_V(nut->time_base[i].num, tmp > 0 && tmp < (1ULL << 31));
         GET_V(nut->time_base[i].den, tmp > 0 && tmp < (1ULL << 31));
         if (av_gcd(nut->time_base[i].num, nut->time_base[i].den) != 1) {
-            av_log(s, AV_LOG_ERROR, "time base invalid\n");
+            av_log(s, AV_LOG_ERROR, "invalid time base %d/%d\n",
+                   nut->time_base[i].num,
+                   nut->time_base[i].den);
             ret = AVERROR_INVALIDDATA;
             goto fail;
         }
@@ -276,6 +246,11 @@ static int decode_main_header(NUTContext *nut)
     for (i = 0; i < 256;) {
         int tmp_flags  = ffio_read_varlen(bc);
         int tmp_fields = ffio_read_varlen(bc);
+        if (tmp_fields < 0) {
+            av_log(s, AV_LOG_ERROR, "fields %d is invalid\n", tmp_fields);
+            ret = AVERROR_INVALIDDATA;
+            goto fail;
+        }
 
         if (tmp_fields > 0)
             tmp_pts = get_s(bc);
@@ -294,7 +269,7 @@ static int decode_main_header(NUTContext *nut)
         if (tmp_fields > 5)
             count = ffio_read_varlen(bc);
         else
-            count = tmp_mul - tmp_size;
+            count = tmp_mul - (unsigned)tmp_size;
         if (tmp_fields > 6)
             get_s(bc);
         if (tmp_fields > 7)
@@ -315,7 +290,13 @@ static int decode_main_header(NUTContext *nut)
             goto fail;
         }
         if (tmp_stream >= stream_count) {
-            av_log(s, AV_LOG_ERROR, "illegal stream number\n");
+            av_log(s, AV_LOG_ERROR, "illegal stream number %d >= %d\n",
+                   tmp_stream, stream_count);
+            ret = AVERROR_INVALIDDATA;
+            goto fail;
+        }
+        if (tmp_size < 0 || tmp_size > INT_MAX - count) {
+            av_log(s, AV_LOG_ERROR, "illegal size\n");
             ret = AVERROR_INVALIDDATA;
             goto fail;
         }
@@ -344,12 +325,14 @@ static int decode_main_header(NUTContext *nut)
         for (i = 1; i < nut->header_count; i++) {
             uint8_t *hdr;
             GET_V(nut->header_len[i], tmp > 0 && tmp < 256);
-            rem -= nut->header_len[i];
-            if (rem < 0) {
-                av_log(s, AV_LOG_ERROR, "invalid elision header\n");
+            if (rem < nut->header_len[i]) {
+                av_log(s, AV_LOG_ERROR,
+                       "invalid elision header %d : %d > %d\n",
+                       i, nut->header_len[i], rem);
                 ret = AVERROR_INVALIDDATA;
                 goto fail;
             }
+            rem -= nut->header_len[i];
             hdr = av_malloc(nut->header_len[i]);
             if (!hdr) {
                 ret = AVERROR(ENOMEM);
@@ -377,8 +360,12 @@ static int decode_main_header(NUTContext *nut)
         ret = AVERROR(ENOMEM);
         goto fail;
     }
-    for (i = 0; i < stream_count; i++)
-        avformat_new_stream(s, NULL);
+    for (i = 0; i < stream_count; i++) {
+        if (!avformat_new_stream(s, NULL)) {
+            ret = AVERROR(ENOMEM);
+            goto fail;
+        }
+    }
 
     return 0;
 fail:
@@ -410,11 +397,11 @@ static int decode_stream_header(NUTContext *nut)
 
     class                = ffio_read_varlen(bc);
     tmp                  = get_fourcc(bc);
-    st->codec->codec_tag = tmp;
+    st->codecpar->codec_tag = tmp;
     switch (class) {
     case 0:
-        st->codec->codec_type = AVMEDIA_TYPE_VIDEO;
-        st->codec->codec_id   = av_codec_get_id((const AVCodecTag * const []) {
+        st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+        st->codecpar->codec_id   = av_codec_get_id((const AVCodecTag * const []) {
                                                     ff_nut_video_tags,
                                                     ff_codec_bmp_tags,
                                                     ff_codec_movvideo_tags,
@@ -423,8 +410,8 @@ static int decode_stream_header(NUTContext *nut)
                                                 tmp);
         break;
     case 1:
-        st->codec->codec_type = AVMEDIA_TYPE_AUDIO;
-        st->codec->codec_id   = av_codec_get_id((const AVCodecTag * const []) {
+        st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
+        st->codecpar->codec_id   = av_codec_get_id((const AVCodecTag * const []) {
                                                     ff_nut_audio_tags,
                                                     ff_codec_wav_tags,
                                                     ff_nut_audio_extra_tags,
@@ -433,18 +420,18 @@ static int decode_stream_header(NUTContext *nut)
                                                 tmp);
         break;
     case 2:
-        st->codec->codec_type = AVMEDIA_TYPE_SUBTITLE;
-        st->codec->codec_id   = ff_codec_get_id(ff_nut_subtitle_tags, tmp);
+        st->codecpar->codec_type = AVMEDIA_TYPE_SUBTITLE;
+        st->codecpar->codec_id   = ff_codec_get_id(ff_nut_subtitle_tags, tmp);
         break;
     case 3:
-        st->codec->codec_type = AVMEDIA_TYPE_DATA;
-        st->codec->codec_id   = ff_codec_get_id(ff_nut_data_tags, tmp);
+        st->codecpar->codec_type = AVMEDIA_TYPE_DATA;
+        st->codecpar->codec_id   = ff_codec_get_id(ff_nut_data_tags, tmp);
         break;
     default:
         av_log(s, AV_LOG_ERROR, "unknown stream class (%d)\n", class);
         return AVERROR(ENOSYS);
     }
-    if (class < 3 && st->codec->codec_id == AV_CODEC_ID_NONE)
+    if (class < 3 && st->codecpar->codec_id == AV_CODEC_ID_NONE)
         av_log(s, AV_LOG_ERROR,
                "Unknown codec tag '0x%04x' for stream number %d\n",
                (unsigned int) tmp, stream_id);
@@ -453,18 +440,20 @@ static int decode_stream_header(NUTContext *nut)
     GET_V(stc->msb_pts_shift, tmp < 16);
     stc->max_pts_distance = ffio_read_varlen(bc);
     GET_V(stc->decode_delay, tmp < 1000); // sanity limit, raise this if Moore's law is true
-    st->codec->has_b_frames = stc->decode_delay;
+    st->codecpar->video_delay = stc->decode_delay;
     ffio_read_varlen(bc); // stream flags
 
-    GET_V(st->codec->extradata_size, tmp < (1 << 30));
-    if (st->codec->extradata_size) {
-        if (ff_get_extradata(st->codec, bc, st->codec->extradata_size) < 0)
-            return AVERROR(ENOMEM);
+    GET_V(st->codecpar->extradata_size, tmp < (1 << 30));
+    if (st->codecpar->extradata_size) {
+        ret = ff_get_extradata(s, st->codecpar, bc,
+                               st->codecpar->extradata_size);
+        if (ret < 0)
+            return ret;
     }
 
-    if (st->codec->codec_type == AVMEDIA_TYPE_VIDEO) {
-        GET_V(st->codec->width,  tmp > 0);
-        GET_V(st->codec->height, tmp > 0);
+    if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+        GET_V(st->codecpar->width,  tmp > 0);
+        GET_V(st->codecpar->height, tmp > 0);
         st->sample_aspect_ratio.num = ffio_read_varlen(bc);
         st->sample_aspect_ratio.den = ffio_read_varlen(bc);
         if ((!st->sample_aspect_ratio.num) != (!st->sample_aspect_ratio.den)) {
@@ -474,10 +463,10 @@ static int decode_stream_header(NUTContext *nut)
             goto fail;
         }
         ffio_read_varlen(bc); /* csp type */
-    } else if (st->codec->codec_type == AVMEDIA_TYPE_AUDIO) {
-        GET_V(st->codec->sample_rate, tmp > 0);
+    } else if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+        GET_V(st->codecpar->sample_rate, tmp > 0);
         ffio_read_varlen(bc); // samplerate_den
-        GET_V(st->codec->channels, tmp > 0);
+        GET_V(st->codecpar->ch_layout.nb_channels, tmp > 0);
     }
     if (skip_reserved(bc, end) || ffio_get_checksum(bc)) {
         av_log(s, AV_LOG_ERROR,
@@ -490,9 +479,9 @@ static int decode_stream_header(NUTContext *nut)
                         stc->time_base->den);
     return 0;
 fail:
-    if (st && st->codec) {
-        av_freep(&st->codec->extradata);
-        st->codec->extradata_size = 0;
+    if (st && st->codecpar) {
+        av_freep(&st->codecpar->extradata);
+        st->codecpar->extradata_size = 0;
     }
     return ret;
 }
@@ -518,8 +507,8 @@ static int decode_info_header(NUTContext *nut)
     AVIOContext *bc    = s->pb;
     uint64_t tmp, chapter_start, chapter_len;
     unsigned int stream_id_plus1, count;
-    int chapter_id, i, ret = 0;
-    int64_t value, end;
+    int i, ret = 0;
+    int64_t chapter_id, value, end;
     char name[256], str_value[1024], type_str[256];
     const char *type;
     int *event_flags        = NULL;
@@ -598,7 +587,9 @@ static int decode_info_header(NUTContext *nut)
         }
 
         if (stream_id_plus1 > s->nb_streams) {
-            av_log(s, AV_LOG_ERROR, "invalid stream id for info packet\n");
+            av_log(s, AV_LOG_WARNING,
+                   "invalid stream id %d for info packet\n",
+                   stream_id_plus1);
             continue;
         }
 
@@ -611,7 +602,7 @@ static int decode_info_header(NUTContext *nut)
             if (stream_id_plus1 && !strcmp(name, "r_frame_rate")) {
                 sscanf(str_value, "%d/%d", &st->r_frame_rate.num, &st->r_frame_rate.den);
                 if (st->r_frame_rate.num >= 1000LL*st->r_frame_rate.den ||
-                    st->r_frame_rate.num < 0 || st->r_frame_rate.num < 0)
+                    st->r_frame_rate.num < 0 || st->r_frame_rate.den < 0)
                     st->r_frame_rate.num = st->r_frame_rate.den = 0;
                 continue;
             }
@@ -707,7 +698,7 @@ static int find_and_decode_index(NUTContext *nut)
     avio_seek(bc, filesize - 12, SEEK_SET);
     avio_seek(bc, filesize - avio_rb64(bc), SEEK_SET);
     if (avio_rb64(bc) != INDEX_STARTCODE) {
-        av_log(s, AV_LOG_ERROR, "no index at the end\n");
+        av_log(s, AV_LOG_WARNING, "no index at the end\n");
 
         if(s->duration<=0)
             s->duration = find_duration(nut, filesize);
@@ -822,19 +813,23 @@ static int nut_read_header(AVFormatContext *s)
     NUTContext *nut = s->priv_data;
     AVIOContext *bc = s->pb;
     int64_t pos;
-    int initialized_stream_count;
+    int initialized_stream_count, ret;
 
     nut->avf = s;
 
     /* main header */
     pos = 0;
+    ret = 0;
     do {
+        if (ret == AVERROR(ENOMEM))
+            return ret;
+
         pos = find_startcode(bc, MAIN_STARTCODE, pos) + 1;
         if (pos < 0 + 1) {
             av_log(s, AV_LOG_ERROR, "No main startcode found.\n");
-            goto fail;
+            return AVERROR_INVALIDDATA;
         }
-    } while (decode_main_header(nut) < 0);
+    } while ((ret = decode_main_header(nut)) < 0);
 
     /* stream headers */
     pos = 0;
@@ -842,7 +837,7 @@ static int nut_read_header(AVFormatContext *s)
         pos = find_startcode(bc, STREAM_STARTCODE, pos) + 1;
         if (pos < 0 + 1) {
             av_log(s, AV_LOG_ERROR, "Not all stream headers found.\n");
-            goto fail;
+            return AVERROR_INVALIDDATA;
         }
         if (decode_stream_header(nut) >= 0)
             initialized_stream_count++;
@@ -856,7 +851,7 @@ static int nut_read_header(AVFormatContext *s)
 
         if (startcode == 0) {
             av_log(s, AV_LOG_ERROR, "EOF before video frames\n");
-            goto fail;
+            return AVERROR_INVALIDDATA;
         } else if (startcode == SYNCPOINT_STARTCODE) {
             nut->next_startcode = startcode;
             break;
@@ -867,9 +862,9 @@ static int nut_read_header(AVFormatContext *s)
         decode_info_header(nut);
     }
 
-    s->internal->data_offset = pos - 8;
+    ffformatcontext(s)->data_offset = pos - 8;
 
-    if (bc->seekable) {
+    if (bc->seekable & AVIO_SEEKABLE_NORMAL) {
         int64_t orig_pos = avio_tell(bc);
         find_and_decode_index(nut);
         avio_seek(bc, orig_pos, SEEK_SET);
@@ -879,11 +874,6 @@ static int nut_read_header(AVFormatContext *s)
     ff_metadata_conv_ctx(s, NULL, ff_nut_metadata_conv);
 
     return 0;
-
-fail:
-    nut_read_close(s);
-
-    return AVERROR_INVALIDDATA;
 }
 
 static int read_sm_data(AVFormatContext *s, AVIOContext *bc, AVPacket *pkt, int is_meta, int64_t maxpos)
@@ -891,8 +881,6 @@ static int read_sm_data(AVFormatContext *s, AVIOContext *bc, AVPacket *pkt, int 
     int count = ffio_read_varlen(bc);
     int skip_start = 0;
     int skip_end = 0;
-    int channels = 0;
-    int64_t channel_layout = 0;
     int sample_rate = 0;
     int width = 0;
     int height = 0;
@@ -927,7 +915,7 @@ static int read_sm_data(AVFormatContext *s, AVIOContext *bc, AVPacket *pkt, int 
                 return ret;
             }
             value_len = ffio_read_varlen(bc);
-            if (avio_tell(bc) + value_len >= maxpos)
+            if (value_len < 0 || value_len >= maxpos - avio_tell(bc))
                 return AVERROR_INVALIDDATA;
             if (!strcmp(name, "Palette")) {
                 dst = av_packet_new_side_data(pkt, AV_PKT_DATA_PALETTE, value_len);
@@ -940,7 +928,7 @@ static int read_sm_data(AVFormatContext *s, AVIOContext *bc, AVPacket *pkt, int 
                 AV_WB64(dst, v64);
                 dst += 8;
             } else if (!strcmp(name, "ChannelLayout") && value_len == 8) {
-                channel_layout = avio_rl64(bc);
+                // Ignored
                 continue;
             } else {
                 av_log(s, AV_LOG_WARNING, "Unknown data %s / %s\n", name, type_str);
@@ -962,7 +950,7 @@ static int read_sm_data(AVFormatContext *s, AVIOContext *bc, AVPacket *pkt, int 
             } else if (!strcmp(name, "SkipEnd")) {
                 skip_end = value;
             } else if (!strcmp(name, "Channels")) {
-                channels = value;
+                // Ignored
             } else if (!strcmp(name, "SampleRate")) {
                 sample_rate = value;
             } else if (!strcmp(name, "Width")) {
@@ -975,20 +963,14 @@ static int read_sm_data(AVFormatContext *s, AVIOContext *bc, AVPacket *pkt, int 
         }
     }
 
-    if (channels || channel_layout || sample_rate || width || height) {
-        uint8_t *dst = av_packet_new_side_data(pkt, AV_PKT_DATA_PARAM_CHANGE, 28);
+    if (sample_rate || width || height) {
+        uint8_t *dst = av_packet_new_side_data(pkt, AV_PKT_DATA_PARAM_CHANGE, 16);
         if (!dst)
             return AVERROR(ENOMEM);
         bytestream_put_le32(&dst,
-                            AV_SIDE_DATA_PARAM_CHANGE_CHANNEL_COUNT*(!!channels) +
-                            AV_SIDE_DATA_PARAM_CHANGE_CHANNEL_LAYOUT*(!!channel_layout) +
                             AV_SIDE_DATA_PARAM_CHANGE_SAMPLE_RATE*(!!sample_rate) +
                             AV_SIDE_DATA_PARAM_CHANGE_DIMENSIONS*(!!(width|height))
                            );
-        if (channels)
-            bytestream_put_le32(&dst, channels);
-        if (channel_layout)
-            bytestream_put_le64(&dst, channel_layout);
         if (sample_rate)
             bytestream_put_le32(&dst, sample_rate);
         if (width || height){
@@ -1004,6 +986,9 @@ static int read_sm_data(AVFormatContext *s, AVIOContext *bc, AVPacket *pkt, int 
         AV_WL32(dst, skip_start);
         AV_WL32(dst+4, skip_end);
     }
+
+    if (avio_tell(bc) >= maxpos)
+        return AVERROR_INVALIDDATA;
 
     return 0;
 }
@@ -1042,9 +1027,9 @@ static int decode_frame_header(NUTContext *nut, int64_t *pts, int *stream_id,
     }
     stc = &nut->stream[*stream_id];
     if (flags & FLAG_CODED_PTS) {
-        int coded_pts = ffio_read_varlen(bc);
+        int64_t coded_pts = ffio_read_varlen(bc);
         // FIXME check last_pts validity?
-        if (coded_pts < (1 << stc->msb_pts_shift)) {
+        if (coded_pts < (1LL << stc->msb_pts_shift)) {
             *pts = ff_lsb2full(stc, coded_pts);
         } else
             *pts = coded_pts - (1LL << stc->msb_pts_shift);
@@ -1110,7 +1095,7 @@ static int decode_frame(NUTContext *nut, AVPacket *pkt, int frame_code)
         stc->skip_until_key_frame = 0;
 
     discard     = s->streams[stream_id]->discard;
-    last_IP_pts = s->streams[stream_id]->last_IP_pts;
+    last_IP_pts = ffstream(s->streams[stream_id])->last_IP_pts;
     if ((discard >= AVDISCARD_NONKEY && !(stc->last_flags & FLAG_KEY)) ||
         (discard >= AVDISCARD_BIDIR  && last_IP_pts != AV_NOPTS_VALUE &&
          last_IP_pts > pts) ||
@@ -1123,7 +1108,8 @@ static int decode_frame(NUTContext *nut, AVPacket *pkt, int frame_code)
     ret = av_new_packet(pkt, size + nut->header_len[header_idx]);
     if (ret < 0)
         return ret;
-    memcpy(pkt->data, nut->header[header_idx], nut->header_len[header_idx]);
+    if (nut->header[header_idx])
+        memcpy(pkt->data, nut->header[header_idx], nut->header_len[header_idx]);
     pkt->pos = avio_tell(bc); // FIXME
     if (stc->last_flags & FLAG_SM_DATA) {
         int sm_size;
@@ -1137,7 +1123,6 @@ static int decode_frame(NUTContext *nut, AVPacket *pkt, int frame_code)
         }
         sm_size = avio_tell(bc) - pkt->pos;
         size      -= sm_size;
-        pkt->size -= sm_size;
     }
 
     ret = avio_read(bc, pkt->data + nut->header_len[header_idx], size);
@@ -1154,7 +1139,7 @@ static int decode_frame(NUTContext *nut, AVPacket *pkt, int frame_code)
 
     return 0;
 fail:
-    av_free_packet(pkt);
+    av_packet_unref(pkt);
     return ret;
 }
 
@@ -1248,6 +1233,7 @@ static int read_seek(AVFormatContext *s, int stream_index,
 {
     NUTContext *nut    = s->priv_data;
     AVStream *st       = s->streams[stream_index];
+    FFStream *const sti = ffstream(st);
     Syncpoint dummy    = { .ts = pts * av_q2d(st->time_base) * AV_TIME_BASE };
     Syncpoint nopts_sp = { .ts = AV_NOPTS_VALUE, .back_ptr = AV_NOPTS_VALUE };
     Syncpoint *sp, *next_node[2] = { &nopts_sp, &nopts_sp };
@@ -1258,17 +1244,17 @@ static int read_seek(AVFormatContext *s, int stream_index,
         return AVERROR(ENOSYS);
     }
 
-    if (st->index_entries) {
+    if (sti->index_entries) {
         int index = av_index_search_timestamp(st, pts, flags);
         if (index < 0)
             index = av_index_search_timestamp(st, pts, flags ^ AVSEEK_FLAG_BACKWARD);
         if (index < 0)
             return -1;
 
-        pos2 = st->index_entries[index].pos;
-        ts   = st->index_entries[index].timestamp;
+        pos2 = sti->index_entries[index].pos;
+        ts   = sti->index_entries[index].timestamp;
     } else {
-        av_tree_find(nut->syncpoints, &dummy, (void *) ff_nut_sp_pts_cmp,
+        av_tree_find(nut->syncpoints, &dummy, ff_nut_sp_pts_cmp,
                      (void **) next_node);
         av_log(s, AV_LOG_DEBUG, "%"PRIu64"-%"PRIu64" %"PRId64"-%"PRId64"\n",
                next_node[0]->pos, next_node[1]->pos, next_node[0]->ts,
@@ -1277,11 +1263,13 @@ static int read_seek(AVFormatContext *s, int stream_index,
                             next_node[1]->pos, next_node[1]->pos,
                             next_node[0]->ts, next_node[1]->ts,
                             AVSEEK_FLAG_BACKWARD, &ts, nut_read_timestamp);
+        if (pos < 0)
+            return pos;
 
         if (!(flags & AVSEEK_FLAG_BACKWARD)) {
             dummy.pos    = pos + 16;
             next_node[1] = &nopts_sp;
-            av_tree_find(nut->syncpoints, &dummy, (void *) ff_nut_sp_pos_cmp,
+            av_tree_find(nut->syncpoints, &dummy, ff_nut_sp_pos_cmp,
                          (void **) next_node);
             pos2 = ff_gen_search(s, -2, dummy.pos, next_node[0]->pos,
                                  next_node[1]->pos, next_node[1]->pos,
@@ -1292,19 +1280,19 @@ static int read_seek(AVFormatContext *s, int stream_index,
             // FIXME dir but I think it does not matter
         }
         dummy.pos = pos;
-        sp = av_tree_find(nut->syncpoints, &dummy, (void *) ff_nut_sp_pos_cmp,
+        sp = av_tree_find(nut->syncpoints, &dummy, ff_nut_sp_pos_cmp,
                           NULL);
 
         av_assert0(sp);
         pos2 = sp->back_ptr - 15;
     }
-    av_log(NULL, AV_LOG_DEBUG, "SEEKTO: %"PRId64"\n", pos2);
+    av_log(s, AV_LOG_DEBUG, "SEEKTO: %"PRId64"\n", pos2);
     pos = find_startcode(s->pb, SYNCPOINT_STARTCODE, pos2);
     avio_seek(s->pb, pos, SEEK_SET);
     nut->last_syncpoint_pos = pos;
-    av_log(NULL, AV_LOG_DEBUG, "SP: %"PRId64"\n", pos);
+    av_log(s, AV_LOG_DEBUG, "SP: %"PRId64"\n", pos);
     if (pos2 > pos || pos2 + 15 < pos)
-        av_log(NULL, AV_LOG_ERROR, "no syncpoint at backptr pos\n");
+        av_log(s, AV_LOG_ERROR, "no syncpoint at backptr pos\n");
     for (i = 0; i < s->nb_streams; i++)
         nut->stream[i].skip_until_key_frame = 1;
 
@@ -1313,16 +1301,17 @@ static int read_seek(AVFormatContext *s, int stream_index,
     return 0;
 }
 
-AVInputFormat ff_nut_demuxer = {
-    .name           = "nut",
-    .long_name      = NULL_IF_CONFIG_SMALL("NUT"),
-    .flags          = AVFMT_SEEK_TO_PTS,
+const FFInputFormat ff_nut_demuxer = {
+    .p.name         = "nut",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("NUT"),
+    .p.flags        = AVFMT_SEEK_TO_PTS,
+    .p.extensions   = "nut",
+    .p.codec_tag    = ff_nut_codec_tags,
     .priv_data_size = sizeof(NUTContext),
+    .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
     .read_probe     = nut_probe,
     .read_header    = nut_read_header,
     .read_packet    = nut_read_packet,
     .read_close     = nut_read_close,
     .read_seek      = read_seek,
-    .extensions     = "nut",
-    .codec_tag      = ff_nut_codec_tags,
 };

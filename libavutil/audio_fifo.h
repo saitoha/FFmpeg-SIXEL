@@ -27,8 +27,7 @@
 #ifndef AVUTIL_AUDIO_FIFO_H
 #define AVUTIL_AUDIO_FIFO_H
 
-#include "avutil.h"
-#include "fifo.h"
+#include "attributes.h"
 #include "samplefmt.h"
 
 /**
@@ -73,6 +72,7 @@ AVAudioFifo *av_audio_fifo_alloc(enum AVSampleFormat sample_fmt, int channels,
  * @param nb_samples  new allocation size, in samples
  * @return            0 if OK, or negative AVERROR code on failure
  */
+av_warn_unused_result
 int av_audio_fifo_realloc(AVAudioFifo *af, int nb_samples);
 
 /**
@@ -91,7 +91,41 @@ int av_audio_fifo_realloc(AVAudioFifo *af, int nb_samples);
  *                    code on failure. If successful, the number of samples
  *                    actually written will always be nb_samples.
  */
-int av_audio_fifo_write(AVAudioFifo *af, void **data, int nb_samples);
+int av_audio_fifo_write(AVAudioFifo *af, void * const *data, int nb_samples);
+
+/**
+ * Peek data from an AVAudioFifo.
+ *
+ * @see enum AVSampleFormat
+ * The documentation for AVSampleFormat describes the data layout.
+ *
+ * @param af          AVAudioFifo to read from
+ * @param data        audio data plane pointers
+ * @param nb_samples  number of samples to peek
+ * @return            number of samples actually peek, or negative AVERROR code
+ *                    on failure. The number of samples actually peek will not
+ *                    be greater than nb_samples, and will only be less than
+ *                    nb_samples if av_audio_fifo_size is less than nb_samples.
+ */
+int av_audio_fifo_peek(const AVAudioFifo *af, void * const *data, int nb_samples);
+
+/**
+ * Peek data from an AVAudioFifo.
+ *
+ * @see enum AVSampleFormat
+ * The documentation for AVSampleFormat describes the data layout.
+ *
+ * @param af          AVAudioFifo to read from
+ * @param data        audio data plane pointers
+ * @param nb_samples  number of samples to peek
+ * @param offset      offset from current read position
+ * @return            number of samples actually peek, or negative AVERROR code
+ *                    on failure. The number of samples actually peek will not
+ *                    be greater than nb_samples, and will only be less than
+ *                    nb_samples if av_audio_fifo_size is less than nb_samples.
+ */
+int av_audio_fifo_peek_at(const AVAudioFifo *af, void * const *data,
+                          int nb_samples, int offset);
 
 /**
  * Read data from an AVAudioFifo.
@@ -107,7 +141,7 @@ int av_audio_fifo_write(AVAudioFifo *af, void **data, int nb_samples);
  *                    be greater than nb_samples, and will only be less than
  *                    nb_samples if av_audio_fifo_size is less than nb_samples.
  */
-int av_audio_fifo_read(AVAudioFifo *af, void **data, int nb_samples);
+int av_audio_fifo_read(AVAudioFifo *af, void * const *data, int nb_samples);
 
 /**
  * Drain data from an AVAudioFifo.

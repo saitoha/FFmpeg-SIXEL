@@ -30,17 +30,16 @@
 #define AVCODEC_BGMC_H
 
 
-#include "avcodec.h"
 #include "get_bits.h"
 
 
-int ff_bgmc_init(AVCodecContext *avctx, uint8_t **cf_lut, int **cf_lut_status);
+int ff_bgmc_init(void *logctx, uint8_t **cf_lut, int **cf_lut_status);
 
 
 void ff_bgmc_end(uint8_t **cf_lut, int **cf_lut_status);
 
 
-void ff_bgmc_decode_init(GetBitContext *gb,
+int ff_bgmc_decode_init(GetBitContext *gb,
                       unsigned int *h, unsigned int *l, unsigned int *v);
 
 

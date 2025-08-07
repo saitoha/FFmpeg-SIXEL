@@ -21,7 +21,11 @@
 
 #include "libavutil/intreadwrite.h"
 #include "libavutil/dict.h"
+#include "libavutil/mem.h"
+#include "libavcodec/dca.h"
 #include "avformat.h"
+#include "demux.h"
+#include "internal.h"
 
 #define AUPR_HDR 0x415550522D484452
 #define AUPRINFO 0x41555052494E464F
@@ -41,7 +45,7 @@ typedef struct DTSHDDemuxContext {
     uint64_t    data_end;
 } DTSHDDemuxContext;
 
-static int dtshd_probe(AVProbeData *p)
+static int dtshd_probe(const AVProbeData *p)
 {
     if (AV_RB64(p->buf) == DTSHDHDR)
         return AVPROBE_SCORE_MAX;
@@ -53,6 +57,7 @@ static int dtshd_read_header(AVFormatContext *s)
     DTSHDDemuxContext *dtshd = s->priv_data;
     AVIOContext *pb = s->pb;
     uint64_t chunk_type, chunk_size;
+    int64_t duration, orig_nb_samples, data_start;
     AVStream *st;
     int ret;
     char *value;
@@ -60,13 +65,16 @@ static int dtshd_read_header(AVFormatContext *s)
     st = avformat_new_stream(s, NULL);
     if (!st)
         return AVERROR(ENOMEM);
-    st->codec->codec_type = AVMEDIA_TYPE_AUDIO;
-    st->codec->codec_id   = AV_CODEC_ID_DTS;
-    st->need_parsing      = AVSTREAM_PARSE_FULL_RAW;
+    st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
+    st->codecpar->codec_id   = AV_CODEC_ID_DTS;
+    ffstream(st)->need_parsing = AVSTREAM_PARSE_FULL_RAW;
 
-    while (!avio_feof(pb)) {
+    for (;;) {
         chunk_type = avio_rb64(pb);
         chunk_size = avio_rb64(pb);
+
+        if (avio_feof(pb))
+            break;
 
         if (chunk_size < 4) {
             av_log(s, AV_LOG_ERROR, "chunk size too small\n");
@@ -79,10 +87,31 @@ static int dtshd_read_header(AVFormatContext *s)
 
         switch (chunk_type) {
         case STRMDATA:
-            dtshd->data_end = chunk_size + avio_tell(pb);
+            data_start = avio_tell(pb);
+            dtshd->data_end = data_start + chunk_size;
             if (dtshd->data_end <= chunk_size)
                 return AVERROR_INVALIDDATA;
-            return 0;
+            if (!(pb->seekable & AVIO_SEEKABLE_NORMAL))
+                goto break_loop;
+            goto skip;
+            break;
+        case AUPR_HDR:
+            if (chunk_size < 21)
+                return AVERROR_INVALIDDATA;
+            avio_skip(pb, 3);
+            st->codecpar->sample_rate = avio_rb24(pb);
+            if (!st->codecpar->sample_rate)
+                return AVERROR_INVALIDDATA;
+            duration  = avio_rb32(pb); // num_frames
+            duration *= avio_rb16(pb); // samples_per_frames
+            st->duration = duration;
+            orig_nb_samples  = avio_rb32(pb);
+            orig_nb_samples <<= 8;
+            orig_nb_samples |= avio_r8(pb);
+            st->codecpar->ch_layout.nb_channels = ff_dca_count_chs_for_mask(avio_rb16(pb));
+            st->codecpar->initial_padding = avio_rb16(pb);
+            st->codecpar->trailing_padding = FFMAX(st->duration - orig_nb_samples - st->codecpar->initial_padding, 0);
+            avio_skip(pb, chunk_size - 21);
             break;
         case FILEINFO:
             if (chunk_size > INT_MAX)
@@ -103,7 +132,16 @@ skip:
         };
     }
 
-    return AVERROR_EOF;
+    if (!dtshd->data_end)
+        return AVERROR_EOF;
+
+    avio_seek(pb, data_start, SEEK_SET);
+
+break_loop:
+    if (st->codecpar->sample_rate)
+        avpriv_set_pts_info(st, 64, 1, st->codecpar->sample_rate);
+
+    return 0;
 }
 
 static int raw_read_packet(AVFormatContext *s, AVPacket *pkt)
@@ -126,14 +164,14 @@ static int raw_read_packet(AVFormatContext *s, AVPacket *pkt)
     return ret;
 }
 
-AVInputFormat ff_dtshd_demuxer = {
-    .name           = "dtshd",
-    .long_name      = NULL_IF_CONFIG_SMALL("raw DTS-HD"),
+const FFInputFormat ff_dtshd_demuxer = {
+    .p.name         = "dtshd",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("raw DTS-HD"),
+    .p.flags        = AVFMT_GENERIC_INDEX,
+    .p.extensions   = "dtshd",
     .priv_data_size = sizeof(DTSHDDemuxContext),
     .read_probe     = dtshd_probe,
     .read_header    = dtshd_read_header,
     .read_packet    = raw_read_packet,
-    .flags          = AVFMT_GENERIC_INDEX,
-    .extensions     = "dtshd",
     .raw_codec_id   = AV_CODEC_ID_DTS,
 };

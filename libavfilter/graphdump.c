@@ -23,18 +23,20 @@
 
 #include "libavutil/channel_layout.h"
 #include "libavutil/bprint.h"
+#include "libavutil/mem.h"
 #include "libavutil/pixdesc.h"
 #include "avfilter.h"
-#include "avfiltergraph.h"
+#include "filters.h"
 
 static int print_link_prop(AVBPrint *buf, AVFilterLink *link)
 {
-    char *format;
-    char layout[64];
-    AVBPrint dummy_buffer = { 0 };
+    const char *format;
+    AVBPrint dummy_buffer;
 
-    if (!buf)
+    if (!buf) {
         buf = &dummy_buffer;
+        av_bprint_init(buf, 0, AV_BPRINT_SIZE_COUNT_ONLY);
+    }
     switch (link->type) {
         case AVMEDIA_TYPE_VIDEO:
             format = av_x_if_null(av_get_pix_fmt_name(link->format), "?");
@@ -45,11 +47,11 @@ static int print_link_prop(AVBPrint *buf, AVFilterLink *link)
             break;
 
         case AVMEDIA_TYPE_AUDIO:
-            av_get_channel_layout_string(layout, sizeof(layout),
-                                         link->channels, link->channel_layout);
             format = av_x_if_null(av_get_sample_fmt_name(link->format), "?");
-            av_bprintf(buf, "[%dHz %s:%s]",
-                       (int)link->sample_rate, format, layout);
+            av_bprintf(buf, "[%dHz %s:",
+                       (int)link->sample_rate, format);
+            av_channel_layout_describe_bprint(&link->ch_layout, buf);
+            av_bprint_chars(buf, ']', 1);
             break;
 
         default:
@@ -154,12 +156,14 @@ static void avfilter_graph_dump_to_buf(AVBPrint *buf, AVFilterGraph *graph)
 char *avfilter_graph_dump(AVFilterGraph *graph, const char *options)
 {
     AVBPrint buf;
-    char *dump;
+    char *dump = NULL;
 
-    av_bprint_init(&buf, 0, 0);
+    av_bprint_init(&buf, 0, AV_BPRINT_SIZE_COUNT_ONLY);
     avfilter_graph_dump_to_buf(&buf, graph);
-    av_bprint_init(&buf, buf.len + 1, buf.len + 1);
+    dump = av_malloc(buf.len + 1);
+    if (!dump)
+        return NULL;
+    av_bprint_init_for_buffer(&buf, dump, buf.len + 1);
     avfilter_graph_dump_to_buf(&buf, graph);
-    av_bprint_finalize(&buf, &dump);
     return dump;
 }

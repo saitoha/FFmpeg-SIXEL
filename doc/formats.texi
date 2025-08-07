@@ -27,40 +27,53 @@ stream information. A higher value will enable detecting more
 information in case it is dispersed into the stream, but will increase
 latency. Must be an integer not lesser than 32. It is 5000000 by default.
 
+@item max_probe_packets @var{integer} (@emph{input})
+Set the maximum number of buffered packets when probing a codec.
+Default is 2500 packets.
+
 @item packetsize @var{integer} (@emph{output})
 Set packet size.
 
-@item fflags @var{flags} (@emph{input/output})
-Set format flags.
+@item fflags @var{flags}
+Set format flags. Some are implemented for a limited number of formats.
 
-Possible values:
+Possible values for input files:
 @table @samp
-@item ignidx
-Ignore index.
+@item discardcorrupt
+Discard corrupted packets.
 @item fastseek
 Enable fast, but inaccurate seeks for some formats.
 @item genpts
-Generate PTS.
+Generate missing PTS if DTS is present.
+@item igndts
+Ignore DTS if PTS is also set. In case the PTS is set, the DTS value
+is set to NOPTS. This is ignored when the @code{nofillin} flag is set.
+@item ignidx
+Ignore index.
+@item nobuffer
+Reduce the latency introduced by buffering during initial input streams analysis.
 @item nofillin
-Do not fill in missing values that can be exactly calculated.
+Do not fill in missing values in packet fields that can be exactly calculated.
 @item noparse
 Disable AVParsers, this needs @code{+nofillin} too.
-@item igndts
-Ignore DTS.
-@item discardcorrupt
-Discard corrupted frames.
 @item sortdts
-Try to interleave output packets by DTS.
-@item keepside
-Do not merge side data.
-@item latm
-Enable RTP MP4A-LATM payload.
-@item nobuffer
-Reduce the latency introduced by optional buffering
+Try to interleave output packets by DTS. At present, available only for AVIs with an index.
+@end table
+
+Possible values for output files:
+@table @samp
+@item autobsf
+Automatically apply bitstream filters as required by the output format. Enabled by default.
 @item bitexact
 Only write platform-, build- and time-independent data.
 This ensures that file and data checksums are reproducible and match between
 platforms. Its primary use is for regression testing.
+@item flush_packets
+Write out packets immediately.
+@item shortest
+Stop muxing at the end of the shortest stream.
+It may be needed to increase max_interleave_delta to avoid flushing the longer
+streams before EOF.
 @end table
 
 @item seek2any @var{integer} (@emph{input})
@@ -127,8 +140,27 @@ Consider all spec non compliancies as errors.
 Consider things that a sane encoder should not do as an error.
 @end table
 
+@item max_interleave_delta @var{integer} (@emph{output})
+Set maximum buffering duration for interleaving. The duration is
+expressed in microseconds, and defaults to 10000000 (10 seconds).
+
+To ensure all the streams are interleaved correctly, libavformat will
+wait until it has at least one packet for each stream before actually
+writing any packets to the output file. When some streams are
+"sparse" (i.e. there are large gaps between successive packets), this
+can result in excessive buffering.
+
+This field specifies the maximum difference between the timestamps of the
+first and the last packet in the muxing queue, above which libavformat
+will output a packet regardless of whether it has queued a packet for all
+the streams.
+
+If set to 0, libavformat will continue buffering packets until it has
+a packet for each stream, regardless of the maximum timestamp
+difference between the buffered packets.
+
 @item use_wallclock_as_timestamps @var{integer} (@emph{input})
-Use wallclock as timestamps.
+Use wallclock as timestamps if set to 1. Default is 0.
 
 @item avoid_negative_ts @var{integer} (@emph{output})
 
@@ -159,9 +191,10 @@ Default is 0.
 Correct single timestamp overflows if set to 1. Default is 1.
 
 @item flush_packets @var{integer} (@emph{output})
-Flush the underlying I/O stream after each packet. Default 1 enables it, and
-has the effect of reducing the latency; 0 disables it and may slightly
-increase performance in some cases.
+Flush the underlying I/O stream after each packet. Default is -1 (auto), which
+means that the underlying protocol will decide, 1 enables it, and has the
+effect of reducing the latency, 0 disables it and may increase IO throughput in
+some cases.
 
 @item output_ts_offset @var{offset} (@emph{output})
 Set the output time offset.
@@ -176,16 +209,63 @@ delayed bt the time duration specified in @var{offset}. Default value
 is @code{0} (meaning that no offset is applied).
 
 @item format_whitelist @var{list} (@emph{input})
-"," separated List of allowed demuxers. By default all are allowed.
+"," separated list of allowed demuxers. By default all are allowed.
 
 @item dump_separator @var{string} (@emph{input})
 Separator used to separate the fields printed on the command line about the
 Stream parameters.
-For example to separate the fields with newlines and indention:
+For example, to separate the fields with newlines and indentation:
 @example
 ffprobe -dump_separator "
                           "  -i ~/videos/matrixbench_mpeg2.mpg
 @end example
+
+@item max_streams @var{integer} (@emph{input})
+Specifies the maximum number of streams. This can be used to reject files that
+would require too many resources due to a large number of streams.
+
+@item skip_estimate_duration_from_pts @var{bool} (@emph{input})
+Skip estimation of input duration if it requires an additional probing for PTS at end of file.
+At present, applicable for MPEG-PS and MPEG-TS.
+
+@item duration_probesize @var{integer} (@emph{input})
+Set probing size, in bytes, for input duration estimation when it actually requires
+an additional probing for PTS at end of file (at present: MPEG-PS and MPEG-TS).
+It is aimed at users interested in better durations probing for itself, or indirectly
+because using the concat demuxer, for example.
+The typical use case is an MPEG-TS CBR with a high bitrate, high video buffering and
+ending cleaning with similar PTS for video and audio: in such a scenario, the large
+physical gap between the last video packet and the last audio packet makes it necessary
+to read many bytes in order to get the video stream duration.
+Another use case is where the default probing behaviour only reaches a single video frame which is
+not the last one of the stream due to frame reordering, so the duration is not accurate.
+Setting this option has a performance impact even for small files because the probing
+size is fixed.
+Default behaviour is a general purpose trade-off, largely adaptive, but the probing size
+will not be extended to get streams durations at all costs.
+Must be an integer not lesser than 1, or 0 for default behaviour.
+
+@item strict, f_strict @var{integer} (@emph{input/output})
+Specify how strictly to follow the standards. @code{f_strict} is deprecated and
+should be used only via the @command{ffmpeg} tool.
+
+Possible values:
+@table @samp
+@item very
+strictly conform to an older more strict version of the spec or reference software
+@item strict
+strictly conform to all the things in the spec no matter what consequences
+@item normal
+
+@item unofficial
+allow unofficial extensions
+@item experimental
+allow non standardized experimental things, experimental
+(unfinished/work in progress/not well tested) decoders and encoders.
+Note: experimental decoders can pose a security risk, do not use this for
+decoding untrusted input.
+@end table
+
 @end table
 
 @c man end FORMAT OPTIONS
@@ -196,30 +276,10 @@ ffprobe -dump_separator "
 Format stream specifiers allow selection of one or more streams that
 match specific properties.
 
-Possible forms of stream specifiers are:
-@table @option
-@item @var{stream_index}
-Matches the stream with this index.
-
-@item @var{stream_type}[:@var{stream_index}]
-@var{stream_type} is one of following: 'v' for video, 'a' for audio,
-'s' for subtitle, 'd' for data, and 't' for attachments. If
-@var{stream_index} is given, then it matches the stream number
-@var{stream_index} of this type. Otherwise, it matches all streams of
-this type.
-
-@item p:@var{program_id}[:@var{stream_index}]
-If @var{stream_index} is given, then it matches the stream with number
-@var{stream_index} in the program with the id
-@var{program_id}. Otherwise, it matches all streams in the program.
-
-@item #@var{stream_id}
-Matches the stream by a format-specific ID.
-@end table
-
 The exact semantics of stream specifiers is defined by the
 @code{avformat_match_stream_specifier()} function declared in the
-@file{libavformat/avformat.h} header.
+@file{libavformat/avformat.h} header and documented in the
+@ref{Stream specifiers,,Stream specifiers section in the ffmpeg(1) manual,ffmpeg}.
 
 @ifclear config-writeonly
 @include demuxers.texi

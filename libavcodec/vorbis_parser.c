@@ -25,10 +25,12 @@
  * Determines the duration for each packet.
  */
 
+#include "config_components.h"
+
 #include "libavutil/log.h"
+#include "libavutil/mem.h"
 
 #include "get_bits.h"
-#include "parser.h"
 #include "xiph.h"
 #include "vorbis_parser_internal.h"
 
@@ -232,7 +234,8 @@ int av_vorbis_parse_frame_flags(AVVorbisParseContext *s, const uint8_t *buf,
             else if (buf[0] == 5)
                 *flags |= VORBIS_FLAG_SETUP;
             else
-                goto bad_packet;
+                av_log(s, AV_LOG_VERBOSE, "Ignoring packet with unknown type %u\n",
+                       buf[0]);
 
             /* Special packets have no duration. */
             return 0;
@@ -296,27 +299,6 @@ AVVorbisParseContext *av_vorbis_parse_init(const uint8_t *extradata,
     return s;
 }
 
-#if LIBAVCODEC_VERSION_MAJOR < 57
-int avpriv_vorbis_parse_extradata(AVCodecContext *avctx, AVVorbisParseContext *s)
-{
-    return vorbis_parse_init(s, avctx->extradata, avctx->extradata_size);
-}
-void avpriv_vorbis_parse_reset(AVVorbisParseContext *s)
-{
-    av_vorbis_parse_reset(s);
-}
-int avpriv_vorbis_parse_frame(AVVorbisParseContext *s, const uint8_t *buf,
-                              int buf_size)
-{
-    return av_vorbis_parse_frame(s, buf, buf_size);
-}
-int avpriv_vorbis_parse_frame_flags(AVVorbisParseContext *s, const uint8_t *buf,
-                                    int buf_size, int *flags)
-{
-    return av_vorbis_parse_frame_flags(s, buf, buf_size, flags);
-}
-#endif
-
 #if CONFIG_VORBIS_PARSER
 
 typedef struct VorbisParseContext {
@@ -353,7 +335,7 @@ static void vorbis_parser_close(AVCodecParserContext *ctx)
     av_vorbis_parse_free(&s->vp);
 }
 
-AVCodecParser ff_vorbis_parser = {
+const AVCodecParser ff_vorbis_parser = {
     .codec_ids      = { AV_CODEC_ID_VORBIS },
     .priv_data_size = sizeof(VorbisParseContext),
     .parser_parse   = vorbis_parse,

@@ -20,32 +20,42 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "libavutil/avstring.h"
+#include "libavutil/reverse.h"
 
 #include "avcodec.h"
-#include "internal.h"
-#include "mathops.h"
+#include "codec_internal.h"
+#include "decode.h"
 
-static int convert(uint8_t x)
+static int get_nibble(uint8_t x)
 {
-    if (x >= 'a')
-        x -= 87;
-    else if (x >= 'A')
-        x -= 55;
-    else
-        x -= '0';
-    return x;
+#define TIMES256(idx) \
+TIMES64(4 * (idx)) TIMES64(4 * (idx) + 1) TIMES64(4 * (idx) + 2) TIMES64(4 * (idx) + 3)
+#define TIMES64(idx) \
+TIMES16(4 * (idx)) TIMES16(4 * (idx) + 1) TIMES16(4 * (idx) + 2) TIMES16(4 * (idx) + 3)
+#define TIMES16(idx) \
+TIMES4(4 * (idx)) TIMES4(4 * (idx) + 1) TIMES4(4 * (idx) + 2) TIMES4(4 * (idx) + 3)
+#define TIMES4(idx) \
+ENTRY(4 * (idx)) ENTRY(4 * (idx) + 1) ENTRY(4 * (idx) + 2) ENTRY(4 * (idx) + 3)
+#define ENTRY(x) [x] = ((x) >= 'a' && (x) <= 'f') ? (x) - ('a' - 10) : \
+                       ((x) >= 'A' && (x) <= 'F') ? (x) - ('A' - 10) : \
+                       ((x) >= '0' && (x) <= '9') ? (x) - '0' : 255,
+
+    static const uint8_t lut[] = {
+        TIMES256(0)
+    };
+    return lut[x];
 }
 
-static int parse_str_int(const uint8_t *p, int len, const uint8_t *key)
+static int parse_str_int(const uint8_t *p, const uint8_t *end, const uint8_t *key)
 {
-    const uint8_t *end = p + len;
+    int keylen = strlen(key);
+    const uint8_t *e = end - keylen;
 
-    for(; p<end - strlen(key); p++) {
-        if (!memcmp(p, key, strlen(key)))
+    for(; p < e; p++) {
+        if (!memcmp(p, key, keylen))
             break;
     }
-    p += strlen(key);
+    p += keylen;
     if (p >= end)
         return INT_MIN;
 
@@ -58,10 +68,9 @@ static int parse_str_int(const uint8_t *p, int len, const uint8_t *key)
     return INT_MIN;
 }
 
-static int xbm_decode_frame(AVCodecContext *avctx, void *data,
+static int xbm_decode_frame(AVCodecContext *avctx, AVFrame *p,
                             int *got_frame, AVPacket *avpkt)
 {
-    AVFrame *p = data;
     int ret, linesize, i, j;
     int width  = 0;
     int height = 0;
@@ -72,11 +81,14 @@ static int xbm_decode_frame(AVCodecContext *avctx, void *data,
     avctx->pix_fmt = AV_PIX_FMT_MONOWHITE;
     end = avpkt->data + avpkt->size;
 
-    width  = parse_str_int(avpkt->data, avpkt->size, "_width");
-    height = parse_str_int(avpkt->data, avpkt->size, "_height");
+    width  = parse_str_int(avpkt->data, end, "_width");
+    height = parse_str_int(avpkt->data, end, "_height");
 
     if ((ret = ff_set_dimensions(avctx, width, height)) < 0)
         return ret;
+
+    if (avctx->skip_frame >= AVDISCARD_ALL)
+        return avpkt->size;
 
     if ((ret = ff_get_buffer(avctx, p, 0)) < 0)
         return ret;
@@ -93,22 +105,26 @@ static int xbm_decode_frame(AVCodecContext *avctx, void *data,
     for (i = 0; i < avctx->height; i++) {
         dst = p->data[0] + i * p->linesize[0];
         for (j = 0; j < linesize; j++) {
-            uint8_t val;
+            uint8_t nib, val;
 
             while (ptr < end && *ptr != 'x' && *ptr != '$')
                 ptr++;
 
             ptr ++;
-            if (ptr < end && av_isxdigit(*ptr)) {
-                val = convert(*ptr++);
-                if (av_isxdigit(*ptr))
-                    val = (val << 4) + convert(*ptr++);
+            if (ptr < end && (val = get_nibble(*ptr)) <= 15) {
+                ptr++;
+                if ((nib = get_nibble(*ptr)) <= 15) {
+                    val = (val << 4) + nib;
+                    ptr++;
+                }
                 *dst++ = ff_reverse[val];
-                if (av_isxdigit(*ptr) && j+1 < linesize) {
+                if ((val = get_nibble(*ptr)) <= 15 && j+1 < linesize) {
                     j++;
-                    val = convert(*ptr++);
-                    if (av_isxdigit(*ptr))
-                        val = (val << 4) + convert(*ptr++);
+                    ptr++;
+                    if ((nib = get_nibble(*ptr)) <= 15) {
+                        val = (val << 4) + nib;
+                        ptr++;
+                    }
                     *dst++ = ff_reverse[val];
                 }
             } else {
@@ -119,19 +135,17 @@ static int xbm_decode_frame(AVCodecContext *avctx, void *data,
         }
     }
 
-    p->key_frame = 1;
-    p->pict_type = AV_PICTURE_TYPE_I;
-
     *got_frame       = 1;
 
     return avpkt->size;
 }
 
-AVCodec ff_xbm_decoder = {
-    .name         = "xbm",
-    .long_name    = NULL_IF_CONFIG_SMALL("XBM (X BitMap) image"),
-    .type         = AVMEDIA_TYPE_VIDEO,
-    .id           = AV_CODEC_ID_XBM,
-    .decode       = xbm_decode_frame,
-    .capabilities = CODEC_CAP_DR1,
+const FFCodec ff_xbm_decoder = {
+    .p.name       = "xbm",
+    CODEC_LONG_NAME("XBM (X BitMap) image"),
+    .p.type       = AVMEDIA_TYPE_VIDEO,
+    .p.id         = AV_CODEC_ID_XBM,
+    .p.capabilities = AV_CODEC_CAP_DR1,
+    .caps_internal  = FF_CODEC_CAP_SKIP_FRAME_FILL_PARAM,
+    FF_CODEC_DECODE_CB(xbm_decode_frame),
 };

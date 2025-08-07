@@ -21,22 +21,31 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "libavutil/intreadwrite.h"
-#include "libavutil/imgutils.h"
 #include "bytestream.h"
 #include "avcodec.h"
-#include "internal.h"
-#include "s3tc.h"
+#include "codec_internal.h"
+#include "decode.h"
+#include "texturedsp.h"
 
-static int txd_decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
-                            AVPacket *avpkt) {
+#define TXD_DXT1 0x31545844
+#define TXD_DXT3 0x33545844
+
+static int txd_decode_frame(AVCodecContext *avctx, AVFrame *p,
+                            int *got_frame, AVPacket *avpkt)
+{
     GetByteContext gb;
-    AVFrame * const p = data;
+    TextureDSPContext dxtc;
     unsigned int version, w, h, d3d_format, depth, stride, flags;
     unsigned int y, v;
     uint8_t *ptr;
     uint32_t *pal;
+    int i, j;
     int ret;
+
+    if (avpkt->size < 88)
+        return AVERROR_INVALIDDATA;
+
+    ff_texturedsp_init(&dxtc);
 
     bytestream2_init(&gb, avpkt->data, avpkt->size);
     version         = bytestream2_get_le32(&gb);
@@ -49,22 +58,42 @@ static int txd_decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
     flags           = bytestream2_get_byte(&gb);
 
     if (version < 8 || version > 9) {
-        av_log(avctx, AV_LOG_ERROR, "texture data version %i is unsupported\n",
-                                                                    version);
+        avpriv_report_missing_feature(avctx, "Texture data version %u", version);
         return AVERROR_PATCHWELCOME;
     }
 
     if (depth == 8) {
         avctx->pix_fmt = AV_PIX_FMT_PAL8;
-    } else if (depth == 16 || depth == 32) {
-        avctx->pix_fmt = AV_PIX_FMT_RGB32;
+        if (bytestream2_get_bytes_left(&gb) < w * h + 4 * 256)
+            return AVERROR_INVALIDDATA;
+    } else if (depth == 16) {
+        avctx->pix_fmt = AV_PIX_FMT_RGBA;
+        switch (d3d_format) {
+        case 0:
+            if (!(flags & 1))
+                goto unsupported;
+        case TXD_DXT1:
+            if (bytestream2_get_bytes_left(&gb) < AV_CEIL_RSHIFT(w, 2) * AV_CEIL_RSHIFT(h, 2) * 8 + 4)
+                return AVERROR_INVALIDDATA;
+            break;
+        case TXD_DXT3:
+            if (bytestream2_get_bytes_left(&gb) < AV_CEIL_RSHIFT(w, 2) * AV_CEIL_RSHIFT(h, 2) * 16 + 4)
+                return AVERROR_INVALIDDATA;
+        }
+    } else if (depth == 32) {
+        avctx->pix_fmt = AV_PIX_FMT_RGBA;
+        if (bytestream2_get_bytes_left(&gb) < h * w * 4)
+            return AVERROR_INVALIDDATA;
     } else {
-        av_log(avctx, AV_LOG_ERROR, "depth of %i is unsupported\n", depth);
+        avpriv_report_missing_feature(avctx, "Color depth of %u", depth);
         return AVERROR_PATCHWELCOME;
     }
 
     if ((ret = ff_set_dimensions(avctx, w, h)) < 0)
         return ret;
+
+    avctx->coded_width  = FFALIGN(w, 4);
+    avctx->coded_height = FFALIGN(h, 4);
 
     if ((ret = ff_get_buffer(avctx, p, 0)) < 0)
         return ret;
@@ -80,8 +109,6 @@ static int txd_decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
             v = bytestream2_get_be32(&gb);
             pal[y] = (v >> 8) + (v << 24);
         }
-        if (bytestream2_get_bytes_left(&gb) < w * h)
-            return AVERROR_INVALIDDATA;
         bytestream2_skip(&gb, 4);
         for (y=0; y<h; y++) {
             bytestream2_get_buffer(&gb, ptr, w);
@@ -91,17 +118,23 @@ static int txd_decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
         bytestream2_skip(&gb, 4);
         switch (d3d_format) {
         case 0:
-            if (!(flags & 1))
-                goto unsupported;
-        case FF_S3TC_DXT1:
-            if (bytestream2_get_bytes_left(&gb) < FF_CEIL_RSHIFT(w, 2) * FF_CEIL_RSHIFT(h, 2) * 8)
-                return AVERROR_INVALIDDATA;
-            ff_decode_dxt1(&gb, ptr, w, h, stride);
+        case TXD_DXT1:
+            for (j = 0; j < avctx->height; j += 4) {
+                for (i = 0; i < avctx->width; i += 4) {
+                    uint8_t *p = ptr + i * 4 + j * stride;
+                    int step = dxtc.dxt1_block(p, stride, gb.buffer);
+                    bytestream2_skip(&gb, step);
+                }
+            }
             break;
-        case FF_S3TC_DXT3:
-            if (bytestream2_get_bytes_left(&gb) < FF_CEIL_RSHIFT(w, 2) * FF_CEIL_RSHIFT(h, 2) * 16)
-                return AVERROR_INVALIDDATA;
-            ff_decode_dxt3(&gb, ptr, w, h, stride);
+        case TXD_DXT3:
+            for (j = 0; j < avctx->height; j += 4) {
+                for (i = 0; i < avctx->width; i += 4) {
+                    uint8_t *p = ptr + i * 4 + j * stride;
+                    int step = dxtc.dxt3_block(p, stride, gb.buffer);
+                    bytestream2_skip(&gb, step);
+                }
+            }
             break;
         default:
             goto unsupported;
@@ -110,8 +143,6 @@ static int txd_decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
         switch (d3d_format) {
         case 0x15:
         case 0x16:
-            if (bytestream2_get_bytes_left(&gb) < h * w * 4)
-                return AVERROR_INVALIDDATA;
             for (y=0; y<h; y++) {
                 bytestream2_get_buffer(&gb, ptr, w * 4);
                 ptr += stride;
@@ -127,15 +158,15 @@ static int txd_decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
     return avpkt->size;
 
 unsupported:
-    av_log(avctx, AV_LOG_ERROR, "unsupported d3d format (%08x)\n", d3d_format);
+    avpriv_report_missing_feature(avctx, "d3d format (%08x)", d3d_format);
     return AVERROR_PATCHWELCOME;
 }
 
-AVCodec ff_txd_decoder = {
-    .name           = "txd",
-    .long_name      = NULL_IF_CONFIG_SMALL("Renderware TXD (TeXture Dictionary) image"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_TXD,
-    .decode         = txd_decode_frame,
-    .capabilities   = CODEC_CAP_DR1,
+const FFCodec ff_txd_decoder = {
+    .p.name         = "txd",
+    CODEC_LONG_NAME("Renderware TXD (TeXture Dictionary) image"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_TXD,
+    .p.capabilities = AV_CODEC_CAP_DR1,
+    FF_CODEC_DECODE_CB(txd_decode_frame),
 };

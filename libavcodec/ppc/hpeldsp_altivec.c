@@ -22,16 +22,13 @@
 
 #include "config.h"
 
-#if HAVE_ALTIVEC_H
-#include <altivec.h>
-#endif
-
 #include "libavutil/attributes.h"
 #include "libavutil/cpu.h"
 #include "libavutil/ppc/cpu.h"
-#include "libavutil/ppc/types_altivec.h"
 #include "libavutil/ppc/util_altivec.h"
+
 #include "libavcodec/hpeldsp.h"
+
 #include "hpeldsp_altivec.h"
 
 #if HAVE_ALTIVEC
@@ -44,12 +41,12 @@ void ff_put_pixels16_altivec(uint8_t *block, const uint8_t *pixels, ptrdiff_t li
     register vector unsigned char pixelsv1D;
 
     int i;
-    register ptrdiff_t line_size_2 = line_size << 1;
+    register ptrdiff_t line_size_2 = line_size * (1 << 1);
     register ptrdiff_t line_size_3 = line_size + line_size_2;
-    register ptrdiff_t line_size_4 = line_size << 2;
+    register ptrdiff_t line_size_4 = line_size * (1 << 2);
 
 // hand-unrolling the loop by 4 gains about 15%
-// mininum execution time goes from 74 to 60 cycles
+// minimum execution time goes from 74 to 60 cycles
 // it's faster than -funroll-loops, but using
 // -funroll-loops w/ this is bad - 74 cycles again.
 // all this is on a 7450, tuning for the 7450
@@ -87,7 +84,7 @@ void ff_avg_pixels16_altivec(uint8_t *block, const uint8_t *pixels, ptrdiff_t li
 /* next one assumes that ((line_size % 8) == 0) */
 static void avg_pixels8_altivec(uint8_t * block, const uint8_t * pixels, ptrdiff_t line_size, int h)
 {
-    register vector unsigned char pixelsv1, pixelsv2, pixelsv, blockv;
+    register vector unsigned char pixelsv, blockv;
     int i;
 
    for (i = 0; i < h; i++) {

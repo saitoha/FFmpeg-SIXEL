@@ -24,22 +24,27 @@
  * XBR Filter is used for depixelization of image.
  * This is based on Hyllian's xBR shader.
  *
- * @see http://www.libretro.com/forums/viewtopic.php?f=6&t=134
+ * @see https://forums.libretro.com/t/xbr-algorithm-tutorial/123
  * @see https://github.com/yoyofr/iFBA/blob/master/fba_src/src/intf/video/scalers/xbr.cpp
  */
 
 #include "libavutil/opt.h"
-#include "libavutil/avassert.h"
 #include "libavutil/pixdesc.h"
-#include "internal.h"
+
+#include "filters.h"
+#include "video.h"
 
 #define LB_MASK       0x00FEFEFE
 #define RED_BLUE_MASK 0x00FF00FF
 #define GREEN_MASK    0x0000FF00
 
+#ifdef PI
+#undef PI
+#endif
+
 typedef int (*xbrfunc_t)(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs);
 
-typedef struct {
+typedef struct XBRContext {
     const AVClass *class;
     int n;
     xbrfunc_t func;
@@ -65,13 +70,14 @@ static uint32_t pixel_diff(uint32_t x, uint32_t y, const uint32_t *r2y)
 #define YMASK 0xff0000
 #define UMASK 0x00ff00
 #define VMASK 0x0000ff
+#define ABSDIFF(a,b) (abs((int)(a)-(int)(b)))
 
     uint32_t yuv1 = r2y[x & 0xffffff];
     uint32_t yuv2 = r2y[y & 0xffffff];
 
-    return (abs((yuv1 & YMASK) - (yuv2 & YMASK)) >> 16) +
-           (abs((yuv1 & UMASK) - (yuv2 & UMASK)) >>  8) +
-           abs((yuv1 & VMASK) - (yuv2 & VMASK));
+    return (ABSDIFF(yuv1 & YMASK, yuv2 & YMASK) >> 16) +
+           (ABSDIFF(yuv1 & UMASK, yuv2 & UMASK) >>  8) +
+            ABSDIFF(yuv1 & VMASK, yuv2 & VMASK);
 }
 
 #define ALPHA_BLEND_128_W(a, b) ((((a) & LB_MASK) >> 1) + (((b) & LB_MASK) >> 1))
@@ -328,31 +334,19 @@ XBR_FUNC(4)
 static int config_output(AVFilterLink *outlink)
 {
     AVFilterContext *ctx = outlink->src;
-    XBRContext *xbr = ctx->priv;
+    XBRContext *s = ctx->priv;
     AVFilterLink *inlink = ctx->inputs[0];
 
-    outlink->w = inlink->w * xbr->n;
-    outlink->h = inlink->h * xbr->n;
+    outlink->w = inlink->w * s->n;
+    outlink->h = inlink->h * s->n;
     return 0;
-}
-
-static int query_formats(AVFilterContext *ctx)
-{
-    static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_0RGB32, AV_PIX_FMT_NONE,
-    };
-
-    AVFilterFormats *fmts_list = ff_make_format_list(pix_fmts);
-    if (!fmts_list)
-        return AVERROR(ENOMEM);
-    return ff_set_common_formats(ctx, fmts_list);
 }
 
 static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 {
     AVFilterContext *ctx = inlink->dst;
     AVFilterLink *outlink = ctx->outputs[0];
-    XBRContext *xbr = ctx->priv;
+    XBRContext *s = ctx->priv;
     ThreadData td;
 
     AVFrame *out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
@@ -365,8 +359,9 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 
     td.in = in;
     td.out = out;
-    td.rgbtoyuv = xbr->rgbtoyuv;
-    ctx->internal->execute(ctx, xbr->func, &td, NULL, FFMIN(inlink->h, ctx->graph->nb_threads));
+    td.rgbtoyuv = s->rgbtoyuv;
+    ff_filter_execute(ctx, s->func, &td, NULL,
+                      FFMIN(inlink->h, ff_filter_get_nb_threads(ctx)));
 
     out->width  = outlink->w;
     out->height = outlink->h;
@@ -375,9 +370,9 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     return ff_filter_frame(outlink, out);
 }
 
-static int init(AVFilterContext *ctx)
+static av_cold int init(AVFilterContext *ctx)
 {
-    XBRContext *xbr = ctx->priv;
+    XBRContext *s = ctx->priv;
     static const xbrfunc_t xbrfuncs[] = {xbr2x, xbr3x, xbr4x};
 
     uint32_t c;
@@ -390,15 +385,15 @@ static int init(AVFilterContext *ctx)
             int startg = FFMAX3(-bg, -rg, 0);
             int endg = FFMIN3(255-bg, 255-rg, 255);
             uint32_t y = (uint32_t)(( 299*rg + 1000*startg + 114*bg)/1000);
-            c = bg + (rg<<16) + 0x010101 * startg;
+            c = bg + rg * (1 << 16) + 0x010101 * startg;
             for (g = startg; g <= endg; g++) {
-                xbr->rgbtoyuv[c] = ((y++) << 16) + (u << 8) + v;
+                s->rgbtoyuv[c] = ((y++) << 16) + (u << 8) + v;
                 c+= 0x010101;
             }
         }
     }
 
-    xbr->func = xbrfuncs[xbr->n - 2];
+    s->func = xbrfuncs[s->n - 2];
     return 0;
 }
 
@@ -408,7 +403,6 @@ static const AVFilterPad xbr_inputs[] = {
         .type         = AVMEDIA_TYPE_VIDEO,
         .filter_frame = filter_frame,
     },
-    { NULL }
 };
 
 static const AVFilterPad xbr_outputs[] = {
@@ -417,17 +411,16 @@ static const AVFilterPad xbr_outputs[] = {
         .type         = AVMEDIA_TYPE_VIDEO,
         .config_props = config_output,
     },
-    { NULL }
 };
 
-AVFilter ff_vf_xbr = {
-    .name          = "xbr",
-    .description   = NULL_IF_CONFIG_SMALL("Scale the input using xBR algorithm."),
-    .inputs        = xbr_inputs,
-    .outputs       = xbr_outputs,
-    .query_formats = query_formats,
+const FFFilter ff_vf_xbr = {
+    .p.name        = "xbr",
+    .p.description = NULL_IF_CONFIG_SMALL("Scale the input using xBR algorithm."),
+    .p.priv_class  = &xbr_class,
+    .p.flags       = AVFILTER_FLAG_SLICE_THREADS,
+    FILTER_INPUTS(xbr_inputs),
+    FILTER_OUTPUTS(xbr_outputs),
+    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_0RGB32),
     .priv_size     = sizeof(XBRContext),
-    .priv_class    = &xbr_class,
     .init          = init,
-    .flags         = AVFILTER_FLAG_SLICE_THREADS,
 };

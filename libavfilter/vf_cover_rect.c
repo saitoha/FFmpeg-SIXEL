@@ -22,10 +22,10 @@
  * @todo switch to dualinput
  */
 
-#include "libavutil/avassert.h"
-#include "libavutil/imgutils.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
-#include "internal.h"
+#include "filters.h"
+#include "video.h"
 
 #include "lavfutils.h"
 
@@ -47,30 +47,13 @@ typedef struct CoverContext {
 #define FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM
 static const AVOption cover_rect_options[] = {
     { "cover",  "cover bitmap filename",  OFFSET(cover_filename),  AV_OPT_TYPE_STRING, {.str = NULL}, .flags = FLAGS },
-    { "mode", "set removal mode", OFFSET(mode), AV_OPT_TYPE_INT, {.i64 = MODE_BLUR}, 0, NB_MODES - 1, FLAGS, "mode" },
-        { "cover", "cover area with bitmap", 0, AV_OPT_TYPE_CONST, {.i64 = MODE_COVER}, INT_MIN, INT_MAX, FLAGS, "mode" },
-        { "blur", "blur area", 0, AV_OPT_TYPE_CONST, {.i64 = MODE_BLUR}, INT_MIN, INT_MAX, FLAGS, "mode" },
+    { "mode", "set removal mode", OFFSET(mode), AV_OPT_TYPE_INT, {.i64 = MODE_BLUR}, 0, NB_MODES - 1, FLAGS, .unit = "mode" },
+        { "cover", "cover area with bitmap", 0, AV_OPT_TYPE_CONST, {.i64 = MODE_COVER}, INT_MIN, INT_MAX, FLAGS, .unit = "mode" },
+        { "blur", "blur area", 0, AV_OPT_TYPE_CONST, {.i64 = MODE_BLUR}, INT_MIN, INT_MAX, FLAGS, .unit = "mode" },
     { NULL }
 };
 
-static const AVClass cover_rect_class = {
-    .class_name       = "cover_rect",
-    .item_name        = av_default_item_name,
-    .option           = cover_rect_options,
-    .version          = LIBAVUTIL_VERSION_INT,
-    .category         = AV_CLASS_CATEGORY_FILTER,
-};
-
-static int query_formats(AVFilterContext *ctx)
-{
-    static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_YUV420P,
-        AV_PIX_FMT_YUVJ420P,
-        AV_PIX_FMT_NONE
-    };
-
-    return ff_set_common_formats(ctx, ff_make_format_list(pix_fmts));
-}
+AVFILTER_DEFINE_CLASS(cover_rect);
 
 static int config_input(AVFilterLink *inlink)
 {
@@ -84,8 +67,8 @@ static void cover_rect(CoverContext *cover, AVFrame *in, int offx, int offy)
     for (p = 0; p < 3; p++) {
         uint8_t *data = in->data[p] + (offx>>!!p) + (offy>>!!p) * in->linesize[p];
         const uint8_t *src = cover->cover_frame->data[p];
-        int w = FF_CEIL_RSHIFT(cover->cover_frame->width , !!p);
-        int h = FF_CEIL_RSHIFT(cover->cover_frame->height, !!p);
+        int w = AV_CEIL_RSHIFT(cover->cover_frame->width , !!p);
+        int h = AV_CEIL_RSHIFT(cover->cover_frame->height, !!p);
         for (y = 0; y < h; y++) {
             for (x = 0; x < w; x++) {
                 data[x] = src[x];
@@ -104,10 +87,10 @@ static void blur(CoverContext *cover, AVFrame *in, int offx, int offy)
         int oy = offy>>!!p;
         int stride = in->linesize[p];
         uint8_t *data = in->data[p] + ox + oy * stride;
-        int w = FF_CEIL_RSHIFT(cover->width , !!p);
-        int h = FF_CEIL_RSHIFT(cover->height, !!p);
-        int iw = FF_CEIL_RSHIFT(in->width , !!p);
-        int ih = FF_CEIL_RSHIFT(in->height, !!p);
+        int w = AV_CEIL_RSHIFT(cover->width , !!p);
+        int h = AV_CEIL_RSHIFT(cover->height, !!p);
+        int iw = AV_CEIL_RSHIFT(in->width , !!p);
+        int ih = AV_CEIL_RSHIFT(in->height, !!p);
         for (y = 0; y < h; y++) {
             for (x = 0; x < w; x++) {
                 int c = 0;
@@ -143,7 +126,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     AVFilterContext *ctx = inlink->dst;
     CoverContext *cover = ctx->priv;
     AVDictionaryEntry *ex, *ey, *ew, *eh;
-    int x = -1, y = -1, w = -1, h = -1;
+    int ret, x = -1, y = -1, w = -1, h = -1;
     char *xendptr = NULL, *yendptr = NULL, *wendptr = NULL, *hendptr = NULL;
 
     ex = av_dict_get(in->metadata, "lavfi.rect.x", NULL, AV_DICT_MATCH_CASE);
@@ -158,7 +141,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     }
 
     if (!xendptr || *xendptr || !yendptr || *yendptr ||
-        !wendptr || *wendptr || !hendptr || !hendptr
+        !wendptr || *wendptr || !hendptr || *hendptr
     ) {
         return ff_filter_frame(ctx->outputs[0], in);
     }
@@ -188,7 +171,11 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     x = av_clip(x, 0, in->width  - w);
     y = av_clip(y, 0, in->height - h);
 
-    av_frame_make_writable(in);
+    ret = ff_inlink_make_frame_writable(inlink, &in);
+    if (ret < 0) {
+        av_frame_free(&in);
+        return ret;
+    }
 
     if (cover->mode == MODE_BLUR) {
         blur (cover, in, x, y);
@@ -204,6 +191,7 @@ static av_cold void uninit(AVFilterContext *ctx)
 
     if (cover->cover_frame)
         av_freep(&cover->cover_frame->data[0]);
+    av_frame_free(&cover->cover_frame);
 }
 
 static av_cold int init(AVFilterContext *ctx)
@@ -242,25 +230,16 @@ static const AVFilterPad cover_rect_inputs[] = {
         .config_props = config_input,
         .filter_frame = filter_frame,
     },
-    { NULL }
 };
 
-static const AVFilterPad cover_rect_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-    { NULL }
-};
-
-AVFilter ff_vf_cover_rect = {
-    .name            = "cover_rect",
-    .description     = NULL_IF_CONFIG_SMALL("Find and cover a user specified object"),
+const FFFilter ff_vf_cover_rect = {
+    .p.name          = "cover_rect",
+    .p.description   = NULL_IF_CONFIG_SMALL("Find and cover a user specified object."),
+    .p.priv_class    = &cover_rect_class,
     .priv_size       = sizeof(CoverContext),
     .init            = init,
     .uninit          = uninit,
-    .query_formats   = query_formats,
-    .inputs          = cover_rect_inputs,
-    .outputs         = cover_rect_outputs,
-    .priv_class      = &cover_rect_class,
+    FILTER_INPUTS(cover_rect_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_PIXFMTS(AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUVJ420P),
 };

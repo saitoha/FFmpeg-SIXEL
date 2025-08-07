@@ -20,9 +20,10 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include <inttypes.h>
+#include <stdint.h>
+#include <string.h>
 
-#include "avcodec.h"
+#include "config.h"
 #include "celp_filters.h"
 #include "libavutil/avassert.h"
 #include "libavutil/common.h"
@@ -65,11 +66,11 @@ int ff_celp_lp_synthesis_filter(int16_t *out, const int16_t *filter_coeffs,
     int i,n;
 
     for (n = 0; n < buffer_length; n++) {
-        int sum = -rounder, sum1;
+        int sum = rounder, sum1;
         for (i = 1; i <= filter_length; i++)
-            sum += filter_coeffs[i-1] * out[n-i];
+            sum -= (unsigned)(filter_coeffs[i-1] * out[n-i]);
 
-        sum1 = ((-sum >> 12) + in[n]) >> shift;
+        sum1 = ((sum >> 12) + in[n]) >> shift;
         sum  = av_clip_int16(sum1);
 
         if (stop_on_overflow && sum != sum1)
@@ -214,6 +215,7 @@ void ff_celp_filter_init(CELPFContext *c)
     c->celp_lp_synthesis_filterf        = ff_celp_lp_synthesis_filterf;
     c->celp_lp_zero_synthesis_filterf   = ff_celp_lp_zero_synthesis_filterf;
 
-    if(HAVE_MIPSFPU)
-        ff_celp_filter_init_mips(c);
+#if HAVE_MIPSFPU
+    ff_celp_filter_init_mips(c);
+#endif
 }

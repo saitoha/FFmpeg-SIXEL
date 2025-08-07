@@ -28,9 +28,7 @@
  * ratecontrol header.
  */
 
-#include <stdio.h>
 #include <stdint.h>
-#include "libavutil/eval.h"
 
 typedef struct Predictor{
     double coeff;
@@ -41,6 +39,9 @@ typedef struct Predictor{
 typedef struct RateControlEntry{
     int pict_type;
     float qscale;
+    int i_count;
+    int f_code;
+    int b_code;
     int mv_bits;
     int i_tex_bits;
     int p_tex_bits;
@@ -51,10 +52,6 @@ typedef struct RateControlEntry{
     float new_qscale;
     int64_t mc_mb_var_sum;
     int64_t mb_var_sum;
-    int i_count;
-    int skip_count;
-    int f_code;
-    int b_code;
 }RateControlEntry;
 
 /**
@@ -68,7 +65,7 @@ typedef struct RateControlContext{
     double short_term_qsum;       ///< sum of recent qscales
     double short_term_qcount;     ///< count of recent qscales
     double pass1_rc_eq_output_sum;///< sum of the output of the rc equation, this is used for normalization
-    double pass1_wanted_bits;     ///< bits which should have been outputed by the pass1 code (including complexity init)
+    double pass1_wanted_bits;     ///< bits which should have been output by the pass1 code (including complexity init)
     double last_qscale;
     double last_qscale_for[5];    ///< last qscale for a specific pict type, used for max_diff & ipb factor stuff
     int64_t last_mc_mb_var_sum;
@@ -80,24 +77,30 @@ typedef struct RateControlContext{
     int frame_count[5];
     int last_non_b_pict_type;
 
-    void *non_lavc_opaque;        ///< context for non lavc rc code (for example xvid)
-    float dry_run_qscale;         ///< for xvid rc
-    int last_picture_number;      ///< for xvid rc
-    AVExpr * rc_eq_eval;
+    /**
+     * ratecontrol qmin qmax limiting method
+     * 0-> clipping, 1-> use a nice continuous function to limit qscale within qmin/qmax.
+     */
+    float qsquish;
+    float qmod_amp;
+    int   qmod_freq;
+    float initial_cplx;
+    float buffer_aggressivity;
+
+    char *rc_eq;
+    struct AVExpr *rc_eq_eval;
+
+    float *cplx_tab, *bits_tab;
 }RateControlContext;
 
-struct MpegEncContext;
+typedef struct MPVMainEncContext MPVMainEncContext;
 
 /* rate control */
-int ff_rate_control_init(struct MpegEncContext *s);
-float ff_rate_estimate_qscale(struct MpegEncContext *s, int dry_run);
-void ff_write_pass1_stats(struct MpegEncContext *s);
-void ff_rate_control_uninit(struct MpegEncContext *s);
-int ff_vbv_update(struct MpegEncContext *s, int frame_size);
-void ff_get_2pass_fcode(struct MpegEncContext *s);
-
-int ff_xvid_rate_control_init(struct MpegEncContext *s);
-void ff_xvid_rate_control_uninit(struct MpegEncContext *s);
-float ff_xvid_rate_estimate_qscale(struct MpegEncContext *s, int dry_run);
+int ff_rate_control_init(MPVMainEncContext *m);
+float ff_rate_estimate_qscale(MPVMainEncContext *m, int dry_run);
+void ff_write_pass1_stats(MPVMainEncContext *m);
+int ff_vbv_update(MPVMainEncContext *m, int frame_size);
+void ff_get_2pass_fcode(MPVMainEncContext *m);
+void ff_rate_control_uninit(RateControlContext *rcc);
 
 #endif /* AVCODEC_RATECONTROL_H */

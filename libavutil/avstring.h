@@ -134,6 +134,7 @@ size_t av_strlcatf(char *dst, size_t size, const char *fmt, ...) av_printf_forma
 /**
  * Get the count of continuous non zero chars starting from the beginning.
  *
+ * @param s   the string whose length to count
  * @param len maximum number of characters to check in the string, that
  *            is the maximum value which is returned by the function
  */
@@ -154,11 +155,6 @@ static inline size_t av_strnlen(const char *s, size_t len)
  * @note You have to free the string yourself with av_free().
  */
 char *av_asprintf(const char *fmt, ...) av_printf_format(1, 2);
-
-/**
- * Convert a number to a av_malloced string.
- */
-char *av_d2str(double d);
 
 /**
  * Unescape the given string until a non escaped terminating char,
@@ -203,17 +199,27 @@ char *av_strtok(char *s, const char *delim, char **saveptr);
 /**
  * Locale-independent conversion of ASCII isdigit.
  */
-av_const int av_isdigit(int c);
+static inline av_const int av_isdigit(int c)
+{
+    return c >= '0' && c <= '9';
+}
 
 /**
  * Locale-independent conversion of ASCII isgraph.
  */
-av_const int av_isgraph(int c);
+static inline av_const int av_isgraph(int c)
+{
+    return c > 32 && c < 127;
+}
 
 /**
  * Locale-independent conversion of ASCII isspace.
  */
-av_const int av_isspace(int c);
+static inline av_const int av_isspace(int c)
+{
+    return c == ' ' || c == '\f' || c == '\n' || c == '\r' || c == '\t' ||
+           c == '\v';
+}
 
 /**
  * Locale-independent conversion of ASCII characters to uppercase.
@@ -238,7 +244,11 @@ static inline av_const int av_tolower(int c)
 /**
  * Locale-independent conversion of ASCII isxdigit.
  */
-av_const int av_isxdigit(int c);
+static inline av_const int av_isxdigit(int c)
+{
+    c = av_tolower(c);
+    return av_isdigit(c) || (c >= 'a' && c <= 'f');
+}
 
 /**
  * Locale-independent case-insensitive compare.
@@ -252,24 +262,39 @@ int av_strcasecmp(const char *a, const char *b);
  */
 int av_strncasecmp(const char *a, const char *b, size_t n);
 
+/**
+ * Locale-independent strings replace.
+ * @note This means only ASCII-range characters are replaced.
+ */
+char *av_strireplace(const char *str, const char *from, const char *to);
 
 /**
  * Thread safe basename.
- * @param path the path, on DOS both \ and / are considered separators.
+ * @param path the string to parse, on DOS both \ and / are considered separators.
  * @return pointer to the basename substring.
+ * If path does not contain a slash, the function returns a copy of path.
+ * If path is a NULL pointer or points to an empty string, a pointer
+ * to a string "." is returned.
  */
 const char *av_basename(const char *path);
 
 /**
  * Thread safe dirname.
- * @param path the path, on DOS both \ and / are considered separators.
- * @return the path with the separator replaced by the string terminator or ".".
- * @note the function may change the input string.
+ * @param path the string to parse, on DOS both \ and / are considered separators.
+ * @return A pointer to a string that's the parent directory of path.
+ * If path is a NULL pointer or points to an empty string, a pointer
+ * to a string "." is returned.
+ * @note the function may modify the contents of the path, so copies should be passed.
  */
 const char *av_dirname(char *path);
 
 /**
  * Match instances of a name in a comma-separated list of names.
+ * List entries are checked from the start to the end of the names list,
+ * the first match ends further processing. If an entry prefixed with '-'
+ * matches, then 0 is returned. The "ALL" list entry is considered to
+ * match all names.
+ *
  * @param name  Name to look for.
  * @param names List of names.
  * @return 1 on match, 0 otherwise.
@@ -290,6 +315,7 @@ enum AVEscapeMode {
     AV_ESCAPE_MODE_AUTO,      ///< Use auto-selected escaping mode.
     AV_ESCAPE_MODE_BACKSLASH, ///< Use backslash escaping.
     AV_ESCAPE_MODE_QUOTE,     ///< Use single-quote escaping.
+    AV_ESCAPE_MODE_XML,       ///< Use XML non-markup character data escaping.
 };
 
 /**
@@ -300,14 +326,27 @@ enum AVEscapeMode {
  * characters lists, except it is guaranteed to use the exact same list
  * of whitespace characters as the rest of libavutil.
  */
-#define AV_ESCAPE_FLAG_WHITESPACE 0x01
+#define AV_ESCAPE_FLAG_WHITESPACE (1 << 0)
 
 /**
  * Escape only specified special characters.
  * Without this flag, escape also any characters that may be considered
  * special by av_get_token(), such as the single quote.
  */
-#define AV_ESCAPE_FLAG_STRICT 0x02
+#define AV_ESCAPE_FLAG_STRICT (1 << 1)
+
+/**
+ * Within AV_ESCAPE_MODE_XML, additionally escape single quotes for single
+ * quoted attributes.
+ */
+#define AV_ESCAPE_FLAG_XML_SINGLE_QUOTES (1 << 2)
+
+/**
+ * Within AV_ESCAPE_MODE_XML, additionally escape double quotes for double
+ * quoted attributes.
+ */
+#define AV_ESCAPE_FLAG_XML_DOUBLE_QUOTES (1 << 3)
+
 
 /**
  * Escape string in src, and put the escaped string in an allocated
@@ -325,6 +364,7 @@ enum AVEscapeMode {
  * @return the length of the allocated string, or a negative error code in case of error
  * @see av_bprint_escape()
  */
+av_warn_unused_result
 int av_escape(char **dst, const char *src, const char *special_chars,
               enum AVEscapeMode mode, int flags);
 
@@ -364,6 +404,7 @@ int av_escape(char **dst, const char *src, const char *special_chars,
  * @return >= 0 in case a sequence was successfully read, a negative
  * value in case of invalid sequence
  */
+av_warn_unused_result
 int av_utf8_decode(int32_t *codep, const uint8_t **bufp, const uint8_t *buf_end,
                    unsigned int flags);
 
@@ -373,6 +414,12 @@ int av_utf8_decode(int32_t *codep, const uint8_t **bufp, const uint8_t *buf_end,
  *            list.
  */
 int av_match_list(const char *name, const char *list, char separator);
+
+/**
+ * See libc sscanf manual for more information.
+ * Locale-independent sscanf implementation.
+ */
+int av_sscanf(const char *string, const char *format, ...) av_scanf_format(2, 3);
 
 /**
  * @}

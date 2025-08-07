@@ -32,7 +32,6 @@
 
 #include "config.h"
 #include "libavutil/attributes.h"
-#include "avcodec.h"
 #include "idctdsp.h"
 #include "xvididct.h"
 
@@ -56,37 +55,37 @@ static const int TAB35[] = { 26722, 25172, 22654, 19266, 15137, 10426, 5315 };
 
 static int idct_row(short *in, const int *const tab, int rnd)
 {
-    const int c1 = tab[0];
-    const int c2 = tab[1];
-    const int c3 = tab[2];
-    const int c4 = tab[3];
-    const int c5 = tab[4];
-    const int c6 = tab[5];
-    const int c7 = tab[6];
+    const unsigned c1 = tab[0];
+    const unsigned c2 = tab[1];
+    const unsigned c3 = tab[2];
+    const unsigned c4 = tab[3];
+    const unsigned c5 = tab[4];
+    const unsigned c6 = tab[5];
+    const unsigned c7 = tab[6];
 
     const int right = in[5] | in[6] | in[7];
     const int left  = in[1] | in[2] | in[3];
     if (!(right | in[4])) {
         const int k = c4 * in[0] + rnd;
         if (left) {
-            const int a0 = k + c2 * in[2];
-            const int a1 = k + c6 * in[2];
-            const int a2 = k - c6 * in[2];
-            const int a3 = k - c2 * in[2];
+            const unsigned a0 = k + c2 * in[2];
+            const unsigned a1 = k + c6 * in[2];
+            const unsigned a2 = k - c6 * in[2];
+            const unsigned a3 = k - c2 * in[2];
 
             const int b0 = c1 * in[1] + c3 * in[3];
             const int b1 = c3 * in[1] - c7 * in[3];
             const int b2 = c5 * in[1] - c1 * in[3];
             const int b3 = c7 * in[1] - c5 * in[3];
 
-            in[0] = (a0 + b0) >> ROW_SHIFT;
-            in[1] = (a1 + b1) >> ROW_SHIFT;
-            in[2] = (a2 + b2) >> ROW_SHIFT;
-            in[3] = (a3 + b3) >> ROW_SHIFT;
-            in[4] = (a3 - b3) >> ROW_SHIFT;
-            in[5] = (a2 - b2) >> ROW_SHIFT;
-            in[6] = (a1 - b1) >> ROW_SHIFT;
-            in[7] = (a0 - b0) >> ROW_SHIFT;
+            in[0] = (int)(a0 + b0) >> ROW_SHIFT;
+            in[1] = (int)(a1 + b1) >> ROW_SHIFT;
+            in[2] = (int)(a2 + b2) >> ROW_SHIFT;
+            in[3] = (int)(a3 + b3) >> ROW_SHIFT;
+            in[4] = (int)(a3 - b3) >> ROW_SHIFT;
+            in[5] = (int)(a2 - b2) >> ROW_SHIFT;
+            in[6] = (int)(a1 - b1) >> ROW_SHIFT;
+            in[7] = (int)(a0 - b0) >> ROW_SHIFT;
         } else {
             const int a0 = k >> ROW_SHIFT;
             if (a0) {
@@ -102,8 +101,8 @@ static int idct_row(short *in, const int *const tab, int rnd)
                 return 0;
         }
     } else if (!(left | right)) {
-        const int a0 = (rnd + c4 * (in[0] + in[4])) >> ROW_SHIFT;
-        const int a1 = (rnd + c4 * (in[0] - in[4])) >> ROW_SHIFT;
+        const int a0 = (int)(rnd + c4 * (in[0] + in[4])) >> ROW_SHIFT;
+        const int a1 = (int)(rnd + c4 * (in[0] - in[4])) >> ROW_SHIFT;
 
         in[0] = a0;
         in[3] = a0;
@@ -114,25 +113,25 @@ static int idct_row(short *in, const int *const tab, int rnd)
         in[5] = a1;
         in[6] = a1;
     } else {
-        const int k  = c4 * in[0] + rnd;
-        const int a0 = k + c2 * in[2] + c4 * in[4] + c6 * in[6];
-        const int a1 = k + c6 * in[2] - c4 * in[4] - c2 * in[6];
-        const int a2 = k - c6 * in[2] - c4 * in[4] + c2 * in[6];
-        const int a3 = k - c2 * in[2] + c4 * in[4] - c6 * in[6];
+        const unsigned int k  = c4 * in[0] + rnd;
+        const unsigned int a0 = k + c2 * in[2] + c4 * in[4] + c6 * in[6];
+        const unsigned int a1 = k + c6 * in[2] - c4 * in[4] - c2 * in[6];
+        const unsigned int a2 = k - c6 * in[2] - c4 * in[4] + c2 * in[6];
+        const unsigned int a3 = k - c2 * in[2] + c4 * in[4] - c6 * in[6];
 
-        const int b0 = c1 * in[1] + c3 * in[3] + c5 * in[5] + c7 * in[7];
-        const int b1 = c3 * in[1] - c7 * in[3] - c1 * in[5] - c5 * in[7];
-        const int b2 = c5 * in[1] - c1 * in[3] + c7 * in[5] + c3 * in[7];
-        const int b3 = c7 * in[1] - c5 * in[3] + c3 * in[5] - c1 * in[7];
+        const unsigned int b0 = c1 * in[1] + c3 * in[3] + c5 * in[5] + c7 * in[7];
+        const unsigned int b1 = c3 * in[1] - c7 * in[3] - c1 * in[5] - c5 * in[7];
+        const unsigned int b2 = c5 * in[1] - c1 * in[3] + c7 * in[5] + c3 * in[7];
+        const unsigned int b3 = c7 * in[1] - c5 * in[3] + c3 * in[5] - c1 * in[7];
 
-        in[0] = (a0 + b0) >> ROW_SHIFT;
-        in[1] = (a1 + b1) >> ROW_SHIFT;
-        in[2] = (a2 + b2) >> ROW_SHIFT;
-        in[3] = (a3 + b3) >> ROW_SHIFT;
-        in[4] = (a3 - b3) >> ROW_SHIFT;
-        in[5] = (a2 - b2) >> ROW_SHIFT;
-        in[6] = (a1 - b1) >> ROW_SHIFT;
-        in[7] = (a0 - b0) >> ROW_SHIFT;
+        in[0] = (int)(a0 + b0) >> ROW_SHIFT;
+        in[1] = (int)(a1 + b1) >> ROW_SHIFT;
+        in[2] = (int)(a2 + b2) >> ROW_SHIFT;
+        in[3] = (int)(a3 + b3) >> ROW_SHIFT;
+        in[4] = (int)(a3 - b3) >> ROW_SHIFT;
+        in[5] = (int)(a2 - b2) >> ROW_SHIFT;
+        in[6] = (int)(a1 - b1) >> ROW_SHIFT;
+        in[7] = (int)(a0 - b0) >> ROW_SHIFT;
     }
     return 1;
 }
@@ -142,7 +141,7 @@ static int idct_row(short *in, const int *const tab, int rnd)
 #define TAN3  0xAB0E
 #define SQRT2 0x5A82
 
-#define MULT(c, x, n)  (((c) * (x)) >> (n))
+#define MULT(c, x, n)  ((unsigned)((int)((c) * (unsigned)(x)) >> (n)))
 // 12b version => #define MULT(c,x, n)  ((((c) >> 3) * (x)) >> ((n) - 3))
 // 12b zero-testing version:
 
@@ -318,36 +317,28 @@ void ff_xvid_idct(int16_t *const in)
     }
 }
 
-static void xvid_idct_put(uint8_t *dest, int line_size, int16_t *block)
+static void xvid_idct_put(uint8_t *dest, ptrdiff_t line_size, int16_t *block)
 {
     ff_xvid_idct(block);
-    ff_put_pixels_clamped(block, dest, line_size);
+    ff_put_pixels_clamped_c(block, dest, line_size);
 }
 
-static void xvid_idct_add(uint8_t *dest, int line_size, int16_t *block)
+static void xvid_idct_add(uint8_t *dest, ptrdiff_t line_size, int16_t *block)
 {
     ff_xvid_idct(block);
-    ff_add_pixels_clamped(block, dest, line_size);
+    ff_add_pixels_clamped_c(block, dest, line_size);
 }
 
-av_cold void ff_xvid_idct_init(IDCTDSPContext *c, AVCodecContext *avctx)
+av_cold void ff_xvid_idct_init(IDCTDSPContext *c)
 {
-    const unsigned high_bit_depth = avctx->bits_per_raw_sample > 8;
+    c->idct_put  = xvid_idct_put;
+    c->idct_add  = xvid_idct_add;
+    c->idct      = ff_xvid_idct;
+    c->perm_type = FF_IDCT_PERM_NONE;
 
-    if (high_bit_depth || avctx->lowres ||
-        !(avctx->idct_algo == FF_IDCT_AUTO ||
-          avctx->idct_algo == FF_IDCT_XVID))
-        return;
-
-    if (avctx->idct_algo == FF_IDCT_XVID) {
-        c->idct_put  = xvid_idct_put;
-        c->idct_add  = xvid_idct_add;
-        c->idct      = ff_xvid_idct;
-        c->perm_type = FF_IDCT_PERM_NONE;
-    }
-
-    if (ARCH_X86)
-        ff_xvid_idct_init_x86(c, avctx, high_bit_depth);
-
-    ff_init_scantable_permutation(c->idct_permutation, c->perm_type);
+#if ARCH_X86
+    ff_xvid_idct_init_x86(c);
+#elif ARCH_MIPS
+    ff_xvid_idct_init_mips(c);
+#endif
 }

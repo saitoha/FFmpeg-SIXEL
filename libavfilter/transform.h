@@ -60,47 +60,28 @@ enum FillMethod {
 #define FILL_DEFAULT FILL_ORIGINAL
 
 /**
- * Get an affine transformation matrix from a given translation, rotation, and
- * zoom factor. The matrix will look like:
+ * Get an affine transformation matrix from given translation, rotation, and
+ * zoom factors. The matrix will look like:
  *
- * [ zoom * cos(angle),           -sin(angle),     x_shift,
- *          sin(angle),     zoom * cos(angle),     y_shift,
- *                   0,                     0,           1 ]
+ * [ scale_x * cos(angle),           -sin(angle),     x_shift,
+ *             sin(angle),  scale_y * cos(angle),     y_shift,
+ *                      0,                     0,           1 ]
  *
- * @param x_shift horizontal translation
- * @param y_shift vertical translation
- * @param angle   rotation in radians
- * @param zoom    scale percent (1.0 = 100%)
- * @param matrix  9-item affine transformation matrix
+ * @param x_shift   horizontal translation
+ * @param y_shift   vertical translation
+ * @param angle     rotation in radians
+ * @param scale_x   x scale percent (1.0 = 100%)
+ * @param scale_y   y scale percent (1.0 = 100%)
+ * @param matrix    9-item affine transformation matrix
  */
-void avfilter_get_matrix(float x_shift, float y_shift, float angle, float zoom, float *matrix);
-
-/**
- * Add two matrices together. result = m1 + m2.
- *
- * @param m1     9-item transformation matrix
- * @param m2     9-item transformation matrix
- * @param result 9-item transformation matrix
- */
-void avfilter_add_matrix(const float *m1, const float *m2, float *result);
-
-/**
- * Subtract one matrix from another. result = m1 - m2.
- *
- * @param m1     9-item transformation matrix
- * @param m2     9-item transformation matrix
- * @param result 9-item transformation matrix
- */
-void avfilter_sub_matrix(const float *m1, const float *m2, float *result);
-
-/**
- * Multiply a matrix by a scalar value. result = m1 * scalar.
- *
- * @param m1     9-item transformation matrix
- * @param scalar a number
- * @param result 9-item transformation matrix
- */
-void avfilter_mul_matrix(const float *m1, float scalar, float *result);
+void ff_get_matrix(
+    float x_shift,
+    float y_shift,
+    float angle,
+    float scale_x,
+    float scale_y,
+    float *matrix
+);
 
 /**
  * Do an affine transformation with the given interpolation method. This
@@ -118,7 +99,7 @@ void avfilter_mul_matrix(const float *m1, float scalar, float *result);
  * @param fill        edge fill method
  * @return negative on error
  */
-int avfilter_transform(const uint8_t *src, uint8_t *dst,
+int ff_affine_transform(const uint8_t *src, uint8_t *dst,
                         int src_stride, int dst_stride,
                         int width, int height, const float *matrix,
                         enum InterpolateMethod interpolate,

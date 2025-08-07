@@ -172,6 +172,9 @@ INF: while(<$inf>) {
         } elsif ($ended =~ /^(?:itemize|enumerate|(?:multi|[fv])?table)$/) {
             $_ = "\n=back\n";
             $ic = pop @icstack;
+        } elsif ($ended =~ /^float$/) {
+            $_ = "\n=back\n";
+            $ic = pop @icstack;
         } else {
             die "unknown command \@end $ended at line $.\n";
         }
@@ -297,6 +300,12 @@ INF: while(<$inf>) {
         $_ = "";        # need a paragraph break
     };
 
+    /^\@(float)\s+\w+/ and do {
+        push @endwstack, $endw;
+        $endw = $1;
+        $_ = "\n=over 4\n";
+    };
+
     /^\@item\s+(.*\S)\s*$/ and $endw eq "multitable" and do {
         my $columns = $1;
         $columns =~ s/\@tab/ : /;
@@ -384,7 +393,7 @@ sub postprocess
     # @* is also impossible in .pod; we discard it and any newline that
     # follows it.  Similarly, our macro @gol must be discarded.
 
-    s/\@anchor{(?:[^\}]*)\}//g;
+    s/\@anchor\{(?:[^\}]*)\}//g;
     s/\(?\@xref\{(?:[^\}]*)\}(?:[^.<]|(?:<[^<>]*>))*\.\)?//g;
     s/\s+\(\@pxref\{(?:[^\}]*)\}\)//g;
     s/;\s+\@pxref\{(?:[^\}]*)\}//g;

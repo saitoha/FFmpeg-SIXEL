@@ -47,6 +47,21 @@ void ff_http_init_auth_state(URLContext *dest, const URLContext *src);
  */
 int ff_http_do_new_request(URLContext *h, const char *uri);
 
+/**
+ * Send a new HTTP request, reusing the old connection.
+ *
+ * @param h pointer to the resource
+ * @param uri uri used to perform the request
+ * @param options  A dictionary filled with HTTP options. On return
+ * this parameter will be destroyed and replaced with a dict containing options
+ * that were not found. May be NULL.
+ * @return a negative value if an error condition occurred, 0
+ * otherwise
+ */
+int ff_http_do_new_request2(URLContext *h, const char *uri, AVDictionary **options);
+
 int ff_http_averror(int status_code, int default_averror);
+
+const char* ff_http_get_new_location(URLContext *h);
 
 #endif /* AVFORMAT_HTTP_H */

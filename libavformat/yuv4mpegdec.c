@@ -19,12 +19,16 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/avstring.h"
+#include "libavutil/imgutils.h"
+
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 #include "yuv4mpeg.h"
 
 /* Header size increased to allow room for optional flags */
-#define MAX_YUV4_HEADER 80
+#define MAX_YUV4_HEADER 128
 #define MAX_FRAME_HEADER 80
 
 static int yuv4_read_header(AVFormatContext *s)
@@ -39,7 +43,9 @@ static int yuv4_read_header(AVFormatContext *s)
     enum AVPixelFormat pix_fmt = AV_PIX_FMT_NONE, alt_pix_fmt = AV_PIX_FMT_NONE;
     enum AVChromaLocation chroma_sample_location = AVCHROMA_LOC_UNSPECIFIED;
     enum AVFieldOrder field_order = AV_FIELD_UNKNOWN;
+    enum AVColorRange color_range = AVCOL_RANGE_UNSPECIFIED;
     AVStream *st;
+    int64_t data_offset;
 
     for (i = 0; i < MAX_YUV4_HEADER; i++) {
         header[i] = avio_r8(pb);
@@ -50,10 +56,14 @@ static int yuv4_read_header(AVFormatContext *s)
             break;
         }
     }
-    if (i == MAX_YUV4_HEADER)
-        return -1;
-    if (strncmp(header, Y4M_MAGIC, strlen(Y4M_MAGIC)))
-        return -1;
+    if (i == MAX_YUV4_HEADER) {
+        av_log(s, AV_LOG_ERROR, "Header too large.\n");
+        return AVERROR(EINVAL);
+    }
+    if (strncmp(header, Y4M_MAGIC, strlen(Y4M_MAGIC))) {
+        av_log(s, AV_LOG_ERROR, "Invalid magic number for yuv4mpeg.\n");
+        return AVERROR(EINVAL);
+    }
 
     header_end = &header[i + 1]; // Include space
     for (tokstart = &header[strlen(Y4M_MAGIC) + 1];
@@ -70,70 +80,60 @@ static int yuv4_read_header(AVFormatContext *s)
             tokstart = tokend;
             break;
         case 'C': // Color space
-            if (strncmp("420jpeg", tokstart, 7) == 0) {
-                pix_fmt = AV_PIX_FMT_YUV420P;
-                chroma_sample_location = AVCHROMA_LOC_CENTER;
-            } else if (strncmp("420mpeg2", tokstart, 8) == 0) {
-                pix_fmt = AV_PIX_FMT_YUV420P;
-                chroma_sample_location = AVCHROMA_LOC_LEFT;
-            } else if (strncmp("420paldv", tokstart, 8) == 0) {
-                pix_fmt = AV_PIX_FMT_YUV420P;
-                chroma_sample_location = AVCHROMA_LOC_TOPLEFT;
-            } else if (strncmp("420p16", tokstart, 6) == 0) {
-                pix_fmt = AV_PIX_FMT_YUV420P16;
-            } else if (strncmp("422p16", tokstart, 6) == 0) {
-                pix_fmt = AV_PIX_FMT_YUV422P16;
-            } else if (strncmp("444p16", tokstart, 6) == 0) {
-                pix_fmt = AV_PIX_FMT_YUV444P16;
-            } else if (strncmp("420p14", tokstart, 6) == 0) {
-                pix_fmt = AV_PIX_FMT_YUV420P14;
-            } else if (strncmp("422p14", tokstart, 6) == 0) {
-                pix_fmt = AV_PIX_FMT_YUV422P14;
-            } else if (strncmp("444p14", tokstart, 6) == 0) {
-                pix_fmt = AV_PIX_FMT_YUV444P14;
-            } else if (strncmp("420p12", tokstart, 6) == 0) {
-                pix_fmt = AV_PIX_FMT_YUV420P12;
-            } else if (strncmp("422p12", tokstart, 6) == 0) {
-                pix_fmt = AV_PIX_FMT_YUV422P12;
-            } else if (strncmp("444p12", tokstart, 6) == 0) {
-                pix_fmt = AV_PIX_FMT_YUV444P12;
-            } else if (strncmp("420p10", tokstart, 6) == 0) {
-                pix_fmt = AV_PIX_FMT_YUV420P10;
-            } else if (strncmp("422p10", tokstart, 6) == 0) {
-                pix_fmt = AV_PIX_FMT_YUV422P10;
-            } else if (strncmp("444p10", tokstart, 6) == 0) {
-                pix_fmt = AV_PIX_FMT_YUV444P10;
-            } else if (strncmp("420p9", tokstart, 5) == 0) {
-                pix_fmt = AV_PIX_FMT_YUV420P9;
-            } else if (strncmp("422p9", tokstart, 5) == 0) {
-                pix_fmt = AV_PIX_FMT_YUV422P9;
-            } else if (strncmp("444p9", tokstart, 5) == 0) {
-                pix_fmt = AV_PIX_FMT_YUV444P9;
-            } else if (strncmp("420", tokstart, 3) == 0) {
-                pix_fmt = AV_PIX_FMT_YUV420P;
-                chroma_sample_location = AVCHROMA_LOC_CENTER;
-            } else if (strncmp("411", tokstart, 3) == 0) {
-                pix_fmt = AV_PIX_FMT_YUV411P;
-            } else if (strncmp("422", tokstart, 3) == 0) {
-                pix_fmt = AV_PIX_FMT_YUV422P;
-            } else if (strncmp("444alpha", tokstart, 8) == 0 ) {
-                av_log(s, AV_LOG_ERROR, "Cannot handle 4:4:4:4 "
-                       "YUV4MPEG stream.\n");
-                return -1;
-            } else if (strncmp("444", tokstart, 3) == 0) {
-                pix_fmt = AV_PIX_FMT_YUV444P;
-            } else if (strncmp("mono16", tokstart, 6) == 0) {
-                pix_fmt = AV_PIX_FMT_GRAY16;
-            } else if (strncmp("mono", tokstart, 4) == 0) {
-                pix_fmt = AV_PIX_FMT_GRAY8;
-            } else {
+        {
+            static const struct {
+#define MAX_PIX_FMT_LENGTH 8
+                char name[MAX_PIX_FMT_LENGTH + 1];
+#undef MAX_PIX_FMT_LENGTH
+                enum AVPixelFormat pix_fmt;
+                enum AVChromaLocation chroma_loc;
+            } pix_fmt_array[] = {
+                { "420jpeg",  AV_PIX_FMT_YUV420P,   AVCHROMA_LOC_CENTER      },
+                { "420mpeg2", AV_PIX_FMT_YUV420P,   AVCHROMA_LOC_LEFT        },
+                { "420paldv", AV_PIX_FMT_YUV420P,   AVCHROMA_LOC_TOPLEFT     },
+                { "420p16",   AV_PIX_FMT_YUV420P16, AVCHROMA_LOC_UNSPECIFIED },
+                { "422p16",   AV_PIX_FMT_YUV422P16, AVCHROMA_LOC_UNSPECIFIED },
+                { "444p16",   AV_PIX_FMT_YUV444P16, AVCHROMA_LOC_UNSPECIFIED },
+                { "420p14",   AV_PIX_FMT_YUV420P14, AVCHROMA_LOC_UNSPECIFIED },
+                { "422p14",   AV_PIX_FMT_YUV422P14, AVCHROMA_LOC_UNSPECIFIED },
+                { "444p14",   AV_PIX_FMT_YUV444P14, AVCHROMA_LOC_UNSPECIFIED },
+                { "420p12",   AV_PIX_FMT_YUV420P12, AVCHROMA_LOC_UNSPECIFIED },
+                { "422p12",   AV_PIX_FMT_YUV422P12, AVCHROMA_LOC_UNSPECIFIED },
+                { "444p12",   AV_PIX_FMT_YUV444P12, AVCHROMA_LOC_UNSPECIFIED },
+                { "420p10",   AV_PIX_FMT_YUV420P10, AVCHROMA_LOC_UNSPECIFIED },
+                { "422p10",   AV_PIX_FMT_YUV422P10, AVCHROMA_LOC_UNSPECIFIED },
+                { "444p10",   AV_PIX_FMT_YUV444P10, AVCHROMA_LOC_UNSPECIFIED },
+                { "420p9",    AV_PIX_FMT_YUV420P9,  AVCHROMA_LOC_UNSPECIFIED },
+                { "422p9",    AV_PIX_FMT_YUV422P9,  AVCHROMA_LOC_UNSPECIFIED },
+                { "444p9",    AV_PIX_FMT_YUV444P9,  AVCHROMA_LOC_UNSPECIFIED },
+                { "420",      AV_PIX_FMT_YUV420P,   AVCHROMA_LOC_CENTER      },
+                { "411",      AV_PIX_FMT_YUV411P,   AVCHROMA_LOC_UNSPECIFIED },
+                { "422",      AV_PIX_FMT_YUV422P,   AVCHROMA_LOC_UNSPECIFIED },
+                { "444alpha", AV_PIX_FMT_YUVA444P,  AVCHROMA_LOC_UNSPECIFIED },
+                { "444",      AV_PIX_FMT_YUV444P,   AVCHROMA_LOC_UNSPECIFIED },
+                { "mono16",   AV_PIX_FMT_GRAY16,    AVCHROMA_LOC_UNSPECIFIED },
+                { "mono12",   AV_PIX_FMT_GRAY12,    AVCHROMA_LOC_UNSPECIFIED },
+                { "mono10",   AV_PIX_FMT_GRAY10,    AVCHROMA_LOC_UNSPECIFIED },
+                { "mono9",    AV_PIX_FMT_GRAY9,     AVCHROMA_LOC_UNSPECIFIED },
+                { "mono",     AV_PIX_FMT_GRAY8,     AVCHROMA_LOC_UNSPECIFIED },
+            };
+            for (i = 0; i < FF_ARRAY_ELEMS(pix_fmt_array); i++) {
+                if (av_strstart(tokstart, pix_fmt_array[i].name, NULL)) {
+                    pix_fmt = pix_fmt_array[i].pix_fmt;
+                    if (pix_fmt_array[i].chroma_loc != AVCHROMA_LOC_UNSPECIFIED)
+                        chroma_sample_location = pix_fmt_array[i].chroma_loc;
+                    break;
+                }
+            }
+            if (i == FF_ARRAY_ELEMS(pix_fmt_array)) {
                 av_log(s, AV_LOG_ERROR, "YUV4MPEG stream contains an unknown "
                        "pixel format.\n");
-                return -1;
+                return AVERROR_INVALIDDATA;
             }
             while (tokstart < header_end && *tokstart != 0x20)
                 tokstart++;
             break;
+        }
         case 'I': // Interlace type
             switch (*tokstart++){
             case '?':
@@ -168,50 +168,46 @@ static int yuv4_read_header(AVFormatContext *s)
             break;
         case 'X': // Vendor extensions
             if (strncmp("YSCSS=", tokstart, 6) == 0) {
+                static const struct {
+#define MAX_PIX_FMT_LENGTH 8
+                    char name[MAX_PIX_FMT_LENGTH + 1];
+#undef MAX_PIX_FMT_LENGTH
+                    enum AVPixelFormat pix_fmt;
+                } pix_fmt_array[] = {
+                    { "420JPEG",  AV_PIX_FMT_YUV420P   },
+                    { "420MPEG2", AV_PIX_FMT_YUV420P   },
+                    { "420PALDV", AV_PIX_FMT_YUV420P   },
+                    { "420P9",    AV_PIX_FMT_YUV420P9  },
+                    { "422P9",    AV_PIX_FMT_YUV422P9  },
+                    { "444P9",    AV_PIX_FMT_YUV444P9  },
+                    { "420P10",   AV_PIX_FMT_YUV420P10 },
+                    { "444P10",   AV_PIX_FMT_YUV444P10 },
+                    { "420P12",   AV_PIX_FMT_YUV420P12 },
+                    { "422P12",   AV_PIX_FMT_YUV422P12 },
+                    { "444P12",   AV_PIX_FMT_YUV444P12 },
+                    { "420P14",   AV_PIX_FMT_YUV420P14 },
+                    { "422P14",   AV_PIX_FMT_YUV422P14 },
+                    { "444P14",   AV_PIX_FMT_YUV444P14 },
+                    { "420P16",   AV_PIX_FMT_YUV420P16 },
+                    { "422P16",   AV_PIX_FMT_YUV422P16 },
+                    { "444P16",   AV_PIX_FMT_YUV444P16 },
+                    { "411",      AV_PIX_FMT_YUV411P   },
+                    { "422",      AV_PIX_FMT_YUV422P   },
+                    { "444",      AV_PIX_FMT_YUV444P   },
+                };
                 // Older nonstandard pixel format representation
                 tokstart += 6;
-                if (strncmp("420JPEG", tokstart, 7) == 0)
-                    alt_pix_fmt = AV_PIX_FMT_YUV420P;
-                else if (strncmp("420MPEG2", tokstart, 8) == 0)
-                    alt_pix_fmt = AV_PIX_FMT_YUV420P;
-                else if (strncmp("420PALDV", tokstart, 8) == 0)
-                    alt_pix_fmt = AV_PIX_FMT_YUV420P;
-                else if (strncmp("420P9", tokstart, 5) == 0)
-                    alt_pix_fmt = AV_PIX_FMT_YUV420P9;
-                else if (strncmp("422P9", tokstart, 5) == 0)
-                    alt_pix_fmt = AV_PIX_FMT_YUV422P9;
-                else if (strncmp("444P9", tokstart, 5) == 0)
-                    alt_pix_fmt = AV_PIX_FMT_YUV444P9;
-                else if (strncmp("420P10", tokstart, 6) == 0)
-                    alt_pix_fmt = AV_PIX_FMT_YUV420P10;
-                else if (strncmp("422P10", tokstart, 6) == 0)
-                    alt_pix_fmt = AV_PIX_FMT_YUV422P10;
-                else if (strncmp("444P10", tokstart, 6) == 0)
-                    alt_pix_fmt = AV_PIX_FMT_YUV444P10;
-                else if (strncmp("420P12", tokstart, 6) == 0)
-                    alt_pix_fmt = AV_PIX_FMT_YUV420P12;
-                else if (strncmp("422P12", tokstart, 6) == 0)
-                    alt_pix_fmt = AV_PIX_FMT_YUV422P12;
-                else if (strncmp("444P12", tokstart, 6) == 0)
-                    alt_pix_fmt = AV_PIX_FMT_YUV444P12;
-                else if (strncmp("420P14", tokstart, 6) == 0)
-                    alt_pix_fmt = AV_PIX_FMT_YUV420P14;
-                else if (strncmp("422P14", tokstart, 6) == 0)
-                    alt_pix_fmt = AV_PIX_FMT_YUV422P14;
-                else if (strncmp("444P14", tokstart, 6) == 0)
-                    alt_pix_fmt = AV_PIX_FMT_YUV444P14;
-                else if (strncmp("420P16", tokstart, 6) == 0)
-                    alt_pix_fmt = AV_PIX_FMT_YUV420P16;
-                else if (strncmp("422P16", tokstart, 6) == 0)
-                    alt_pix_fmt = AV_PIX_FMT_YUV422P16;
-                else if (strncmp("444P16", tokstart, 6) == 0)
-                    alt_pix_fmt = AV_PIX_FMT_YUV444P16;
-                else if (strncmp("411", tokstart, 3) == 0)
-                    alt_pix_fmt = AV_PIX_FMT_YUV411P;
-                else if (strncmp("422", tokstart, 3) == 0)
-                    alt_pix_fmt = AV_PIX_FMT_YUV422P;
-                else if (strncmp("444", tokstart, 3) == 0)
-                    alt_pix_fmt = AV_PIX_FMT_YUV444P;
+                for (size_t i = 0; i < FF_ARRAY_ELEMS(pix_fmt_array); i++)
+                    if (av_strstart(tokstart, pix_fmt_array[i].name, NULL)) {
+                        alt_pix_fmt = pix_fmt_array[i].pix_fmt;
+                        break;
+                    }
+            } else if (strncmp("COLORRANGE=", tokstart, 11) == 0) {
+              tokstart += 11;
+              if (strncmp("FULL",tokstart, 4) == 0)
+                  color_range = AVCOL_RANGE_JPEG;
+              else if (strncmp("LIMITED", tokstart, 7) == 0)
+                  color_range = AVCOL_RANGE_MPEG;
             }
             while (tokstart < header_end && *tokstart != 0x20)
                 tokstart++;
@@ -221,7 +217,7 @@ static int yuv4_read_header(AVFormatContext *s)
 
     if (width == -1 || height == -1) {
         av_log(s, AV_LOG_ERROR, "YUV4MPEG has invalid header.\n");
-        return -1;
+        return AVERROR_INVALIDDATA;
     }
 
     if (pix_fmt == AV_PIX_FMT_NONE) {
@@ -245,17 +241,24 @@ static int yuv4_read_header(AVFormatContext *s)
     st = avformat_new_stream(s, NULL);
     if (!st)
         return AVERROR(ENOMEM);
-    st->codec->width  = width;
-    st->codec->height = height;
+    st->codecpar->width  = width;
+    st->codecpar->height = height;
     av_reduce(&raten, &rated, raten, rated, (1UL << 31) - 1);
     avpriv_set_pts_info(st, 64, rated, raten);
     st->avg_frame_rate                = av_inv_q(st->time_base);
-    st->codec->pix_fmt                = pix_fmt;
-    st->codec->codec_type             = AVMEDIA_TYPE_VIDEO;
-    st->codec->codec_id               = AV_CODEC_ID_RAWVIDEO;
+    st->codecpar->format              = pix_fmt;
+    st->codecpar->codec_type          = AVMEDIA_TYPE_VIDEO;
+    st->codecpar->codec_id            = AV_CODEC_ID_RAWVIDEO;
     st->sample_aspect_ratio           = (AVRational){ aspectn, aspectd };
-    st->codec->chroma_sample_location = chroma_sample_location;
-    st->codec->field_order            = field_order;
+    st->codecpar->chroma_location     = chroma_sample_location;
+    st->codecpar->color_range         = color_range;
+    st->codecpar->field_order         = field_order;
+    s->packet_size = av_image_get_buffer_size(st->codecpar->format, width, height, 1) + Y4M_FRAME_MAGIC_LEN;
+    if ((int) s->packet_size < 0)
+        return s->packet_size;
+    ffformatcontext(s)->data_offset = data_offset = avio_tell(pb);
+
+    st->duration = (avio_size(pb) - data_offset) / s->packet_size;
 
     return 0;
 }
@@ -264,8 +267,8 @@ static int yuv4_read_packet(AVFormatContext *s, AVPacket *pkt)
 {
     int i;
     char header[MAX_FRAME_HEADER+1];
-    int packet_size, width, height, ret;
-    AVStream *st = s->streams[0];
+    int ret;
+    int64_t off = avio_tell(s->pb);
 
     for (i = 0; i < MAX_FRAME_HEADER; i++) {
         header[i] = avio_r8(s->pb);
@@ -284,24 +287,35 @@ static int yuv4_read_packet(AVFormatContext *s, AVPacket *pkt)
     if (strncmp(header, Y4M_FRAME_MAGIC, strlen(Y4M_FRAME_MAGIC)))
         return AVERROR_INVALIDDATA;
 
-    width  = st->codec->width;
-    height = st->codec->height;
-
-    packet_size = avpicture_get_size(st->codec->pix_fmt, width, height);
-    if (packet_size < 0)
-        return packet_size;
-
-    ret = av_get_packet(s->pb, pkt, packet_size);
+    ret = av_get_packet(s->pb, pkt, s->packet_size - Y4M_FRAME_MAGIC_LEN);
     if (ret < 0)
         return ret;
-    else if (ret != packet_size)
+    else if (ret != s->packet_size - Y4M_FRAME_MAGIC_LEN) {
         return s->pb->eof_reached ? AVERROR_EOF : AVERROR(EIO);
-
+    }
     pkt->stream_index = 0;
+    pkt->pts = (off - ffformatcontext(s)->data_offset) / s->packet_size;
+    pkt->duration = 1;
     return 0;
 }
 
-static int yuv4_probe(AVProbeData *pd)
+static int yuv4_read_seek(AVFormatContext *s, int stream_index,
+                          int64_t pts, int flags)
+{
+    int64_t pos;
+
+    if (flags & AVSEEK_FLAG_BACKWARD)
+        pts = FFMAX(0, pts - 1);
+    if (pts < 0)
+        return -1;
+    pos = pts * s->packet_size;
+
+    if (avio_seek(s->pb, pos + ffformatcontext(s)->data_offset, SEEK_SET) < 0)
+        return -1;
+    return 0;
+}
+
+static int yuv4_probe(const AVProbeData *pd)
 {
     /* check file header */
     if (strncmp(pd->buf, Y4M_MAGIC, sizeof(Y4M_MAGIC) - 1) == 0)
@@ -310,11 +324,12 @@ static int yuv4_probe(AVProbeData *pd)
         return 0;
 }
 
-AVInputFormat ff_yuv4mpegpipe_demuxer = {
-    .name           = "yuv4mpegpipe",
-    .long_name      = NULL_IF_CONFIG_SMALL("YUV4MPEG pipe"),
+const FFInputFormat ff_yuv4mpegpipe_demuxer = {
+    .p.name         = "yuv4mpegpipe",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("YUV4MPEG pipe"),
+    .p.extensions   = "y4m",
     .read_probe     = yuv4_probe,
     .read_header    = yuv4_read_header,
     .read_packet    = yuv4_read_packet,
-    .extensions     = "y4m",
+    .read_seek      = yuv4_read_seek,
 };

@@ -26,18 +26,19 @@
 /* #define DEBUG */
 
 #include "libavutil/file.h"
+#include "libavutil/internal.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/lfg.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
-#include "libavutil/parseutils.h"
 #include "libavutil/random_seed.h"
 #include "libavutil/avstring.h"
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
 #include "formats.h"
 #include "video.h"
 
-typedef struct {
+typedef struct LifeContext {
     const AVClass *class;
     int w, h;
     char *filename;
@@ -62,7 +63,7 @@ typedef struct {
     uint64_t pts;
     AVRational frame_rate;
     double   random_fill_ratio;
-    uint32_t random_seed;
+    int64_t random_seed;
     int stitch;
     int mold;
     uint8_t  life_color[4];
@@ -81,18 +82,18 @@ static const AVOption life_options[] = {
     { "f",        "set source file",  OFFSET(filename), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS },
     { "size",     "set video size",   OFFSET(w),        AV_OPT_TYPE_IMAGE_SIZE, {.str = NULL}, 0, 0, FLAGS },
     { "s",        "set video size",   OFFSET(w),        AV_OPT_TYPE_IMAGE_SIZE, {.str = NULL}, 0, 0, FLAGS },
-    { "rate",     "set video rate",   OFFSET(frame_rate), AV_OPT_TYPE_VIDEO_RATE, {.str = "25"}, 0, 0, FLAGS },
-    { "r",        "set video rate",   OFFSET(frame_rate), AV_OPT_TYPE_VIDEO_RATE, {.str = "25"}, 0, 0, FLAGS },
-    { "rule",     "set rule",         OFFSET(rule_str), AV_OPT_TYPE_STRING, {.str = "B3/S23"}, CHAR_MIN, CHAR_MAX, FLAGS },
+    { "rate",     "set video rate",   OFFSET(frame_rate), AV_OPT_TYPE_VIDEO_RATE, {.str = "25"}, 0, INT_MAX, FLAGS },
+    { "r",        "set video rate",   OFFSET(frame_rate), AV_OPT_TYPE_VIDEO_RATE, {.str = "25"}, 0, INT_MAX, FLAGS },
+    { "rule",     "set rule",         OFFSET(rule_str), AV_OPT_TYPE_STRING, {.str = "B3/S23"}, 0, 0, FLAGS },
     { "random_fill_ratio", "set fill ratio for filling initial grid randomly", OFFSET(random_fill_ratio), AV_OPT_TYPE_DOUBLE, {.dbl=1/M_PHI}, 0, 1, FLAGS },
     { "ratio",             "set fill ratio for filling initial grid randomly", OFFSET(random_fill_ratio), AV_OPT_TYPE_DOUBLE, {.dbl=1/M_PHI}, 0, 1, FLAGS },
-    { "random_seed", "set the seed for filling the initial grid randomly", OFFSET(random_seed), AV_OPT_TYPE_INT, {.i64=-1}, -1, UINT32_MAX, FLAGS },
-    { "seed",        "set the seed for filling the initial grid randomly", OFFSET(random_seed), AV_OPT_TYPE_INT, {.i64=-1}, -1, UINT32_MAX, FLAGS },
-    { "stitch",      "stitch boundaries", OFFSET(stitch), AV_OPT_TYPE_INT, {.i64=1}, 0, 1, FLAGS },
+    { "random_seed", "set the seed for filling the initial grid randomly", OFFSET(random_seed), AV_OPT_TYPE_INT64, {.i64=-1}, -1, UINT32_MAX, FLAGS },
+    { "seed",        "set the seed for filling the initial grid randomly", OFFSET(random_seed), AV_OPT_TYPE_INT64, {.i64=-1}, -1, UINT32_MAX, FLAGS },
+    { "stitch",      "stitch boundaries", OFFSET(stitch), AV_OPT_TYPE_BOOL, {.i64=1}, 0, 1, FLAGS },
     { "mold",        "set mold speed for dead cells", OFFSET(mold), AV_OPT_TYPE_INT, {.i64=0}, 0, 0xFF, FLAGS },
-    { "life_color",  "set life color",  OFFSET( life_color), AV_OPT_TYPE_COLOR, {.str="white"}, CHAR_MIN, CHAR_MAX, FLAGS },
-    { "death_color", "set death color", OFFSET(death_color), AV_OPT_TYPE_COLOR, {.str="black"}, CHAR_MIN, CHAR_MAX, FLAGS },
-    { "mold_color",  "set mold color",  OFFSET( mold_color), AV_OPT_TYPE_COLOR, {.str="black"}, CHAR_MIN, CHAR_MAX, FLAGS },
+    { "life_color",  "set life color",  OFFSET( life_color), AV_OPT_TYPE_COLOR, {.str="white"}, 0, 0, FLAGS },
+    { "death_color", "set death color", OFFSET(death_color), AV_OPT_TYPE_COLOR, {.str="black"}, 0, 0, FLAGS },
+    { "mold_color",  "set mold color",  OFFSET( mold_color), AV_OPT_TYPE_COLOR, {.str="black"}, 0, 0, FLAGS },
     { NULL }
 };
 
@@ -158,6 +159,58 @@ static void show_life_grid(AVFilterContext *ctx)
     av_free(line);
 }
 #endif
+
+static void fill_picture_monoblack(AVFilterContext *ctx, AVFrame *picref)
+{
+    LifeContext *life = ctx->priv;
+    uint8_t *buf = life->buf[life->buf_idx];
+    int i, j, k;
+
+    /* fill the output picture with the old grid buffer */
+    for (i = 0; i < life->h; i++) {
+        uint8_t byte = 0;
+        uint8_t *p = picref->data[0] + i * picref->linesize[0];
+        for (k = 0, j = 0; j < life->w; j++) {
+            byte |= (buf[i*life->w+j] == ALIVE_CELL)<<(7-k++);
+            if (k==8 || j == life->w-1) {
+                k = 0;
+                *p++ = byte;
+                byte = 0;
+            }
+        }
+    }
+}
+
+// divide by 255 and round to nearest
+// apply a fast variant: (X+127)/255 = ((X+127)*257+257)>>16 = ((X+128)*257)>>16
+#define FAST_DIV255(x) ((((x) + 128) * 257) >> 16)
+
+static void fill_picture_rgb(AVFilterContext *ctx, AVFrame *picref)
+{
+    LifeContext *life = ctx->priv;
+    uint8_t *buf = life->buf[life->buf_idx];
+    int i, j;
+
+    /* fill the output picture with the old grid buffer */
+    for (i = 0; i < life->h; i++) {
+        uint8_t *p = picref->data[0] + i * picref->linesize[0];
+        for (j = 0; j < life->w; j++) {
+            uint8_t v = buf[i*life->w + j];
+            if (life->mold && v != ALIVE_CELL) {
+                const uint8_t *c1 = life-> mold_color;
+                const uint8_t *c2 = life->death_color;
+                int death_age = FFMIN((0xff - v) * life->mold, 0xff);
+                *p++ = FAST_DIV255((c2[0] << 8) + ((int)c1[0] - (int)c2[0]) * death_age);
+                *p++ = FAST_DIV255((c2[1] << 8) + ((int)c1[1] - (int)c2[1]) * death_age);
+                *p++ = FAST_DIV255((c2[2] << 8) + ((int)c1[2] - (int)c2[2]) * death_age);
+            } else {
+                const uint8_t *c = v == ALIVE_CELL ? life->life_color : life->death_color;
+                AV_WB24(p, c[0]<<16 | c[1]<<8 | c[2]);
+                p += 3;
+            }
+        }
+    }
+}
 
 static int init_pattern_from_file(AVFilterContext *ctx)
 {
@@ -258,8 +311,15 @@ static av_cold int init(AVFilterContext *ctx)
             return ret;
     }
 
+    if (life->mold || memcmp(life-> life_color, "\xff\xff\xff", 3)
+                   || memcmp(life->death_color, "\x00\x00\x00", 3)) {
+        life->draw = fill_picture_rgb;
+    } else {
+        life->draw = fill_picture_monoblack;
+    }
+
     av_log(ctx, AV_LOG_VERBOSE,
-           "s:%dx%d r:%d/%d rule:%s stay_rule:%d born_rule:%d stitch:%d seed:%u\n",
+           "s:%dx%d r:%d/%d rule:%s stay_rule:%d born_rule:%d stitch:%d seed:%"PRId64"\n",
            life->w, life->h, life->frame_rate.num, life->frame_rate.den,
            life->rule_str, life->stay_rule, life->born_rule, life->stitch,
            life->random_seed);
@@ -279,10 +339,12 @@ static av_cold void uninit(AVFilterContext *ctx)
 static int config_props(AVFilterLink *outlink)
 {
     LifeContext *life = outlink->src->priv;
+    FilterLink *l = ff_filter_link(outlink);
 
     outlink->w = life->w;
     outlink->h = life->h;
     outlink->time_base = av_inv_q(life->frame_rate);
+    l->frame_rate = life->frame_rate;
 
     return 0;
 }
@@ -334,64 +396,12 @@ static void evolve(AVFilterContext *ctx)
             if (alive)     *newbuf = ALIVE_CELL; // new cell is alive
             else if (cell) *newbuf = cell - 1;   // new cell is dead and in the process of mold
             else           *newbuf = 0;          // new cell is definitely dead
-            av_dlog(ctx, "i:%d j:%d live_neighbors:%d cell:%d -> cell:%d\n", i, j, n, cell, *newbuf);
+            ff_dlog(ctx, "i:%d j:%d live_neighbors:%d cell:%d -> cell:%d\n", i, j, n, cell, *newbuf);
             newbuf++;
         }
     }
 
     life->buf_idx = !life->buf_idx;
-}
-
-static void fill_picture_monoblack(AVFilterContext *ctx, AVFrame *picref)
-{
-    LifeContext *life = ctx->priv;
-    uint8_t *buf = life->buf[life->buf_idx];
-    int i, j, k;
-
-    /* fill the output picture with the old grid buffer */
-    for (i = 0; i < life->h; i++) {
-        uint8_t byte = 0;
-        uint8_t *p = picref->data[0] + i * picref->linesize[0];
-        for (k = 0, j = 0; j < life->w; j++) {
-            byte |= (buf[i*life->w+j] == ALIVE_CELL)<<(7-k++);
-            if (k==8 || j == life->w-1) {
-                k = 0;
-                *p++ = byte;
-                byte = 0;
-            }
-        }
-    }
-}
-
-// divide by 255 and round to nearest
-// apply a fast variant: (X+127)/255 = ((X+127)*257+257)>>16 = ((X+128)*257)>>16
-#define FAST_DIV255(x) ((((x) + 128) * 257) >> 16)
-
-static void fill_picture_rgb(AVFilterContext *ctx, AVFrame *picref)
-{
-    LifeContext *life = ctx->priv;
-    uint8_t *buf = life->buf[life->buf_idx];
-    int i, j;
-
-    /* fill the output picture with the old grid buffer */
-    for (i = 0; i < life->h; i++) {
-        uint8_t *p = picref->data[0] + i * picref->linesize[0];
-        for (j = 0; j < life->w; j++) {
-            uint8_t v = buf[i*life->w + j];
-            if (life->mold && v != ALIVE_CELL) {
-                const uint8_t *c1 = life-> mold_color;
-                const uint8_t *c2 = life->death_color;
-                int death_age = FFMIN((0xff - v) * life->mold, 0xff);
-                *p++ = FAST_DIV255((c2[0] << 8) + ((int)c1[0] - (int)c2[0]) * death_age);
-                *p++ = FAST_DIV255((c2[1] << 8) + ((int)c1[1] - (int)c2[1]) * death_age);
-                *p++ = FAST_DIV255((c2[2] << 8) + ((int)c1[2] - (int)c2[2]) * death_age);
-            } else {
-                const uint8_t *c = v == ALIVE_CELL ? life->life_color : life->death_color;
-                AV_WB24(p, c[0]<<16 | c[1]<<8 | c[2]);
-                p += 3;
-            }
-        }
-    }
 }
 
 static int request_frame(AVFilterLink *outlink)
@@ -402,6 +412,7 @@ static int request_frame(AVFilterLink *outlink)
         return AVERROR(ENOMEM);
     picref->sample_aspect_ratio = (AVRational) {1, 1};
     picref->pts = life->pts++;
+    picref->duration = 1;
 
     life->draw(outlink->src, picref);
     evolve(outlink->src);
@@ -411,26 +422,17 @@ static int request_frame(AVFilterLink *outlink)
     return ff_filter_frame(outlink, picref);
 }
 
-static int query_formats(AVFilterContext *ctx)
+static int query_formats(const AVFilterContext *ctx,
+                         AVFilterFormatsConfig **cfg_in,
+                         AVFilterFormatsConfig **cfg_out)
 {
-    LifeContext *life = ctx->priv;
-    enum AVPixelFormat pix_fmts[] = { AV_PIX_FMT_NONE, AV_PIX_FMT_NONE };
-    AVFilterFormats *fmts_list;
+    const LifeContext *life = ctx->priv;
+    const enum AVPixelFormat pix_fmts[] = {
+        life->draw == fill_picture_rgb ? AV_PIX_FMT_RGB24 : AV_PIX_FMT_MONOBLACK,
+        AV_PIX_FMT_NONE
+    };
 
-    if (life->mold || memcmp(life-> life_color, "\xff\xff\xff", 3)
-                   || memcmp(life->death_color, "\x00\x00\x00", 3)) {
-        pix_fmts[0] = AV_PIX_FMT_RGB24;
-        life->draw = fill_picture_rgb;
-    } else {
-        pix_fmts[0] = AV_PIX_FMT_MONOBLACK;
-        life->draw = fill_picture_monoblack;
-    }
-
-    fmts_list = ff_make_format_list(pix_fmts);
-    if (!fmts_list)
-        return AVERROR(ENOMEM);
-    ff_set_common_formats(ctx, fmts_list);
-    return 0;
+    return ff_set_common_formats_from_list2(ctx, cfg_in, cfg_out, pix_fmts);
 }
 
 static const AVFilterPad life_outputs[] = {
@@ -440,17 +442,16 @@ static const AVFilterPad life_outputs[] = {
         .request_frame = request_frame,
         .config_props  = config_props,
     },
-    { NULL}
 };
 
-AVFilter ff_vsrc_life = {
-    .name          = "life",
-    .description   = NULL_IF_CONFIG_SMALL("Create life."),
+const FFFilter ff_vsrc_life = {
+    .p.name        = "life",
+    .p.description = NULL_IF_CONFIG_SMALL("Create life."),
+    .p.priv_class  = &life_class,
+    .p.inputs      = NULL,
     .priv_size     = sizeof(LifeContext),
-    .priv_class    = &life_class,
     .init          = init,
     .uninit        = uninit,
-    .query_formats = query_formats,
-    .inputs        = NULL,
-    .outputs       = life_outputs,
+    FILTER_OUTPUTS(life_outputs),
+    FILTER_QUERY_FUNC2(query_formats),
 };

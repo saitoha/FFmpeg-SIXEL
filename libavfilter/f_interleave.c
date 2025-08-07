@@ -23,21 +23,27 @@
  * audio and video interleaver
  */
 
+#include "config_components.h"
+
 #include "libavutil/avassert.h"
 #include "libavutil/avstring.h"
 #include "libavutil/opt.h"
+
 #include "avfilter.h"
-#include "bufferqueue.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
 #include "audio.h"
 #include "video.h"
 
-typedef struct {
+typedef struct InterleaveContext {
     const AVClass *class;
     int nb_inputs;
-    struct FFBufQueue *queues;
+    int duration_mode;
+    int64_t pts;
 } InterleaveContext;
+
+#define DURATION_LONGEST  0
+#define DURATION_SHORTEST 1
+#define DURATION_FIRST    2
 
 #define OFFSET(x) offsetof(InterleaveContext, x)
 
@@ -45,72 +51,111 @@ typedef struct {
 static const AVOption filt_name##_options[] = {                     \
    { "nb_inputs", "set number of inputs", OFFSET(nb_inputs), AV_OPT_TYPE_INT, {.i64 = 2}, 1, INT_MAX, .flags = flags_ }, \
    { "n",         "set number of inputs", OFFSET(nb_inputs), AV_OPT_TYPE_INT, {.i64 = 2}, 1, INT_MAX, .flags = flags_ }, \
+   { "duration", "how to determine the end-of-stream",              \
+       OFFSET(duration_mode), AV_OPT_TYPE_INT, { .i64 = DURATION_LONGEST }, 0,  2, flags_, .unit = "duration" }, \
+       { "longest",  "Duration of longest input",  0, AV_OPT_TYPE_CONST, { .i64 = DURATION_LONGEST  }, 0, 0, flags_, .unit = "duration" }, \
+       { "shortest", "Duration of shortest input", 0, AV_OPT_TYPE_CONST, { .i64 = DURATION_SHORTEST }, 0, 0, flags_, .unit = "duration" }, \
+       { "first",    "Duration of first input",    0, AV_OPT_TYPE_CONST, { .i64 = DURATION_FIRST    }, 0, 0, flags_, .unit = "duration" }, \
    { NULL }                                                         \
 }
 
-inline static int push_frame(AVFilterContext *ctx)
+static int activate(AVFilterContext *ctx)
 {
+    AVFilterLink *outlink = ctx->outputs[0];
     InterleaveContext *s = ctx->priv;
-    AVFrame *frame;
-    int i, queue_idx = -1;
-    int64_t pts_min = INT64_MAX;
+    int64_t q_pts, pts = INT64_MAX;
+    int i, nb_eofs = 0, input_idx = -1;
+    int first_eof = 0;
+    int64_t rpts;
+    int status;
+    int nb_inputs_with_frames = 0;
 
-    /* look for oldest frame */
+    FF_FILTER_FORWARD_STATUS_BACK_ALL(outlink, ctx);
+
     for (i = 0; i < ctx->nb_inputs; i++) {
-        struct FFBufQueue *q = &s->queues[i];
+        int is_eof = !!ff_inlink_acknowledge_status(ctx->inputs[i], &status, &rpts);
 
-        if (!q->available && !ctx->inputs[i]->closed)
-            return 0;
-        if (q->available) {
-            frame = ff_bufqueue_peek(q, 0);
-            if (frame->pts < pts_min) {
-                pts_min = frame->pts;
-                queue_idx = i;
+        nb_eofs += is_eof;
+        if (i == 0)
+            first_eof = is_eof;
+    }
+
+    if ((nb_eofs > 0 && s->duration_mode == DURATION_SHORTEST) ||
+        (nb_eofs == ctx->nb_inputs && s->duration_mode == DURATION_LONGEST) ||
+        (first_eof && s->duration_mode == DURATION_FIRST)) {
+        ff_outlink_set_status(outlink, AVERROR_EOF, s->pts);
+        return 0;
+    }
+
+    for (i = 0; i < ctx->nb_inputs; i++) {
+        if (!ff_inlink_queued_frames(ctx->inputs[i]))
+            continue;
+        nb_inputs_with_frames++;
+    }
+
+    if (nb_inputs_with_frames >= ctx->nb_inputs - nb_eofs) {
+        for (i = 0; i < ctx->nb_inputs; i++) {
+            AVFrame *frame;
+
+            if (ff_inlink_queued_frames(ctx->inputs[i]) == 0)
+                continue;
+
+            frame = ff_inlink_peek_frame(ctx->inputs[i], 0);
+            if (frame->pts == AV_NOPTS_VALUE) {
+                int ret;
+
+                av_log(ctx, AV_LOG_WARNING,
+                       "NOPTS value for input frame cannot be accepted, frame discarded\n");
+                ret = ff_inlink_consume_frame(ctx->inputs[i], &frame);
+                if (ret < 0)
+                    return ret;
+                av_frame_free(&frame);
+                return AVERROR_INVALIDDATA;
             }
+
+            q_pts = av_rescale_q(frame->pts, ctx->inputs[i]->time_base, AV_TIME_BASE_Q);
+            if (q_pts < pts) {
+                pts = q_pts;
+                input_idx = i;
+            }
+        }
+
+        if (input_idx >= 0) {
+            AVFrame *frame;
+            int ret;
+
+            ret = ff_inlink_consume_frame(ctx->inputs[input_idx], &frame);
+            if (ret < 0)
+                return ret;
+
+            frame->pts = s->pts = pts;
+            return ff_filter_frame(outlink, frame);
         }
     }
 
-    /* all inputs are closed */
-    if (queue_idx < 0)
-        return AVERROR_EOF;
-
-    frame = ff_bufqueue_get(&s->queues[queue_idx]);
-    av_log(ctx, AV_LOG_DEBUG, "queue:%d -> frame time:%f\n",
-           queue_idx, frame->pts * av_q2d(AV_TIME_BASE_Q));
-    return ff_filter_frame(ctx->outputs[0], frame);
-}
-
-static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
-{
-    AVFilterContext *ctx = inlink->dst;
-    InterleaveContext *s = ctx->priv;
-    unsigned in_no = FF_INLINK_IDX(inlink);
-
-    if (frame->pts == AV_NOPTS_VALUE) {
-        av_log(ctx, AV_LOG_WARNING,
-               "NOPTS value for input frame cannot be accepted, frame discarded\n");
-        av_frame_free(&frame);
-        return AVERROR_INVALIDDATA;
+    for (i = 0; i < ctx->nb_inputs; i++) {
+        if (ff_inlink_queued_frames(ctx->inputs[i]))
+            continue;
+        if (ff_outlink_frame_wanted(outlink) &&
+            !ff_outlink_get_status(ctx->inputs[i])) {
+            ff_inlink_request_frame(ctx->inputs[i]);
+            return 0;
+        }
     }
 
-    /* queue frame */
-    frame->pts = av_rescale_q(frame->pts, inlink->time_base, AV_TIME_BASE_Q);
-    av_log(ctx, AV_LOG_DEBUG, "frame pts:%f -> queue idx:%d available:%d\n",
-           frame->pts * av_q2d(AV_TIME_BASE_Q), in_no, s->queues[in_no].available);
-    ff_bufqueue_add(ctx, &s->queues[in_no], frame);
+    if (i == ctx->nb_inputs - nb_eofs && ff_outlink_frame_wanted(outlink)) {
+        ff_filter_set_ready(ctx, 100);
+        return 0;
+    }
 
-    return push_frame(ctx);
+    return FFERROR_NOT_READY;
 }
 
 static av_cold int init(AVFilterContext *ctx)
 {
     InterleaveContext *s = ctx->priv;
     const AVFilterPad *outpad = &ctx->filter->outputs[0];
-    int i;
-
-    s->queues = av_calloc(s->nb_inputs, sizeof(s->queues[0]));
-    if (!s->queues)
-        return AVERROR(ENOMEM);
+    int i, ret;
 
     for (i = 0; i < s->nb_inputs; i++) {
         AVFilterPad inpad = { 0 };
@@ -119,36 +164,25 @@ static av_cold int init(AVFilterContext *ctx)
         if (!inpad.name)
             return AVERROR(ENOMEM);
         inpad.type         = outpad->type;
-        inpad.filter_frame = filter_frame;
 
         switch (outpad->type) {
         case AVMEDIA_TYPE_VIDEO:
-            inpad.get_video_buffer = ff_null_get_video_buffer; break;
+            inpad.get_buffer.video = ff_null_get_video_buffer; break;
         case AVMEDIA_TYPE_AUDIO:
-            inpad.get_audio_buffer = ff_null_get_audio_buffer; break;
+            inpad.get_buffer.audio = ff_null_get_audio_buffer; break;
         default:
             av_assert0(0);
         }
-        ff_insert_inpad(ctx, i, &inpad);
+        if ((ret = ff_append_inpad_free_name(ctx, &inpad)) < 0)
+            return ret;
     }
 
     return 0;
 }
 
-static av_cold void uninit(AVFilterContext *ctx)
-{
-    InterleaveContext *s = ctx->priv;
-    int i;
-
-    for (i = 0; i < ctx->nb_inputs; i++) {
-        ff_bufqueue_discard_all(&s->queues[i]);
-        av_freep(&s->queues[i]);
-        av_freep(&ctx->input_pads[i].name);
-    }
-}
-
 static int config_output(AVFilterLink *outlink)
 {
+    FilterLink *l = ff_filter_link(outlink);
     AVFilterContext *ctx = outlink->src;
     AVFilterLink *inlink0 = ctx->inputs[0];
     int i;
@@ -159,7 +193,7 @@ static int config_output(AVFilterLink *outlink)
         outlink->h                   = inlink0->h;
         outlink->sample_aspect_ratio = inlink0->sample_aspect_ratio;
         outlink->format              = inlink0->format;
-        outlink->frame_rate = (AVRational) {1, 0};
+        l->frame_rate = (AVRational) {1, 0};
         for (i = 1; i < ctx->nb_inputs; i++) {
             AVFilterLink *inlink = ctx->inputs[i];
 
@@ -180,26 +214,7 @@ static int config_output(AVFilterLink *outlink)
             }
         }
     }
-
-    outlink->flags |= FF_LINK_FLAG_REQUEST_LOOP;
     return 0;
-}
-
-static int request_frame(AVFilterLink *outlink)
-{
-    AVFilterContext *ctx = outlink->src;
-    InterleaveContext *s = ctx->priv;
-    int i, ret;
-
-    for (i = 0; i < ctx->nb_inputs; i++) {
-        if (!s->queues[i].available && !ctx->inputs[i]->closed) {
-            ret = ff_request_frame(ctx->inputs[i]);
-            if (ret != AVERROR_EOF)
-                return ret;
-        }
-    }
-
-    return push_frame(ctx);
 }
 
 #if CONFIG_INTERLEAVE_FILTER
@@ -212,20 +227,18 @@ static const AVFilterPad interleave_outputs[] = {
         .name          = "default",
         .type          = AVMEDIA_TYPE_VIDEO,
         .config_props  = config_output,
-        .request_frame = request_frame,
     },
-    { NULL }
 };
 
-AVFilter ff_vf_interleave = {
-    .name        = "interleave",
-    .description = NULL_IF_CONFIG_SMALL("Temporally interleave video inputs."),
+const FFFilter ff_vf_interleave = {
+    .p.name        = "interleave",
+    .p.description = NULL_IF_CONFIG_SMALL("Temporally interleave video inputs."),
+    .p.priv_class  = &interleave_class,
+    .p.flags       = AVFILTER_FLAG_DYNAMIC_INPUTS,
     .priv_size   = sizeof(InterleaveContext),
     .init        = init,
-    .uninit      = uninit,
-    .outputs     = interleave_outputs,
-    .priv_class  = &interleave_class,
-    .flags       = AVFILTER_FLAG_DYNAMIC_INPUTS,
+    .activate    = activate,
+    FILTER_OUTPUTS(interleave_outputs),
 };
 
 #endif
@@ -240,20 +253,18 @@ static const AVFilterPad ainterleave_outputs[] = {
         .name          = "default",
         .type          = AVMEDIA_TYPE_AUDIO,
         .config_props  = config_output,
-        .request_frame = request_frame,
     },
-    { NULL }
 };
 
-AVFilter ff_af_ainterleave = {
-    .name        = "ainterleave",
-    .description = NULL_IF_CONFIG_SMALL("Temporally interleave audio inputs."),
+const FFFilter ff_af_ainterleave = {
+    .p.name        = "ainterleave",
+    .p.description = NULL_IF_CONFIG_SMALL("Temporally interleave audio inputs."),
+    .p.priv_class  = &ainterleave_class,
+    .p.flags       = AVFILTER_FLAG_DYNAMIC_INPUTS,
     .priv_size   = sizeof(InterleaveContext),
     .init        = init,
-    .uninit      = uninit,
-    .outputs     = ainterleave_outputs,
-    .priv_class  = &ainterleave_class,
-    .flags       = AVFILTER_FLAG_DYNAMIC_INPUTS,
+    .activate    = activate,
+    FILTER_OUTPUTS(ainterleave_outputs),
 };
 
 #endif

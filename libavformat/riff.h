@@ -28,7 +28,6 @@
 #ifndef AVFORMAT_RIFF_H
 #define AVFORMAT_RIFF_H
 
-#include "libavcodec/avcodec.h"
 #include "avio.h"
 #include "internal.h"
 #include "metadata.h"
@@ -41,16 +40,22 @@ void ff_end_tag(AVIOContext *pb, int64_t start);
 /**
  * Read BITMAPINFOHEADER structure and set AVStream codec width, height and
  * bits_per_encoded_sample fields. Does not read extradata.
+ * Writes the size of the BMP file to *size.
  * @return codec tag
  */
-int ff_get_bmp_header(AVIOContext *pb, AVStream *st, unsigned *esize);
+int ff_get_bmp_header(AVIOContext *pb, AVStream *st, uint32_t *size);
 
-void ff_put_bmp_header(AVIOContext *pb, AVCodecContext *enc, const AVCodecTag *tags, int for_asf, int ignore_extradata);
+void ff_put_bmp_header(AVIOContext *pb, AVCodecParameters *par, int for_asf, int ignore_extradata, int rgb_frame_is_flipped);
 
 /**
  * Tell ff_put_wav_header() to use WAVEFORMATEX even for PCM codecs.
  */
 #define FF_PUT_WAV_HEADER_FORCE_WAVEFORMATEX    0x00000001
+
+/**
+ * Tell ff_put_wav_header() to write an empty channel mask.
+ */
+#define FF_PUT_WAV_HEADER_SKIP_CHANNELMASK      0x00000002
 
 /**
  * Write WAVEFORMAT header structure.
@@ -59,13 +64,20 @@ void ff_put_bmp_header(AVIOContext *pb, AVCodecContext *enc, const AVCodecTag *t
  *
  * @return the size or -1 on error
  */
-int ff_put_wav_header(AVIOContext *pb, AVCodecContext *enc, int flags);
+int ff_put_wav_header(AVFormatContext *s, AVIOContext *pb, AVCodecParameters *par, int flags);
 
 enum AVCodecID ff_wav_codec_get_id(unsigned int tag, int bps);
-int ff_get_wav_header(AVIOContext *pb, AVCodecContext *codec, int size, int big_endian);
+int ff_get_wav_header(AVFormatContext *s, AVIOContext *pb, AVCodecParameters *par,
+                      int size, int big_endian);
 
 extern const AVCodecTag ff_codec_bmp_tags[]; // exposed through avformat_get_riff_video_tags()
 extern const AVCodecTag ff_codec_wav_tags[];
+/* The following list contains both ff_codec_bmp_tags and ff_codec_wav_tags. */
+extern const AVCodecTag *const ff_riff_codec_tags_list[];
+/* The following list contains only ff_codec_wav_tags. */
+extern const AVCodecTag *const ff_wav_codec_tags_list[];
+
+extern const AVCodecTag ff_codec_bmp_tags_unofficial[];
 
 void ff_parse_specific_params(AVStream *st, int *au_rate, int *au_ssize, int *au_scale);
 
@@ -102,6 +114,10 @@ extern const AVCodecGuid ff_codec_wav_guids[];
 
 #define FF_MEDIASUBTYPE_BASE_GUID \
     0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71
+#define FF_AMBISONIC_BASE_GUID \
+    0x21, 0x07, 0xD3, 0x11, 0x86, 0x44, 0xC8, 0xC1, 0xCA, 0x00, 0x00, 0x00
+#define FF_BROKEN_BASE_GUID \
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA
 
 static av_always_inline int ff_guidcmp(const void *g1, const void *g2)
 {

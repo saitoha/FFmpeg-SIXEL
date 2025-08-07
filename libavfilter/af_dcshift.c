@@ -23,12 +23,12 @@
 #include "libavutil/samplefmt.h"
 #include "avfilter.h"
 #include "audio.h"
-#include "internal.h"
+#include "filters.h"
 
 typedef struct DCShiftContext {
     const AVClass *class;
     double dcshift;
-    double limiterthreshhold;
+    double limiterthreshold;
     double limitergain;
 } DCShiftContext;
 
@@ -47,57 +47,33 @@ static av_cold int init(AVFilterContext *ctx)
 {
     DCShiftContext *s = ctx->priv;
 
-    s->limiterthreshhold = INT32_MAX * (1.0 - (fabs(s->dcshift) - s->limitergain));
+    s->limiterthreshold = INT32_MAX * (1.0 - (fabs(s->dcshift) - s->limitergain));
 
     return 0;
-}
-
-static int query_formats(AVFilterContext *ctx)
-{
-    AVFilterChannelLayouts *layouts;
-    AVFilterFormats *formats;
-    static const enum AVSampleFormat sample_fmts[] = {
-        AV_SAMPLE_FMT_S32P, AV_SAMPLE_FMT_NONE
-    };
-    int ret;
-
-    layouts = ff_all_channel_layouts();
-    if (!layouts)
-        return AVERROR(ENOMEM);
-    ret = ff_set_common_channel_layouts(ctx, layouts);
-    if (ret < 0)
-        return ret;
-
-    formats = ff_make_format_list(sample_fmts);
-    if (!formats)
-        return AVERROR(ENOMEM);
-    ret = ff_set_common_formats(ctx, formats);
-    if (ret < 0)
-        return ret;
-
-    formats = ff_all_samplerates();
-    if (!formats)
-        return AVERROR(ENOMEM);
-    return ff_set_common_samplerates(ctx, formats);
 }
 
 static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 {
     AVFilterContext *ctx = inlink->dst;
     AVFilterLink *outlink = ctx->outputs[0];
-    AVFrame *out = ff_get_audio_buffer(inlink, in->nb_samples);
+    AVFrame *out;
     DCShiftContext *s = ctx->priv;
     int i, j;
     double dcshift = s->dcshift;
 
-    if (!out) {
-        av_frame_free(&in);
-        return AVERROR(ENOMEM);
+    if (av_frame_is_writable(in)) {
+        out = in;
+    } else {
+        out = ff_get_audio_buffer(outlink, in->nb_samples);
+        if (!out) {
+            av_frame_free(&in);
+            return AVERROR(ENOMEM);
+        }
+        av_frame_copy_props(out, in);
     }
-    av_frame_copy_props(out, in);
 
     if (s->limitergain > 0) {
-        for (i = 0; i < inlink->channels; i++) {
+        for (i = 0; i < inlink->ch_layout.nb_channels; i++) {
             const int32_t *src = (int32_t *)in->extended_data[i];
             int32_t *dst = (int32_t *)out->extended_data[i];
 
@@ -106,14 +82,14 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 
                 d = src[j];
 
-                if (d > s->limiterthreshhold && dcshift > 0) {
-                    d = (d - s->limiterthreshhold) * s->limitergain /
-                             (INT32_MAX - s->limiterthreshhold) +
-                             s->limiterthreshhold + dcshift;
-                } else if (d < -s->limiterthreshhold && dcshift < 0) {
-                    d = (d + s->limiterthreshhold) * s->limitergain /
-                             (INT32_MAX - s->limiterthreshhold) -
-                             s->limiterthreshhold + dcshift;
+                if (d > s->limiterthreshold && dcshift > 0) {
+                    d = (d - s->limiterthreshold) * s->limitergain /
+                             (INT32_MAX - s->limiterthreshold) +
+                             s->limiterthreshold + dcshift;
+                } else if (d < -s->limiterthreshold && dcshift < 0) {
+                    d = (d + s->limiterthreshold) * s->limitergain /
+                             (INT32_MAX - s->limiterthreshold) -
+                             s->limiterthreshold + dcshift;
                 } else {
                     d = dcshift * INT32_MAX + d;
                 }
@@ -122,7 +98,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
             }
         }
     } else {
-        for (i = 0; i < inlink->channels; i++) {
+        for (i = 0; i < inlink->ch_layout.nb_channels; i++) {
             const int32_t *src = (int32_t *)in->extended_data[i];
             int32_t *dst = (int32_t *)out->extended_data[i];
 
@@ -134,7 +110,8 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
         }
     }
 
-    av_frame_free(&in);
+    if (out != in)
+        av_frame_free(&in);
     return ff_filter_frame(outlink, out);
 }
 static const AVFilterPad dcshift_inputs[] = {
@@ -143,25 +120,16 @@ static const AVFilterPad dcshift_inputs[] = {
         .type         = AVMEDIA_TYPE_AUDIO,
         .filter_frame = filter_frame,
     },
-    { NULL }
 };
 
-static const AVFilterPad dcshift_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_AUDIO,
-    },
-    { NULL }
-};
-
-AVFilter ff_af_dcshift = {
-    .name           = "dcshift",
-    .description    = NULL_IF_CONFIG_SMALL("Apply a DC shift to the audio."),
-    .query_formats  = query_formats,
+const FFFilter ff_af_dcshift = {
+    .p.name         = "dcshift",
+    .p.description  = NULL_IF_CONFIG_SMALL("Apply a DC shift to the audio."),
+    .p.priv_class   = &dcshift_class,
+    .p.flags        = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
     .priv_size      = sizeof(DCShiftContext),
-    .priv_class     = &dcshift_class,
     .init           = init,
-    .inputs         = dcshift_inputs,
-    .outputs        = dcshift_outputs,
-    .flags          = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
+    FILTER_INPUTS(dcshift_inputs),
+    FILTER_OUTPUTS(ff_audio_default_filterpad),
+    FILTER_SINGLE_SAMPLEFMT(AV_SAMPLE_FMT_S32P),
 };

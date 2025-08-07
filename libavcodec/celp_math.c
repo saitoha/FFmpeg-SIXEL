@@ -20,14 +20,18 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include <inttypes.h>
-#include <limits.h>
+#include <stdint.h>
 
-#include "libavutil/avassert.h"
-#include "avcodec.h"
+#include "config.h"
+
+#include "libavutil/attributes.h"
+#include "libavutil/float_dsp.h"
+#include "libavutil/intmath.h"
 #include "mathops.h"
 #include "celp_math.h"
-#include "libavutil/common.h"
+
+#ifdef G729_BITEXACT
+#include "libavutil/avassert.h"
 
 static const uint16_t exp2a[]=
 {
@@ -54,6 +58,7 @@ int ff_exp2(uint16_t power)
     result= (result<<3) + ((result*exp2b[(power>>5)&31])>>17);
     return result + ((result*(power&31)*89)>>22);
 }
+#endif
 
 /**
  * Table used to compute log2(x)
@@ -106,21 +111,11 @@ int64_t ff_dot_product(const int16_t *a, const int16_t *b, int length)
     return sum;
 }
 
-float ff_dot_productf(const float* a, const float* b, int length)
+av_cold void ff_celp_math_init(CELPMContext *c)
 {
-    float sum = 0;
-    int i;
+    c->dot_productf = ff_scalarproduct_float_c;
 
-    for(i=0; i<length; i++)
-        sum += a[i] * b[i];
-
-    return sum;
-}
-
-void ff_celp_math_init(CELPMContext *c)
-{
-    c->dot_productf   = ff_dot_productf;
-
-    if(HAVE_MIPSFPU)
-        ff_celp_math_init_mips(c);
+#if HAVE_MIPSFPU
+    ff_celp_math_init_mips(c);
+#endif
 }

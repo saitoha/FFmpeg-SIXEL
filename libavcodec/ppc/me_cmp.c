@@ -21,15 +21,12 @@
  */
 
 #include "config.h"
-#if HAVE_ALTIVEC_H
-#include <altivec.h>
-#endif
 
 #include "libavutil/attributes.h"
 #include "libavutil/cpu.h"
 #include "libavutil/ppc/cpu.h"
-#include "libavutil/ppc/types_altivec.h"
 #include "libavutil/ppc/util_altivec.h"
+
 #include "libavcodec/avcodec.h"
 #include "libavcodec/mpegvideo.h"
 #include "libavcodec/me_cmp.h"
@@ -54,7 +51,7 @@
     iv = vec_vsx_ld(1,  pix);\
 }
 #endif
-static int sad16_x2_altivec(MpegEncContext *v, uint8_t *pix1, uint8_t *pix2,
+static int sad16_x2_altivec(MPVEncContext *v, const uint8_t *pix1, const uint8_t *pix2,
                             ptrdiff_t stride, int h)
 {
     int i;
@@ -94,7 +91,7 @@ static int sad16_x2_altivec(MpegEncContext *v, uint8_t *pix1, uint8_t *pix2,
     return s;
 }
 
-static int sad16_y2_altivec(MpegEncContext *v, uint8_t *pix1, uint8_t *pix2,
+static int sad16_y2_altivec(MPVEncContext *v, const uint8_t *pix1, const uint8_t *pix2,
                             ptrdiff_t stride, int h)
 {
     int i;
@@ -105,7 +102,7 @@ static int sad16_y2_altivec(MpegEncContext *v, uint8_t *pix1, uint8_t *pix2,
     vector unsigned int sad = (vector unsigned int) vec_splat_u32(0);
     vector signed int sumdiffs;
 
-    uint8_t *pix3 = pix2 + stride;
+    const uint8_t *pix3 = pix2 + stride;
 
     /* Due to the fact that pix3 = pix2 + stride, the pix3 of one
      * iteration becomes pix2 in the next iteration. We can use this
@@ -144,12 +141,12 @@ static int sad16_y2_altivec(MpegEncContext *v, uint8_t *pix1, uint8_t *pix2,
     return s;
 }
 
-static int sad16_xy2_altivec(MpegEncContext *v, uint8_t *pix1, uint8_t *pix2,
+static int sad16_xy2_altivec(MPVEncContext *v, const uint8_t *pix1, const uint8_t *pix2,
                              ptrdiff_t stride, int h)
 {
     int i;
     int  __attribute__((aligned(16))) s = 0;
-    uint8_t *pix3 = pix2 + stride;
+    const uint8_t *pix3 = pix2 + stride;
     const vector unsigned char zero =
         (const vector unsigned char) vec_splat_u8(0);
     const vector unsigned short two =
@@ -233,7 +230,7 @@ static int sad16_xy2_altivec(MpegEncContext *v, uint8_t *pix1, uint8_t *pix2,
     return s;
 }
 
-static int sad16_altivec(MpegEncContext *v, uint8_t *pix1, uint8_t *pix2,
+static int sad16_altivec(MPVEncContext *v, const uint8_t *pix1, const uint8_t *pix2,
                          ptrdiff_t stride, int h)
 {
     int i;
@@ -268,7 +265,7 @@ static int sad16_altivec(MpegEncContext *v, uint8_t *pix1, uint8_t *pix2,
     return s;
 }
 
-static int sad8_altivec(MpegEncContext *v, uint8_t *pix1, uint8_t *pix2,
+static int sad8_altivec(MPVEncContext *v, const uint8_t *pix1, const uint8_t *pix2,
                         ptrdiff_t stride, int h)
 {
     int i;
@@ -312,7 +309,7 @@ static int sad8_altivec(MpegEncContext *v, uint8_t *pix1, uint8_t *pix2,
 
 /* Sum of Squared Errors for an 8x8 block, AltiVec-enhanced.
  * It's the sad8_altivec code above w/ squaring added. */
-static int sse8_altivec(MpegEncContext *v, uint8_t *pix1, uint8_t *pix2,
+static int sse8_altivec(MPVEncContext *v, const uint8_t *pix1, const uint8_t *pix2,
                         ptrdiff_t stride, int h)
 {
     int i;
@@ -357,7 +354,7 @@ static int sse8_altivec(MpegEncContext *v, uint8_t *pix1, uint8_t *pix2,
 
 /* Sum of Squared Errors for a 16x16 block, AltiVec-enhanced.
  * It's the sad16_altivec code above w/ squaring added. */
-static int sse16_altivec(MpegEncContext *v, uint8_t *pix1, uint8_t *pix2,
+static int sse16_altivec(MPVEncContext *v, const uint8_t *pix1, const uint8_t *pix2,
                          ptrdiff_t stride, int h)
 {
     int i;
@@ -395,8 +392,8 @@ static int sse16_altivec(MpegEncContext *v, uint8_t *pix1, uint8_t *pix2,
     return s;
 }
 
-static int hadamard8_diff8x8_altivec(MpegEncContext *s, uint8_t *dst,
-                                     uint8_t *src, ptrdiff_t stride, int h)
+static int hadamard8_diff8x8_altivec(MPVEncContext *s, const uint8_t *dst,
+                                     const uint8_t *src, ptrdiff_t stride, int h)
 {
     int __attribute__((aligned(16))) sum;
     register const vector unsigned char vzero =
@@ -504,7 +501,7 @@ static int hadamard8_diff8x8_altivec(MpegEncContext *s, uint8_t *dst,
 }
 
 /*
- * 16x8 works with 16 elements; it allows to avoid replicating loads, and
+ * 16x8 works with 16 elements; it can avoid replicating loads, and
  * gives the compiler more room for scheduling. It's only used from
  * inside hadamard8_diff16_altivec.
  *
@@ -521,8 +518,8 @@ static int hadamard8_diff8x8_altivec(MpegEncContext *s, uint8_t *dst,
  * On the 970, the hand-made RA is still a win (around 690 vs. around 780),
  * but xlc goes to around 660 on the regular C code...
  */
-static int hadamard8_diff16x8_altivec(MpegEncContext *s, uint8_t *dst,
-                                      uint8_t *src, ptrdiff_t stride, int h)
+static int hadamard8_diff16x8_altivec(MPVEncContext *s, const uint8_t *dst,
+                                      const uint8_t *src, ptrdiff_t stride, int h)
 {
     int __attribute__((aligned(16))) sum;
     register vector signed short
@@ -712,8 +709,8 @@ static int hadamard8_diff16x8_altivec(MpegEncContext *s, uint8_t *dst,
     return sum;
 }
 
-static int hadamard8_diff16_altivec(MpegEncContext *s, uint8_t *dst,
-                                    uint8_t *src, ptrdiff_t stride, int h)
+static int hadamard8_diff16_altivec(MPVEncContext *s, const uint8_t *dst,
+                                    const uint8_t *src, ptrdiff_t stride, int h)
 {
     int score = hadamard8_diff16x8_altivec(s, dst, src, stride, 8);
 

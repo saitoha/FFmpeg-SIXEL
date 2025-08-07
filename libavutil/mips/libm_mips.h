@@ -50,8 +50,10 @@
  * MIPS optimization for some libm functions
  */
 
-#ifndef AVUTIL_LIBM_MIPS_H
-#define AVUTIL_LIBM_MIPS_H
+#ifndef AVUTIL_MIPS_LIBM_MIPS_H
+#define AVUTIL_MIPS_LIBM_MIPS_H
+
+#include "libavutil/attributes.h"
 
 static av_always_inline av_const long int lrintf_mips(float x)
 {
@@ -70,4 +72,4 @@ static av_always_inline av_const long int lrintf_mips(float x)
 #define lrintf(x)   lrintf_mips(x)
 
 #define HAVE_LRINTF 1
-#endif /* AVUTIL_LIBM_MIPS_H */
+#endif /* AVUTIL_MIPS_LIBM_MIPS_H */

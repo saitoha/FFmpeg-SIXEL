@@ -22,9 +22,10 @@
 #include "libavutil/intreadwrite.h"
 #include "libavutil/intfloat.h"
 #include "avformat.h"
+#include "demux.h"
 #include "riff.h"
 
-static int read_probe(AVProbeData *p)
+static int read_probe(const AVProbeData *p)
 {
     if (AV_RB32(p->buf     ) != 0x000E ||
         AV_RB32(p->buf +  4) != 0x0050 ||
@@ -50,18 +51,18 @@ static int read_header(AVFormatContext *s)
     if (!st)
         return AVERROR(ENOMEM);
 
-    st->need_parsing = AVSTREAM_PARSE_HEADERS;
+    ffstream(st)->need_parsing = AVSTREAM_PARSE_HEADERS;
     st->start_time = 0;
     st->nb_frames  =
     st->duration   = avio_rb32(pb);
     fps = av_d2q(av_int2float(avio_rb32(pb)), INT_MAX);
-    st->codec->width  = avio_rb32(pb);
-    st->codec->height = avio_rb32(pb);
+    st->codecpar->width  = avio_rb32(pb);
+    st->codecpar->height = avio_rb32(pb);
     avio_skip(pb, 12);
-    st->codec->codec_type = AVMEDIA_TYPE_VIDEO;
-    st->codec->codec_tag  = avio_rb32(pb);
-    st->codec->codec_id   = ff_codec_get_id(ff_codec_bmp_tags,
-                                            st->codec->codec_tag);
+    st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+    st->codecpar->codec_tag  = avio_rb32(pb);
+    st->codecpar->codec_id   = ff_codec_get_id(ff_codec_bmp_tags,
+                                               st->codecpar->codec_tag);
     avpriv_set_pts_info(st, 64, fps.den, fps.num);
     avio_skip(pb, 20);
 
@@ -96,11 +97,11 @@ static int read_packet(AVFormatContext *s, AVPacket *pkt)
     return ret;
 }
 
-AVInputFormat ff_mgsts_demuxer = {
-    .name        = "mgsts",
-    .long_name   = NULL_IF_CONFIG_SMALL("Metal Gear Solid: The Twin Snakes"),
+const FFInputFormat ff_mgsts_demuxer = {
+    .p.name      = "mgsts",
+    .p.long_name = NULL_IF_CONFIG_SMALL("Metal Gear Solid: The Twin Snakes"),
+    .p.flags     = AVFMT_GENERIC_INDEX,
     .read_probe  = read_probe,
     .read_header = read_header,
     .read_packet = read_packet,
-    .flags       = AVFMT_GENERIC_INDEX,
 };

@@ -21,7 +21,8 @@
 
 #include "libavformat/avformat.h"
 
-int ff_alloc_input_device_context(struct AVFormatContext **avctx, struct AVInputFormat *iformat,
+av_warn_unused_result
+int ff_alloc_input_device_context(struct AVFormatContext **avctx, const AVInputFormat *iformat,
                                   const char *format);
 
 #endif

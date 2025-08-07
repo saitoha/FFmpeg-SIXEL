@@ -9,30 +9,26 @@ such as audio, video, subtitles and related metadata.
 * `libavcodec` provides implementation of a wider range of codecs.
 * `libavformat` implements streaming protocols, container formats and basic I/O access.
 * `libavutil` includes hashers, decompressors and miscellaneous utility functions.
-* `libavfilter` provides a mean to alter decoded Audio and Video through chain of filters.
+* `libavfilter` provides means to alter decoded audio and video through a directed graph of connected filters.
 * `libavdevice` provides an abstraction to access capture and playback devices.
 * `libswresample` implements audio mixing and resampling routines.
 * `libswscale` implements color conversion and scaling routines.
 
 ## Tools
 
-* [ffmpeg](http://ffmpeg.org/ffmpeg.html) is a command line toolbox to
+* [ffmpeg](https://ffmpeg.org/ffmpeg.html) is a command line toolbox to
   manipulate, convert and stream multimedia content.
-* [ffplay](http://ffmpeg.org/ffplay.html) is a minimalistic multimedia player.
-* [ffprobe](http://ffmpeg.org/ffprobe.html) is a simple analysis tool to inspect
+* [ffplay](https://ffmpeg.org/ffplay.html) is a minimalistic multimedia player.
+* [ffprobe](https://ffmpeg.org/ffprobe.html) is a simple analysis tool to inspect
   multimedia content.
-* [ffserver](http://ffmpeg.org/ffserver.html) is a multimedia streaming server
-  for live broadcasts.
 * Additional small tools such as `aviocat`, `ismindex` and `qt-faststart`.
 
 ## Documentation
 
-* See the INSTALL file.
-
 The offline documentation is available in the **doc/** directory.
 
-The online documentation is available in the main [website](http://ffmpeg.org)
-and in the [wiki](http://trac.ffmpeg.org).
+The online documentation is available in the main [website](https://ffmpeg.org)
+and in the [wiki](https://trac.ffmpeg.org).
 
 ### Examples
 
@@ -42,6 +38,12 @@ Coding examples are available in the **doc/examples** directory.
 
 FFmpeg codebase is mainly LGPL-licensed with optional components licensed under
 GPL. Please refer to the LICENSE file for detailed information.
+
+## Contributing
+
+Patches should be submitted to the ffmpeg-devel mailing list using
+`git format-patch` or `git send-email`. Github pull requests should be
+avoided because they are not part of our review process and will be ignored.
 
 SIXEL Integration
 =============
@@ -71,7 +73,7 @@ $ make
 $ ./xterm  # launch
 ```
 
-## Step 2. Build FFmpeg-SIXEL with libsixel and libquvi (for network streaming)
+## Step 2. Build FFmpeg-SIXEL with libsixel
 
 ```
 $ git clone https://github.com/saitoha/libsixel
@@ -81,6 +83,7 @@ $ cd ..
 $ git clone https://github.com/saitoha/FFmpeg-SIXEL
 $ cd FFmpeg-SIXEL
 $ ./configure --enable-libquvi --enable-libsixel
-$ make install
-$ ffmpeg -i 'https://www.youtube.com/watch?v=ixaMZPPmVG0' -f sixel -pix_fmt rgb24 -s 480x270 -
+$ make
+$ ./ffmpeg -i a.webm -f sixel -pix_fmt rgb24 -reqcolors 256 -s 600x360 -loglevel panic -
 ```
+

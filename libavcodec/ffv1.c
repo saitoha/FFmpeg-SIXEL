@@ -27,32 +27,19 @@
 
 #include "libavutil/attributes.h"
 #include "libavutil/avassert.h"
-#include "libavutil/crc.h"
-#include "libavutil/opt.h"
-#include "libavutil/imgutils.h"
-#include "libavutil/pixdesc.h"
-#include "libavutil/timer.h"
+#include "libavutil/mem.h"
+
 #include "avcodec.h"
-#include "internal.h"
-#include "rangecoder.h"
-#include "golomb.h"
-#include "mathops.h"
 #include "ffv1.h"
+#include "libavutil/refstruct.h"
 
-av_cold int ffv1_common_init(AVCodecContext *avctx)
+av_cold int ff_ffv1_common_init(AVCodecContext *avctx, FFV1Context *s)
 {
-    FFV1Context *s = avctx->priv_data;
-
     if (!avctx->width || !avctx->height)
         return AVERROR_INVALIDDATA;
 
     s->avctx = avctx;
     s->flags = avctx->flags;
-
-    s->picture.f = av_frame_alloc();
-    s->last_picture.f = av_frame_alloc();
-    if (!s->picture.f || !s->last_picture.f)
-        return AVERROR(ENOMEM);
 
     s->width  = avctx->width;
     s->height = avctx->height;
@@ -64,97 +51,136 @@ av_cold int ffv1_common_init(AVCodecContext *avctx)
     return 0;
 }
 
-av_cold int ffv1_init_slice_state(FFV1Context *f, FFV1Context *fs)
+static void planes_free(AVRefStructOpaque opaque, void *obj)
 {
-    int j;
+    PlaneContext *planes = obj;
 
-    fs->plane_count  = f->plane_count;
-    fs->transparency = f->transparency;
+    for (int i = 0; i < MAX_PLANES; i++) {
+        PlaneContext *p = &planes[i];
+
+        av_freep(&p->state);
+        av_freep(&p->vlc_state);
+    }
+}
+
+PlaneContext* ff_ffv1_planes_alloc(void)
+{
+    return av_refstruct_alloc_ext(sizeof(PlaneContext) * MAX_PLANES,
+                                  0, NULL, planes_free);
+}
+
+av_cold int ff_ffv1_init_slice_state(const FFV1Context *f,
+                                     FFV1SliceContext *sc)
+{
+    int j, i;
+
     for (j = 0; j < f->plane_count; j++) {
-        PlaneContext *const p = &fs->plane[j];
+        PlaneContext *const p = &sc->plane[j];
 
-        if (fs->ac) {
+        if (f->ac != AC_GOLOMB_RICE) {
             if (!p->state)
                 p->state = av_malloc_array(p->context_count, CONTEXT_SIZE *
                                      sizeof(uint8_t));
             if (!p->state)
                 return AVERROR(ENOMEM);
         } else {
-            if (!p->vlc_state)
-                p->vlc_state = av_malloc_array(p->context_count, sizeof(VlcState));
-            if (!p->vlc_state)
-                return AVERROR(ENOMEM);
+            if (!p->vlc_state) {
+                p->vlc_state = av_calloc(p->context_count, sizeof(*p->vlc_state));
+                if (!p->vlc_state)
+                    return AVERROR(ENOMEM);
+                for (i = 0; i < p->context_count; i++) {
+                    p->vlc_state[i].error_sum = 4;
+                    p->vlc_state[i].count     = 1;
+                }
+            }
         }
     }
 
-    if (fs->ac > 1) {
+    if (f->ac == AC_RANGE_CUSTOM_TAB) {
         //FIXME only redo if state_transition changed
         for (j = 1; j < 256; j++) {
-            fs->c. one_state[      j] = f->state_transition[j];
-            fs->c.zero_state[256 - j] = 256 - fs->c.one_state[j];
+            sc->c. one_state[      j] = f->state_transition[j];
+            sc->c.zero_state[256 - j] = 256 - sc->c.one_state[j];
         }
     }
 
     return 0;
 }
 
-av_cold int ffv1_init_slices_state(FFV1Context *f)
+av_cold int ff_ffv1_init_slices_state(FFV1Context *f)
 {
     int i, ret;
-    for (i = 0; i < f->slice_count; i++) {
-        FFV1Context *fs = f->slice_context[i];
-        if ((ret = ffv1_init_slice_state(f, fs)) < 0)
+    for (i = 0; i < f->max_slice_count; i++) {
+        if ((ret = ff_ffv1_init_slice_state(f, &f->slices[i])) < 0)
             return AVERROR(ENOMEM);
     }
     return 0;
 }
 
-av_cold int ffv1_init_slice_contexts(FFV1Context *f)
-{
-    int i;
+int ff_need_new_slices(int width, int num_h_slices, int chroma_shift) {
+    int mpw = 1<<chroma_shift;
+    int i = width * (int64_t)(num_h_slices - 1) / num_h_slices;
 
-    f->slice_count = f->num_h_slices * f->num_v_slices;
-    av_assert0(f->slice_count > 0);
-
-    for (i = 0; i < f->slice_count; i++) {
-        int sx          = i % f->num_h_slices;
-        int sy          = i / f->num_h_slices;
-        int sxs         = f->avctx->width  *  sx      / f->num_h_slices;
-        int sxe         = f->avctx->width  * (sx + 1) / f->num_h_slices;
-        int sys         = f->avctx->height *  sy      / f->num_v_slices;
-        int sye         = f->avctx->height * (sy + 1) / f->num_v_slices;
-        FFV1Context *fs = av_mallocz(sizeof(*fs));
-
-        if (!fs)
-            goto memfail;
-
-        f->slice_context[i] = fs;
-        memcpy(fs, f, sizeof(*fs));
-        memset(fs->rc_stat2, 0, sizeof(fs->rc_stat2));
-
-        fs->slice_width  = sxe - sxs;
-        fs->slice_height = sye - sys;
-        fs->slice_x      = sxs;
-        fs->slice_y      = sys;
-
-        fs->sample_buffer = av_malloc_array((fs->width + 6), 3 * MAX_PLANES *
-                                      sizeof(*fs->sample_buffer));
-        if (!fs->sample_buffer) {
-            av_freep(&f->slice_context[i]);
-            goto memfail;
-        }
-    }
-    return 0;
-
-memfail:
-    while(--i >= 0) {
-        av_freep(&f->slice_context[i]->sample_buffer);
-        av_freep(&f->slice_context[i]);
-    }
-    return AVERROR(ENOMEM);
+    return width % mpw && (width - i) % mpw == 0;
 }
 
-int ffv1_allocate_initial_states(FFV1Context *f)
+int ff_slice_coord(const FFV1Context *f, int width, int sx, int num_h_slices, int chroma_shift) {
+    int mpw = 1<<chroma_shift;
+    int awidth = FFALIGN(width, mpw);
+
+    if (f->combined_version <= 0x40002)
+        return width * sx / num_h_slices;
+
+    sx = (2LL * awidth * sx + num_h_slices * mpw) / (2 * num_h_slices * mpw) * mpw;
+    if (sx == awidth)
+        sx = width;
+    return sx;
+}
+
+av_cold int ff_ffv1_init_slice_contexts(FFV1Context *f)
+{
+    int max_slice_count = f->num_h_slices * f->num_v_slices;
+
+    av_assert0(max_slice_count > 0);
+
+    f->slices = av_calloc(max_slice_count, sizeof(*f->slices));
+    if (!f->slices)
+        return AVERROR(ENOMEM);
+
+    f->max_slice_count = max_slice_count;
+
+    for (int i = 0; i < max_slice_count; i++) {
+        FFV1SliceContext *sc = &f->slices[i];
+        int sx          = i % f->num_h_slices;
+        int sy          = i / f->num_h_slices;
+        int sxs         = ff_slice_coord(f, f->avctx->width , sx    , f->num_h_slices, f->chroma_h_shift);
+        int sxe         = ff_slice_coord(f, f->avctx->width , sx + 1, f->num_h_slices, f->chroma_h_shift);
+        int sys         = ff_slice_coord(f, f->avctx->height, sy   ,  f->num_v_slices, f->chroma_v_shift);
+        int sye         = ff_slice_coord(f, f->avctx->height, sy + 1, f->num_v_slices, f->chroma_v_shift);
+
+        sc->slice_width  = sxe - sxs;
+        sc->slice_height = sye - sys;
+        sc->slice_x      = sxs;
+        sc->slice_y      = sys;
+        sc->sx           = sx;
+        sc->sy           = sy;
+
+        sc->sample_buffer = av_malloc_array((f->width + 6), 3 * MAX_PLANES *
+                                            sizeof(*sc->sample_buffer));
+        sc->sample_buffer32 = av_malloc_array((f->width + 6), 3 * MAX_PLANES *
+                                              sizeof(*sc->sample_buffer32));
+        if (!sc->sample_buffer || !sc->sample_buffer32)
+            return AVERROR(ENOMEM);
+
+        sc->plane = ff_ffv1_planes_alloc();
+        if (!sc->plane)
+            return AVERROR(ENOMEM);
+    }
+
+    return 0;
+}
+
+int ff_ffv1_allocate_initial_states(FFV1Context *f)
 {
     int i;
 
@@ -169,17 +195,14 @@ int ffv1_allocate_initial_states(FFV1Context *f)
     return 0;
 }
 
-void ffv1_clear_slice_state(FFV1Context *f, FFV1Context *fs)
+void ff_ffv1_clear_slice_state(const FFV1Context *f, FFV1SliceContext *sc)
 {
     int i, j;
 
     for (i = 0; i < f->plane_count; i++) {
-        PlaneContext *p = &fs->plane[i];
+        PlaneContext *p = &sc->plane[i];
 
-        p->interlace_bit_state[0] = 128;
-        p->interlace_bit_state[1] = 128;
-
-        if (fs->ac) {
+        if (f->ac != AC_GOLOMB_RICE) {
             if (f->initial_states[p->quant_table_index]) {
                 memcpy(p->state, f->initial_states[p->quant_table_index],
                        CONTEXT_SIZE * p->context_count);
@@ -196,43 +219,77 @@ void ffv1_clear_slice_state(FFV1Context *f, FFV1Context *fs)
     }
 }
 
-
-av_cold int ffv1_close(AVCodecContext *avctx)
+void ff_ffv1_compute_bits_per_plane(const FFV1Context *f, FFV1SliceContext *sc, int bits[4], int *offset, int mask[4], int bits_per_raw_sample)
 {
-    FFV1Context *s = avctx->priv_data;
-    int i, j;
-
-    if (s->picture.f)
-        ff_thread_release_buffer(avctx, &s->picture);
-    av_frame_free(&s->picture.f);
-
-    if (s->last_picture.f)
-        ff_thread_release_buffer(avctx, &s->last_picture);
-    av_frame_free(&s->last_picture.f);
-
-    for (j = 0; j < s->slice_count; j++) {
-        FFV1Context *fs = s->slice_context[j];
-        for (i = 0; i < s->plane_count; i++) {
-            PlaneContext *p = &fs->plane[i];
-
-            av_freep(&p->state);
-            av_freep(&p->vlc_state);
-        }
-        av_freep(&fs->sample_buffer);
+    // to simplify we use the remap_count as the symbol range in each plane
+    if (!sc->remap) {
+        sc->remap_count[0] =
+        sc->remap_count[1] =
+        sc->remap_count[2] =
+        sc->remap_count[3] = 1 << (bits_per_raw_sample > 0 ? bits_per_raw_sample : 8);
     }
 
-    av_freep(&avctx->stats_out);
+    if (sc->remap)
+        av_assert0(bits_per_raw_sample > 8); //breaks with lbd, needs review if added
+
+    //bits with no RCT
+    for (int p=0; p<3+f->transparency; p++) {
+        bits[p] = av_ceil_log2(sc->remap_count[p]);
+        if (mask)
+            mask[p] = (1<<bits[p]) - 1;
+    }
+
+    //RCT
+    if (sc->slice_coding_mode == 0) {
+        *offset = sc->remap_count[0];
+
+        bits[0] = av_ceil_log2(FFMAX3(sc->remap_count[0], sc->remap_count[1], sc->remap_count[2]));
+        bits[1] = av_ceil_log2(sc->remap_count[0] + sc->remap_count[1]);
+        bits[2] = av_ceil_log2(sc->remap_count[0] + sc->remap_count[2]);
+
+        //old version coded a bit more than needed
+        if (f->combined_version < 0x40008) {
+            bits[0]++;
+            if(f->transparency)
+                bits[3]++;
+        }
+    }
+}
+
+int ff_ffv1_get_symbol(RangeCoder *c, uint8_t *state, int is_signed)
+{
+    return get_symbol_inline(c, state, is_signed);
+}
+
+av_cold void ff_ffv1_close(FFV1Context *s)
+{
+    int i, j;
+
+    for (j = 0; j < s->max_slice_count; j++) {
+        FFV1SliceContext *sc = &s->slices[j];
+
+        av_freep(&sc->sample_buffer);
+        av_freep(&sc->sample_buffer32);
+        for(int p = 0; p < 4 ; p++) {
+            av_freep(&sc->fltmap[p]);
+            av_freep(&sc->fltmap32[p]);
+            sc->fltmap_size  [p] = 0;
+            sc->fltmap32_size[p] = 0;
+        }
+
+        av_refstruct_unref(&sc->plane);
+    }
+
+    av_refstruct_unref(&s->slice_damaged);
+
     for (j = 0; j < s->quant_table_count; j++) {
         av_freep(&s->initial_states[j]);
-        for (i = 0; i < s->slice_count; i++) {
-            FFV1Context *sf = s->slice_context[i];
-            av_freep(&sf->rc_stat2[j]);
+        for (i = 0; i < s->max_slice_count; i++) {
+            FFV1SliceContext *sc = &s->slices[i];
+            av_freep(&sc->rc_stat2[j]);
         }
         av_freep(&s->rc_stat2[j]);
     }
 
-    for (i = 0; i < s->slice_count; i++)
-        av_freep(&s->slice_context[i]);
-
-    return 0;
+    av_freep(&s->slices);
 }

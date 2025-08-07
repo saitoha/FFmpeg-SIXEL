@@ -20,13 +20,13 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "avcodec.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mem.h"
+
+#include "avcodec.h"
 #include "bytestream.h"
-#define BITSTREAM_READER_LE
-#include "get_bits.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 
 typedef struct XanContext {
     AVCodecContext *avctx;
@@ -72,16 +72,12 @@ static av_cold int xan_decode_init(AVCodecContext *avctx)
     if (!s->y_buffer)
         return AVERROR(ENOMEM);
     s->scratch_buffer = av_malloc(s->buffer_size + 130);
-    if (!s->scratch_buffer) {
-        xan_decode_end(avctx);
+    if (!s->scratch_buffer)
         return AVERROR(ENOMEM);
-    }
 
     s->pic = av_frame_alloc();
-    if (!s->pic) {
-        xan_decode_end(avctx);
+    if (!s->pic)
         return AVERROR(ENOMEM);
-    }
 
     return 0;
 }
@@ -403,15 +399,14 @@ static int xan_decode_frame_type1(AVCodecContext *avctx)
     return 0;
 }
 
-static int xan_decode_frame(AVCodecContext *avctx,
-                            void *data, int *got_frame,
-                            AVPacket *avpkt)
+static int xan_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
+                            int *got_frame, AVPacket *avpkt)
 {
     XanContext *s = avctx->priv_data;
     int ftype;
     int ret;
 
-    if ((ret = ff_reget_buffer(avctx, s->pic)) < 0)
+    if ((ret = ff_reget_buffer(avctx, s->pic, 0)) < 0)
         return ret;
 
     bytestream2_init(&s->gb, avpkt->data, avpkt->size);
@@ -430,7 +425,7 @@ static int xan_decode_frame(AVCodecContext *avctx,
     if (ret)
         return ret;
 
-    if ((ret = av_frame_ref(data, s->pic)) < 0)
+    if ((ret = av_frame_ref(rframe, s->pic)) < 0)
         return ret;
 
     *got_frame = 1;
@@ -438,14 +433,15 @@ static int xan_decode_frame(AVCodecContext *avctx,
     return avpkt->size;
 }
 
-AVCodec ff_xan_wc4_decoder = {
-    .name           = "xan_wc4",
-    .long_name      = NULL_IF_CONFIG_SMALL("Wing Commander IV / Xxan"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_XAN_WC4,
+const FFCodec ff_xan_wc4_decoder = {
+    .p.name         = "xan_wc4",
+    CODEC_LONG_NAME("Wing Commander IV / Xxan"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_XAN_WC4,
     .priv_data_size = sizeof(XanContext),
     .init           = xan_decode_init,
     .close          = xan_decode_end,
-    .decode         = xan_decode_frame,
-    .capabilities   = CODEC_CAP_DR1,
+    FF_CODEC_DECODE_CB(xan_decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };

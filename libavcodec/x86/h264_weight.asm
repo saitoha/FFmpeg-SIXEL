@@ -70,19 +70,6 @@ SECTION .text
     packuswb      m0, m1
 %endmacro
 
-INIT_MMX mmxext
-cglobal h264_weight_16, 6, 6, 0
-    WEIGHT_SETUP
-.nextrow:
-    WEIGHT_OP 0,  4
-    mova     [r0  ], m0
-    WEIGHT_OP 8, 12
-    mova     [r0+8], m0
-    add        r0, r1
-    dec        r2d
-    jnz .nextrow
-    REP_RET
-
 %macro WEIGHT_FUNC_MM 2
 cglobal h264_weight_%1, 6, 6, %2
     WEIGHT_SETUP
@@ -92,11 +79,9 @@ cglobal h264_weight_%1, 6, 6, %2
     add        r0, r1
     dec        r2d
     jnz .nextrow
-    REP_RET
+    RET
 %endmacro
 
-INIT_MMX mmxext
-WEIGHT_FUNC_MM  8, 0
 INIT_XMM sse2
 WEIGHT_FUNC_MM 16, 8
 
@@ -117,7 +102,7 @@ cglobal h264_weight_%1, 6, 6, %2
     add        r0, r3
     dec        r2d
     jnz .nextrow
-    REP_RET
+    RET
 %endmacro
 
 INIT_MMX mmxext
@@ -134,14 +119,17 @@ WEIGHT_FUNC_HALF_MM 8, 8
     mov  off_regd, r7m
     add  off_regd, 1
     or   off_regd, 1
-    add        r4, 1
-    cmp        r5, 128
-     jne .normal
-    sar        r5, 1
-    sar        r6, 1
+    add       r4d, 1
+    cmp       r6d, 128
+    je .nonnormal
+    cmp       r5d, 128
+    jne .normal
+.nonnormal:
+    sar       r5d, 1
+    sar       r6d, 1
     sar  off_regd, 1
-    sub        r4, 1
-.normal
+    sub       r4d, 1
+.normal:
 %if cpuflag(ssse3)
     movd       m4, r5d
     movd       m0, r6d
@@ -195,25 +183,6 @@ WEIGHT_FUNC_HALF_MM 8, 8
     packuswb   m0, m1
 %endmacro
 
-INIT_MMX mmxext
-cglobal h264_biweight_16, 7, 8, 0
-    BIWEIGHT_SETUP
-    movifnidn r3d, r3m
-.nextrow:
-    BIWEIGHT_STEPA 0, 1, 0
-    BIWEIGHT_STEPA 1, 2, 4
-    BIWEIGHT_STEPB
-    mova       [r0], m0
-    BIWEIGHT_STEPA 0, 1, 8
-    BIWEIGHT_STEPA 1, 2, 12
-    BIWEIGHT_STEPB
-    mova     [r0+8], m0
-    add        r0, r2
-    add        r1, r2
-    dec        r3d
-    jnz .nextrow
-    REP_RET
-
 %macro BIWEIGHT_FUNC_MM 2
 cglobal h264_biweight_%1, 7, 8, %2
     BIWEIGHT_SETUP
@@ -227,11 +196,9 @@ cglobal h264_biweight_%1, 7, 8, %2
     add        r1, r2
     dec        r3d
     jnz .nextrow
-    REP_RET
+    RET
 %endmacro
 
-INIT_MMX mmxext
-BIWEIGHT_FUNC_MM  8, 0
 INIT_XMM sse2
 BIWEIGHT_FUNC_MM 16, 8
 
@@ -239,7 +206,7 @@ BIWEIGHT_FUNC_MM 16, 8
 cglobal h264_biweight_%1, 7, 8, %2
     BIWEIGHT_SETUP
     movifnidn r3d, r3m
-    sar        r3, 1
+    sar       r3d, 1
     lea        r4, [r2*2]
 .nextrow:
     BIWEIGHT_STEPA 0, 1, 0
@@ -256,7 +223,7 @@ cglobal h264_biweight_%1, 7, 8, %2
     add        r1, r4
     dec        r3d
     jnz .nextrow
-    REP_RET
+    RET
 %endmacro
 
 INIT_MMX mmxext
@@ -291,13 +258,13 @@ cglobal h264_biweight_16, 7, 8, 8
     add        r1, r2
     dec        r3d
     jnz .nextrow
-    REP_RET
+    RET
 
 INIT_XMM ssse3
 cglobal h264_biweight_8, 7, 8, 8
     BIWEIGHT_SETUP
     movifnidn r3d, r3m
-    sar        r3, 1
+    sar       r3d, 1
     lea        r4, [r2*2]
 
 .nextrow:
@@ -314,4 +281,4 @@ cglobal h264_biweight_8, 7, 8, 8
     add        r1, r4
     dec        r3d
     jnz .nextrow
-    REP_RET
+    RET

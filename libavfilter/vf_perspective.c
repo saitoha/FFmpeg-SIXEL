@@ -22,11 +22,11 @@
 #include "libavutil/avassert.h"
 #include "libavutil/eval.h"
 #include "libavutil/imgutils.h"
+#include "libavutil/mem.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/opt.h"
 #include "avfilter.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
 #include "video.h"
 
 #define SUB_PIXEL_BITS  8
@@ -48,6 +48,7 @@ typedef struct PerspectiveContext {
     int hsub, vsub;
     int nb_planes;
     int sense;
+    int eval_mode;
 
     int (*perspective)(AVFilterContext *ctx,
                        void *arg, int job, int nb_jobs);
@@ -61,6 +62,12 @@ enum PERSPECTIVESense {
     PERSPECTIVE_SENSE_DESTINATION = 1, ///< coordinates give locations in destination of corners of source.
 };
 
+enum EvalMode {
+    EVAL_MODE_INIT,
+    EVAL_MODE_FRAME,
+    EVAL_MODE_NB
+};
+
 static const AVOption perspective_options[] = {
     { "x0", "set top left x coordinate",     OFFSET(expr_str[0][0]), AV_OPT_TYPE_STRING, {.str="0"}, 0, 0, FLAGS },
     { "y0", "set top left y coordinate",     OFFSET(expr_str[0][1]), AV_OPT_TYPE_STRING, {.str="0"}, 0, 0, FLAGS },
@@ -70,34 +77,29 @@ static const AVOption perspective_options[] = {
     { "y2", "set bottom left y coordinate",  OFFSET(expr_str[2][1]), AV_OPT_TYPE_STRING, {.str="H"}, 0, 0, FLAGS },
     { "x3", "set bottom right x coordinate", OFFSET(expr_str[3][0]), AV_OPT_TYPE_STRING, {.str="W"}, 0, 0, FLAGS },
     { "y3", "set bottom right y coordinate", OFFSET(expr_str[3][1]), AV_OPT_TYPE_STRING, {.str="H"}, 0, 0, FLAGS },
-    { "interpolation", "set interpolation", OFFSET(interpolation), AV_OPT_TYPE_INT, {.i64=LINEAR}, 0, 1, FLAGS, "interpolation" },
-    {      "linear", "", 0, AV_OPT_TYPE_CONST, {.i64=LINEAR}, 0, 0, FLAGS, "interpolation" },
-    {       "cubic", "", 0, AV_OPT_TYPE_CONST, {.i64=CUBIC},  0, 0, FLAGS, "interpolation" },
-    { "sense",   "specify the sense of the coordinates", OFFSET(sense), AV_OPT_TYPE_INT, {.i64=PERSPECTIVE_SENSE_SOURCE}, 0, 1, FLAGS, "sense"},
+    { "interpolation", "set interpolation", OFFSET(interpolation), AV_OPT_TYPE_INT, {.i64=LINEAR}, 0, 1, FLAGS, .unit = "interpolation" },
+    {      "linear", "", 0, AV_OPT_TYPE_CONST, {.i64=LINEAR}, 0, 0, FLAGS, .unit = "interpolation" },
+    {       "cubic", "", 0, AV_OPT_TYPE_CONST, {.i64=CUBIC},  0, 0, FLAGS, .unit = "interpolation" },
+    { "sense",   "specify the sense of the coordinates", OFFSET(sense), AV_OPT_TYPE_INT, {.i64=PERSPECTIVE_SENSE_SOURCE}, 0, 1, FLAGS, .unit = "sense"},
     {       "source", "specify locations in source to send to corners in destination",
-                0, AV_OPT_TYPE_CONST, {.i64=PERSPECTIVE_SENSE_SOURCE}, 0, 0, FLAGS, "sense"},
+                0, AV_OPT_TYPE_CONST, {.i64=PERSPECTIVE_SENSE_SOURCE}, 0, 0, FLAGS, .unit = "sense"},
     {       "destination", "specify locations in destination to send corners of source",
-                0, AV_OPT_TYPE_CONST, {.i64=PERSPECTIVE_SENSE_DESTINATION}, 0, 0, FLAGS, "sense"},
+                0, AV_OPT_TYPE_CONST, {.i64=PERSPECTIVE_SENSE_DESTINATION}, 0, 0, FLAGS, .unit = "sense"},
+    { "eval", "specify when to evaluate expressions", OFFSET(eval_mode), AV_OPT_TYPE_INT, {.i64 = EVAL_MODE_INIT}, 0, EVAL_MODE_NB-1, FLAGS, .unit = "eval" },
+         { "init",  "eval expressions once during initialization", 0, AV_OPT_TYPE_CONST, {.i64=EVAL_MODE_INIT},  .flags = FLAGS, .unit = "eval" },
+         { "frame", "eval expressions per-frame",                  0, AV_OPT_TYPE_CONST, {.i64=EVAL_MODE_FRAME}, .flags = FLAGS, .unit = "eval" },
 
     { NULL }
 };
 
 AVFILTER_DEFINE_CLASS(perspective);
 
-static int query_formats(AVFilterContext *ctx)
-{
-    static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_YUVA444P, AV_PIX_FMT_YUVA422P, AV_PIX_FMT_YUVA420P,
-        AV_PIX_FMT_YUVJ444P, AV_PIX_FMT_YUVJ440P, AV_PIX_FMT_YUVJ422P,AV_PIX_FMT_YUVJ420P, AV_PIX_FMT_YUVJ411P,
-        AV_PIX_FMT_YUV444P, AV_PIX_FMT_YUV440P, AV_PIX_FMT_YUV422P, AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV411P, AV_PIX_FMT_YUV410P,
-        AV_PIX_FMT_GBRP, AV_PIX_FMT_GBRAP, AV_PIX_FMT_GRAY8, AV_PIX_FMT_NONE
-    };
-
-    AVFilterFormats *fmts_list = ff_make_format_list(pix_fmts);
-    if (!fmts_list)
-        return AVERROR(ENOMEM);
-    return ff_set_common_formats(ctx, fmts_list);
-}
+static const enum AVPixelFormat pix_fmts[] = {
+    AV_PIX_FMT_YUVA444P, AV_PIX_FMT_YUVA422P, AV_PIX_FMT_YUVA420P,
+    AV_PIX_FMT_YUVJ444P, AV_PIX_FMT_YUVJ440P, AV_PIX_FMT_YUVJ422P,AV_PIX_FMT_YUVJ420P, AV_PIX_FMT_YUVJ411P,
+    AV_PIX_FMT_YUV444P, AV_PIX_FMT_YUV440P, AV_PIX_FMT_YUV422P, AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV411P, AV_PIX_FMT_YUV410P,
+    AV_PIX_FMT_GBRP, AV_PIX_FMT_GBRAP, AV_PIX_FMT_GRAY8, AV_PIX_FMT_NONE
+};
 
 static inline double get_coeff(double d)
 {
@@ -115,20 +117,24 @@ static inline double get_coeff(double d)
     return coeff;
 }
 
-static const char *const var_names[] = {   "W",   "H",        NULL };
-enum                                   { VAR_W, VAR_H, VAR_VARS_NB };
+static const char *const var_names[] = {   "W",   "H",   "in",   "on",        NULL };
+enum                                   { VAR_W, VAR_H, VAR_IN, VAR_ON, VAR_VARS_NB };
 
-static int config_input(AVFilterLink *inlink)
+static int calc_persp_luts(AVFilterContext *ctx, AVFilterLink *inlink)
 {
+    FilterLink *inl       = ff_filter_link(inlink);
+    PerspectiveContext *s = ctx->priv;
+    AVFilterLink *outlink = ctx->outputs[0];
+    FilterLink *outl      = ff_filter_link(outlink);
+    double (*ref)[2]      = s->ref;
+
+    double values[VAR_VARS_NB] = { [VAR_W] = inlink->w, [VAR_H] = inlink->h,
+                                   [VAR_IN] = inl->frame_count_out + 1,
+                                   [VAR_ON] = outl->frame_count_in + 1 };
+    const int h = values[VAR_H];
+    const int w = values[VAR_W];
     double x0, x1, x2, x3, x4, x5, x6, x7, x8, q;
     double t0, t1, t2, t3;
-    AVFilterContext *ctx = inlink->dst;
-    PerspectiveContext *s = ctx->priv;
-    double (*ref)[2] = s->ref;
-    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(inlink->format);
-    double values[VAR_VARS_NB] = { [VAR_W] = inlink->w, [VAR_H] = inlink->h };
-    int h = inlink->h;
-    int w = inlink->w;
     int x, y, i, j, ret;
 
     for (i = 0; i < 4; i++) {
@@ -143,19 +149,6 @@ static int config_input(AVFilterLink *inlink)
                 return ret;
         }
     }
-
-    s->hsub = desc->log2_chroma_w;
-    s->vsub = desc->log2_chroma_h;
-    s->nb_planes = av_pix_fmt_count_planes(inlink->format);
-    if ((ret = av_image_fill_linesizes(s->linesize, inlink->format, inlink->w)) < 0)
-        return ret;
-
-    s->height[1] = s->height[2] = FF_CEIL_RSHIFT(inlink->h, desc->log2_chroma_h);
-    s->height[0] = s->height[3] = inlink->h;
-
-    s->pv = av_realloc_f(s->pv, w * h, 2 * sizeof(*s->pv));
-    if (!s->pv)
-        return AVERROR(ENOMEM);
 
     switch (s->sense) {
     case PERSPECTIVE_SENSE_SOURCE:
@@ -213,13 +206,43 @@ static int config_input(AVFilterLink *inlink)
         for (x = 0; x < w; x++){
             int u, v;
 
-            u = (int)floor(SUB_PIXELS * (x0 * x + x1 * y + x2) /
-                                        (x6 * x + x7 * y + x8) + 0.5);
-            v = (int)floor(SUB_PIXELS * (x3 * x + x4 * y + x5) /
-                                        (x6 * x + x7 * y + x8) + 0.5);
+            u =      lrint(SUB_PIXELS * (x0 * x + x1 * y + x2) /
+                                        (x6 * x + x7 * y + x8));
+            v =      lrint(SUB_PIXELS * (x3 * x + x4 * y + x5) /
+                                        (x6 * x + x7 * y + x8));
 
             s->pv[x + y * w][0] = u;
             s->pv[x + y * w][1] = v;
+        }
+    }
+
+    return 0;
+}
+
+static int config_input(AVFilterLink *inlink)
+{
+    AVFilterContext *ctx = inlink->dst;
+    PerspectiveContext *s = ctx->priv;
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(inlink->format);
+    int h = inlink->h;
+    int w = inlink->w;
+    int i, j, ret;
+    s->hsub = desc->log2_chroma_w;
+    s->vsub = desc->log2_chroma_h;
+    s->nb_planes = av_pix_fmt_count_planes(inlink->format);
+    if ((ret = av_image_fill_linesizes(s->linesize, inlink->format, inlink->w)) < 0)
+        return ret;
+
+    s->height[1] = s->height[2] = AV_CEIL_RSHIFT(inlink->h, desc->log2_chroma_h);
+    s->height[0] = s->height[3] = inlink->h;
+
+    s->pv = av_realloc_f(s->pv, w * h, 2 * sizeof(*s->pv));
+    if (!s->pv)
+        return AVERROR(ENOMEM);
+
+    if (s->eval_mode == EVAL_MODE_INIT) {
+        if ((ret = calc_persp_luts(ctx, inlink)) < 0) {
+            return ret;
         }
     }
 
@@ -235,7 +258,7 @@ static int config_input(AVFilterLink *inlink)
             sum += temp[j];
 
         for (j = 0; j < 4; j++)
-            s->coeff[i][j] = (int)floor((1 << COEFF_BITS) * temp[j] / sum + 0.5);
+            s->coeff[i][j] = lrint((1 << COEFF_BITS) * temp[j] / sum);
     }
 
     return 0;
@@ -423,6 +446,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
     PerspectiveContext *s = ctx->priv;
     AVFrame *out;
     int plane;
+    int ret;
 
     out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
     if (!out) {
@@ -430,6 +454,13 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
         return AVERROR(ENOMEM);
     }
     av_frame_copy_props(out, frame);
+
+    if (s->eval_mode == EVAL_MODE_FRAME) {
+        if ((ret = calc_persp_luts(ctx, inlink)) < 0) {
+            av_frame_free(&out);
+            return ret;
+        }
+    }
 
     for (plane = 0; plane < s->nb_planes; plane++) {
         int hsub = plane == 1 || plane == 2 ? s->hsub : 0;
@@ -442,7 +473,8 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
                          .h = s->height[plane],
                          .hsub = hsub,
                          .vsub = vsub };
-        ctx->internal->execute(ctx, s->perspective, &td, NULL, FFMIN(td.h, ctx->graph->nb_threads));
+        ff_filter_execute(ctx, s->perspective, &td, NULL,
+                          FFMIN(td.h, ff_filter_get_nb_threads(ctx)));
     }
 
     av_frame_free(&frame);
@@ -463,26 +495,17 @@ static const AVFilterPad perspective_inputs[] = {
         .filter_frame = filter_frame,
         .config_props = config_input,
     },
-    { NULL }
 };
 
-static const AVFilterPad perspective_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-    { NULL }
-};
-
-AVFilter ff_vf_perspective = {
-    .name          = "perspective",
-    .description   = NULL_IF_CONFIG_SMALL("Correct the perspective of video."),
+const FFFilter ff_vf_perspective = {
+    .p.name        = "perspective",
+    .p.description = NULL_IF_CONFIG_SMALL("Correct the perspective of video."),
+    .p.priv_class  = &perspective_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(PerspectiveContext),
     .init          = init,
     .uninit        = uninit,
-    .query_formats = query_formats,
-    .inputs        = perspective_inputs,
-    .outputs       = perspective_outputs,
-    .priv_class    = &perspective_class,
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
+    FILTER_INPUTS(perspective_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_PIXFMTS_ARRAY(pix_fmts),
 };

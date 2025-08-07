@@ -20,7 +20,9 @@
 
 #include <string.h>
 #include "libavutil/avstring.h"
+#include "libavutil/avutil.h"
 #include "libavutil/base64.h"
+#include "libavutil/mem.h"
 #include "url.h"
 
 typedef struct {
@@ -109,7 +111,7 @@ static int data_read(URLContext *h, unsigned char *buf, int size)
     return size;
 }
 
-URLProtocol ff_data_protocol = {
+const URLProtocol ff_data_protocol = {
     .name           = "data",
     .url_open       = data_open,
     .url_close      = data_close,

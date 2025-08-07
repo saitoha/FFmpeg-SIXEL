@@ -30,6 +30,7 @@
 #define AVCODEC_MJPEGDEC_H
 
 #include "libavutil/log.h"
+#include "libavutil/mem_internal.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/stereo3d.h"
 
@@ -39,28 +40,39 @@
 #include "hpeldsp.h"
 #include "idctdsp.h"
 
+#undef near /* This file uses struct member 'near' which in windows.h is defined as empty. */
+
 #define MAX_COMPONENTS 4
+
+typedef struct ICCEntry {
+    uint8_t *data;
+    int    length;
+} ICCEntry;
+
+struct JLSState;
 
 typedef struct MJpegDecodeContext {
     AVClass *class;
     AVCodecContext *avctx;
     GetBitContext gb;
+    int buf_size;
 
     int start_code; /* current start code */
     int buffer_size;
     uint8_t *buffer;
 
-    int16_t quant_matrixes[4][64];
+    uint16_t quant_matrixes[4][64];
     VLC vlcs[3][4];
     int qscale[4];      ///< quantizer scale calculated from quant_matrixes
 
-    int org_height;  /* size given at codec init */
+    int orig_height;  /* size given at codec init */
     int first_picture;    /* true if decoding first picture */
     int interlaced;     /* true if interlaced */
     int bottom_field;   /* true if bottom field */
     int lossless;
     int ls;
     int progressive;
+    int bayer;          /* true if it's a bayer-encoded JPEG embedded in a DNG */
     int rgb;
     uint8_t upscale_h[4];
     uint8_t upscale_v[4];
@@ -98,12 +110,13 @@ typedef struct MJpegDecodeContext {
     int got_picture;                                ///< we found a SOF and picture is valid, too.
     int linesize[MAX_COMPONENTS];                   ///< linesize << interlaced
     int8_t *qscale_table;
-    DECLARE_ALIGNED(16, int16_t, block)[64];
+    DECLARE_ALIGNED(32, int16_t, block)[64];
     int16_t (*blocks[MAX_COMPONENTS])[64]; ///< intermediate sums (progressive mode)
     uint8_t *last_nnz[MAX_COMPONENTS];
     uint64_t coefs_finished[MAX_COMPONENTS]; ///< bitmask of which coefs have been completely decoded (progressive mode)
     int palette_index;
-    ScanTable scantable;
+    int force_pal8;
+    uint8_t permutated_scantable[64];
     BlockDSPContext bdsp;
     HpelDSPContext hdsp;
     IDCTDSPContext idsp;
@@ -114,6 +127,7 @@ typedef struct MJpegDecodeContext {
     int buggy_avid;
     int cs_itu601;
     int interlace_polarity;
+    int multiscope;
 
     int mjpb_skiptosod;
 
@@ -129,13 +143,40 @@ typedef struct MJpegDecodeContext {
     AVStereo3D *stereo3d; ///!< stereoscopic information (cached, since it is read before frame allocation)
 
     const AVPixFmtDescriptor *pix_desc;
+
+    ICCEntry *iccentries;
+    int iccnum;
+    int iccread;
+
+    AVFrame *smv_frame;
+    int smv_frames_per_jpeg;
+    int smv_next_frame;
+
+    // Raw stream data for hwaccel use.
+    const uint8_t *raw_image_buffer;
+    size_t         raw_image_buffer_size;
+    const uint8_t *raw_scan_buffer;
+    size_t         raw_scan_buffer_size;
+
+    uint8_t raw_huffman_lengths[2][4][16];
+    uint8_t raw_huffman_values[2][4][256];
+
+    enum AVPixelFormat hwaccel_sw_pix_fmt;
+    enum AVPixelFormat hwaccel_pix_fmt;
+    void *hwaccel_picture_private;
+    struct JLSState *jls_state;
 } MJpegDecodeContext;
 
+int ff_mjpeg_build_vlc(VLC *vlc, const uint8_t *bits_table,
+                       const uint8_t *val_table, int is_ac, void *logctx);
 int ff_mjpeg_decode_init(AVCodecContext *avctx);
 int ff_mjpeg_decode_end(AVCodecContext *avctx);
 int ff_mjpeg_decode_frame(AVCodecContext *avctx,
-                          void *data, int *got_frame,
+                          AVFrame *frame, int *got_frame,
                           AVPacket *avpkt);
+int ff_mjpeg_decode_frame_from_buf(AVCodecContext *avctx,
+                                   AVFrame *frame, int *got_frame,
+                                   const AVPacket *avpkt, const uint8_t *buf, int buf_size);
 int ff_mjpeg_decode_dqt(MJpegDecodeContext *s);
 int ff_mjpeg_decode_dht(MJpegDecodeContext *s);
 int ff_mjpeg_decode_sof(MJpegDecodeContext *s);

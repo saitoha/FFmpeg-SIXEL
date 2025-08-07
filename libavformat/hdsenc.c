@@ -20,19 +20,20 @@
  */
 
 #include "config.h"
-#include <float.h>
 #if HAVE_UNISTD_H
 #include <unistd.h>
 #endif
 
 #include "avformat.h"
 #include "internal.h"
+#include "mux.h"
 #include "os_support.h"
 
 #include "libavutil/avstring.h"
 #include "libavutil/base64.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mathematics.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 
 typedef struct Fragment {
@@ -92,19 +93,17 @@ static int parse_header(OutputStream *os, const uint8_t *buf, int buf_size)
             if (os->nb_extra_packets >= FF_ARRAY_ELEMS(os->extra_packets))
                 return AVERROR_INVALIDDATA;
             os->extra_packet_sizes[os->nb_extra_packets] = size;
-            os->extra_packets[os->nb_extra_packets] = av_malloc(size);
+            os->extra_packets[os->nb_extra_packets] = av_memdup(buf, size);
             if (!os->extra_packets[os->nb_extra_packets])
                 return AVERROR(ENOMEM);
-            memcpy(os->extra_packets[os->nb_extra_packets], buf, size);
             os->nb_extra_packets++;
         } else if (type == 0x12) {
             if (os->metadata)
                 return AVERROR_INVALIDDATA;
             os->metadata_size = size - 11 - 4;
-            os->metadata      = av_malloc(os->metadata_size);
+            os->metadata      = av_memdup(buf + 11, os->metadata_size);
             if (!os->metadata)
                 return AVERROR(ENOMEM);
-            memcpy(os->metadata, buf + 11, os->metadata_size);
         }
         buf      += size;
         buf_size -= size;
@@ -114,7 +113,7 @@ static int parse_header(OutputStream *os, const uint8_t *buf, int buf_size)
     return 0;
 }
 
-static int hds_write(void *opaque, uint8_t *buf, int buf_size)
+static int hds_write(void *opaque, const uint8_t *buf, int buf_size)
 {
     OutputStream *os = opaque;
     if (os->out) {
@@ -139,13 +138,13 @@ static void hds_free(AVFormatContext *s)
         return;
     for (i = 0; i < s->nb_streams; i++) {
         OutputStream *os = &c->streams[i];
-        avio_closep(&os->out);
+        if (os->out)
+            ff_format_io_close(s, &os->out);
         if (os->ctx && os->ctx_inited)
             av_write_trailer(os->ctx);
         if (os->ctx)
-            av_freep(&os->ctx->pb);
-        if (os->ctx)
-            avformat_free_context(os->ctx);
+            avio_context_free(&os->ctx->pb);
+        avformat_free_context(os->ctx);
         av_freep(&os->metadata);
         for (j = 0; j < os->nb_extra_packets; j++)
             av_freep(&os->extra_packets[j]);
@@ -162,22 +161,21 @@ static int write_manifest(AVFormatContext *s, int final)
     AVIOContext *out;
     char filename[1024], temp_filename[1024];
     int ret, i;
-    float duration = 0;
+    double duration = 0;
 
     if (c->nb_streams > 0)
         duration = c->streams[0].last_ts * av_q2d(s->streams[0]->time_base);
 
-    snprintf(filename, sizeof(filename), "%s/index.f4m", s->filename);
-    snprintf(temp_filename, sizeof(temp_filename), "%s/index.f4m.tmp", s->filename);
-    ret = avio_open2(&out, temp_filename, AVIO_FLAG_WRITE,
-                     &s->interrupt_callback, NULL);
+    snprintf(filename, sizeof(filename), "%s/index.f4m", s->url);
+    snprintf(temp_filename, sizeof(temp_filename), "%s/index.f4m.tmp", s->url);
+    ret = s->io_open(s, &out, temp_filename, AVIO_FLAG_WRITE, NULL);
     if (ret < 0) {
         av_log(s, AV_LOG_ERROR, "Unable to open %s for writing\n", temp_filename);
         return ret;
     }
     avio_printf(out, "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
     avio_printf(out, "<manifest xmlns=\"http://ns.adobe.com/f4m/1.0\">\n");
-    avio_printf(out, "\t<id>%s</id>\n", av_basename(s->filename));
+    avio_printf(out, "\t<id>%s</id>\n", av_basename(s->url));
     avio_printf(out, "\t<streamType>%s</streamType>\n",
                      final ? "recorded" : "live");
     avio_printf(out, "\t<deliveryType>streaming</deliveryType>\n");
@@ -188,7 +186,7 @@ static int write_manifest(AVFormatContext *s, int final)
         int b64_size = AV_BASE64_SIZE(os->metadata_size);
         char *base64 = av_malloc(b64_size);
         if (!base64) {
-            avio_close(out);
+            ff_format_io_close(s, &out);
             return AVERROR(ENOMEM);
         }
         av_base64_encode(base64, b64_size, os->metadata, os->metadata_size);
@@ -201,7 +199,7 @@ static int write_manifest(AVFormatContext *s, int final)
     }
     avio_printf(out, "</manifest>\n");
     avio_flush(out);
-    avio_close(out);
+    ff_format_io_close(s, &out);
     return ff_rename(temp_filename, filename, s);
 }
 
@@ -235,11 +233,10 @@ static int write_abst(AVFormatContext *s, OutputStream *os, int final)
         cur_media_time = os->fragments[os->nb_fragments - 1]->start_time;
 
     snprintf(filename, sizeof(filename),
-             "%s/stream%d.abst", s->filename, index);
+             "%s/stream%d.abst", s->url, index);
     snprintf(temp_filename, sizeof(temp_filename),
-             "%s/stream%d.abst.tmp", s->filename, index);
-    ret = avio_open2(&out, temp_filename, AVIO_FLAG_WRITE,
-                     &s->interrupt_callback, NULL);
+             "%s/stream%d.abst.tmp", s->url, index);
+    ret = s->io_open(s, &out, temp_filename, AVIO_FLAG_WRITE, NULL);
     if (ret < 0) {
         av_log(s, AV_LOG_ERROR, "Unable to open %s for writing\n", temp_filename);
         return ret;
@@ -282,15 +279,14 @@ static int write_abst(AVFormatContext *s, OutputStream *os, int final)
     }
     update_size(out, afrt_pos);
     update_size(out, 0);
-    avio_close(out);
+    ff_format_io_close(s, &out);
     return ff_rename(temp_filename, filename, s);
 }
 
 static int init_file(AVFormatContext *s, OutputStream *os, int64_t start_ts)
 {
     int ret, i;
-    ret = avio_open2(&os->out, os->temp_filename, AVIO_FLAG_WRITE,
-                     &s->interrupt_callback, NULL);
+    ret = s->io_open(s, &os->out, os->temp_filename, AVIO_FLAG_WRITE, NULL);
     if (ret < 0)
         return ret;
     avio_wb32(os->out, 0);
@@ -303,37 +299,34 @@ static int init_file(AVFormatContext *s, OutputStream *os, int64_t start_ts)
     return 0;
 }
 
-static void close_file(OutputStream *os)
+static void close_file(AVFormatContext *s, OutputStream *os)
 {
     int64_t pos = avio_tell(os->out);
     avio_seek(os->out, 0, SEEK_SET);
     avio_wb32(os->out, pos);
     avio_flush(os->out);
-    avio_closep(&os->out);
+    ff_format_io_close(s, &os->out);
 }
 
 static int hds_write_header(AVFormatContext *s)
 {
     HDSContext *c = s->priv_data;
+    const AVOutputFormat *oformat;
     int ret = 0, i;
-    AVOutputFormat *oformat;
 
-    if (mkdir(s->filename, 0777) == -1 && errno != EEXIST) {
-        ret = AVERROR(errno);
-        av_log(s, AV_LOG_ERROR , "Failed to create directory %s\n", s->filename);
-        goto fail;
+    if (mkdir(s->url, 0777) == -1 && errno != EEXIST) {
+        av_log(s, AV_LOG_ERROR , "Failed to create directory %s\n", s->url);
+        return AVERROR(errno);
     }
 
     oformat = av_guess_format("flv", NULL, NULL);
     if (!oformat) {
-        ret = AVERROR_MUXER_NOT_FOUND;
-        goto fail;
+        return AVERROR_MUXER_NOT_FOUND;
     }
 
-    c->streams = av_mallocz_array(s->nb_streams, sizeof(*c->streams));
+    c->streams = av_calloc(s->nb_streams, sizeof(*c->streams));
     if (!c->streams) {
-        ret = AVERROR(ENOMEM);
-        goto fail;
+        return AVERROR(ENOMEM);
     }
 
     for (i = 0; i < s->nb_streams; i++) {
@@ -341,18 +334,17 @@ static int hds_write_header(AVFormatContext *s)
         AVFormatContext *ctx;
         AVStream *st = s->streams[i];
 
-        if (!st->codec->bit_rate) {
+        if (!st->codecpar->bit_rate) {
             av_log(s, AV_LOG_ERROR, "No bit rate set for stream %d\n", i);
-            ret = AVERROR(EINVAL);
-            goto fail;
+            return AVERROR(EINVAL);
         }
-        if (st->codec->codec_type == AVMEDIA_TYPE_VIDEO) {
+        if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
             if (os->has_video) {
                 c->nb_streams++;
                 os++;
             }
             os->has_video = 1;
-        } else if (st->codec->codec_type == AVMEDIA_TYPE_AUDIO) {
+        } else if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
             if (os->has_audio) {
                 c->nb_streams++;
                 os++;
@@ -360,28 +352,26 @@ static int hds_write_header(AVFormatContext *s)
             os->has_audio = 1;
         } else {
             av_log(s, AV_LOG_ERROR, "Unsupported stream type in stream %d\n", i);
-            ret = AVERROR(EINVAL);
-            goto fail;
+            return AVERROR(EINVAL);
         }
-        os->bitrate += s->streams[i]->codec->bit_rate;
+        os->bitrate += s->streams[i]->codecpar->bit_rate;
 
         if (!os->ctx) {
             os->first_stream = i;
             ctx = avformat_alloc_context();
             if (!ctx) {
-                ret = AVERROR(ENOMEM);
-                goto fail;
+                return AVERROR(ENOMEM);
             }
             os->ctx = ctx;
             ctx->oformat = oformat;
             ctx->interrupt_callback = s->interrupt_callback;
+            ctx->flags = s->flags;
 
             ctx->pb = avio_alloc_context(os->iobuf, sizeof(os->iobuf),
-                                         AVIO_FLAG_WRITE, os,
+                                         1, os,
                                          NULL, hds_write, NULL);
             if (!ctx->pb) {
-                ret = AVERROR(ENOMEM);
-                goto fail;
+                return AVERROR(ENOMEM);
             }
         } else {
             ctx = os->ctx;
@@ -389,11 +379,10 @@ static int hds_write_header(AVFormatContext *s)
         s->streams[i]->id = c->nb_streams;
 
         if (!(st = avformat_new_stream(ctx, NULL))) {
-            ret = AVERROR(ENOMEM);
-            goto fail;
+            return AVERROR(ENOMEM);
         }
-        avcodec_copy_context(st->codec, s->streams[i]->codec);
-        st->codec->codec_tag = 0;
+        avcodec_parameters_copy(st->codecpar, s->streams[i]->codecpar);
+        st->codecpar->codec_tag = 0;
         st->sample_aspect_ratio = s->streams[i]->sample_aspect_ratio;
         st->time_base = s->streams[i]->time_base;
     }
@@ -404,7 +393,7 @@ static int hds_write_header(AVFormatContext *s)
         OutputStream *os = &c->streams[i];
         int j;
         if ((ret = avformat_write_header(os->ctx, NULL)) < 0) {
-             goto fail;
+             return ret;
         }
         os->ctx_inited = 1;
         avio_flush(os->ctx->pb);
@@ -412,24 +401,20 @@ static int hds_write_header(AVFormatContext *s)
             s->streams[os->first_stream + j]->time_base = os->ctx->streams[j]->time_base;
 
         snprintf(os->temp_filename, sizeof(os->temp_filename),
-                 "%s/stream%d_temp", s->filename, i);
+                 "%s/stream%d_temp", s->url, i);
         ret = init_file(s, os, 0);
         if (ret < 0)
-            goto fail;
+            return ret;
 
         if (!os->has_video && c->min_frag_duration <= 0) {
             av_log(s, AV_LOG_WARNING,
                    "No video stream in output stream %d and no min frag duration set\n", i);
-            ret = AVERROR(EINVAL);
         }
         os->fragment_index = 1;
         write_abst(s, os, 0);
     }
     ret = write_manifest(s, 0);
 
-fail:
-    if (ret)
-        hds_free(s);
     return ret;
 }
 
@@ -474,10 +459,10 @@ static int hds_flush(AVFormatContext *s, OutputStream *os, int final,
 
     avio_flush(os->ctx->pb);
     os->packets_written = 0;
-    close_file(os);
+    close_file(s, os);
 
     snprintf(target_filename, sizeof(target_filename),
-             "%s/stream%dSeg1-Frag%d", s->filename, index, os->fragment_index);
+             "%s/stream%dSeg1-Frag%d", s->url, index, os->fragment_index);
     ret = ff_rename(os->temp_filename, target_filename, s);
     if (ret < 0)
         return ret;
@@ -513,15 +498,16 @@ static int hds_write_packet(AVFormatContext *s, AVPacket *pkt)
 {
     HDSContext *c = s->priv_data;
     AVStream *st = s->streams[pkt->stream_index];
+    FFStream *const sti = ffstream(st);
     OutputStream *os = &c->streams[s->streams[pkt->stream_index]->id];
     int64_t end_dts = os->fragment_index * (int64_t)c->min_frag_duration;
     int ret;
 
-    if (st->first_dts == AV_NOPTS_VALUE)
-        st->first_dts = pkt->dts;
+    if (sti->first_dts == AV_NOPTS_VALUE)
+        sti->first_dts = pkt->dts;
 
-    if ((!os->has_video || st->codec->codec_type == AVMEDIA_TYPE_VIDEO) &&
-        av_compare_ts(pkt->dts - st->first_dts, st->time_base,
+    if ((!os->has_video || st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) &&
+        av_compare_ts(pkt->dts - sti->first_dts, st->time_base,
                       end_dts, AV_TIME_BASE_Q) >= 0 &&
         pkt->flags & AV_PKT_FLAG_KEY && os->packets_written) {
 
@@ -550,16 +536,15 @@ static int hds_write_trailer(AVFormatContext *s)
 
     if (c->remove_at_exit) {
         char filename[1024];
-        snprintf(filename, sizeof(filename), "%s/index.f4m", s->filename);
+        snprintf(filename, sizeof(filename), "%s/index.f4m", s->url);
         unlink(filename);
         for (i = 0; i < c->nb_streams; i++) {
-            snprintf(filename, sizeof(filename), "%s/stream%d.abst", s->filename, i);
+            snprintf(filename, sizeof(filename), "%s/stream%d.abst", s->url, i);
             unlink(filename);
         }
-        rmdir(s->filename);
+        rmdir(s->url);
     }
 
-    hds_free(s);
     return 0;
 }
 
@@ -569,7 +554,7 @@ static const AVOption options[] = {
     { "window_size", "number of fragments kept in the manifest", OFFSET(window_size), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, E },
     { "extra_window_size", "number of fragments kept outside of the manifest before removing from disk", OFFSET(extra_window_size), AV_OPT_TYPE_INT, { .i64 = 5 }, 0, INT_MAX, E },
     { "min_frag_duration", "minimum fragment duration (in microseconds)", OFFSET(min_frag_duration), AV_OPT_TYPE_INT64, { .i64 = 10000000 }, 0, INT_MAX, E },
-    { "remove_at_exit", "remove all fragments when finished", OFFSET(remove_at_exit), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1, E },
+    { "remove_at_exit", "remove all fragments when finished", OFFSET(remove_at_exit), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, E },
     { NULL },
 };
 
@@ -580,15 +565,16 @@ static const AVClass hds_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-AVOutputFormat ff_hds_muxer = {
-    .name           = "hds",
-    .long_name      = NULL_IF_CONFIG_SMALL("HDS Muxer"),
+const FFOutputFormat ff_hds_muxer = {
+    .p.name         = "hds",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("HDS Muxer"),
+    .p.audio_codec  = AV_CODEC_ID_AAC,
+    .p.video_codec  = AV_CODEC_ID_H264,
+    .p.flags        = AVFMT_GLOBALHEADER | AVFMT_NOFILE,
+    .p.priv_class   = &hds_class,
     .priv_data_size = sizeof(HDSContext),
-    .audio_codec    = AV_CODEC_ID_AAC,
-    .video_codec    = AV_CODEC_ID_H264,
-    .flags          = AVFMT_GLOBALHEADER | AVFMT_NOFILE,
     .write_header   = hds_write_header,
     .write_packet   = hds_write_packet,
     .write_trailer  = hds_write_trailer,
-    .priv_class     = &hds_class,
+    .deinit         = hds_free,
 };

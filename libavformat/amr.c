@@ -1,6 +1,6 @@
 /*
  * amr file format
- * Copyright (c) 2001 ffmpeg project
+ * Copyright (c) 2001 FFmpeg project
  *
  * This file is part of FFmpeg.
  *
@@ -21,54 +21,42 @@
 
 /*
 Write and read amr data according to RFC3267, http://www.ietf.org/rfc/rfc3267.txt?number=3267
-
-Only mono files are supported.
-
 */
 
-#include "libavutil/channel_layout.h"
-#include "avformat.h"
-#include "internal.h"
+#include "config_components.h"
 
-typedef struct {
-    uint64_t cumulated_size;
-    uint64_t block_count;
+#include "libavutil/channel_layout.h"
+#include "libavutil/intreadwrite.h"
+#include "avformat.h"
+#include "avio_internal.h"
+#include "demux.h"
+#include "internal.h"
+#include "mux.h"
+#include "rawdec.h"
+#include "rawenc.h"
+
+typedef struct AMRContext {
+    FFRawDemuxerContext rawctx;
 } AMRContext;
 
-static const char AMR_header[]   = "#!AMR\n";
-static const char AMRWB_header[] = "#!AMR-WB\n";
+static const uint8_t AMR_header[6]      = "#!AMR\x0a";
+static const uint8_t AMRMC_header[12]   = "#!AMR_MC1.0\x0a";
+static const uint8_t AMRWB_header[9]    = "#!AMR-WB\x0a";
+static const uint8_t AMRWBMC_header[15] = "#!AMR-WB_MC1.0\x0a";
 
-#if CONFIG_AMR_MUXER
-static int amr_write_header(AVFormatContext *s)
-{
-    AVIOContext    *pb  = s->pb;
-    AVCodecContext *enc = s->streams[0]->codec;
+static const uint8_t amrnb_packed_size[16] = {
+    13, 14, 16, 18, 20, 21, 27, 32, 6, 1, 1, 1, 1, 1, 1, 1
+};
+static const uint8_t amrwb_packed_size[16] = {
+    18, 24, 33, 37, 41, 47, 51, 59, 61, 6, 1, 1, 1, 1, 1, 1
+};
 
-    s->priv_data = NULL;
-
-    if (enc->codec_id == AV_CODEC_ID_AMR_NB) {
-        avio_write(pb, AMR_header,   sizeof(AMR_header)   - 1); /* magic number */
-    } else if (enc->codec_id == AV_CODEC_ID_AMR_WB) {
-        avio_write(pb, AMRWB_header, sizeof(AMRWB_header) - 1); /* magic number */
-    } else {
-        return -1;
-    }
-    avio_flush(pb);
-    return 0;
-}
-
-static int amr_write_packet(AVFormatContext *s, AVPacket *pkt)
-{
-    avio_write(s->pb, pkt->data, pkt->size);
-    return 0;
-}
-#endif /* CONFIG_AMR_MUXER */
-
-static int amr_probe(AVProbeData *p)
+#if CONFIG_AMR_DEMUXER
+static int amr_probe(const AVProbeData *p)
 {
     // Only check for "#!AMR" which could be amr-wb, amr-nb.
     // This will also trigger multichannel files: "#!AMR_MC1.0\n" and
-    // "#!AMR-WB_MC1.0\n" (not supported)
+    // "#!AMR-WB_MC1.0\n"
 
     if (!memcmp(p->buf, AMR_header, 5))
         return AVPROBE_SCORE_MAX;
@@ -81,109 +69,214 @@ static int amr_read_header(AVFormatContext *s)
 {
     AVIOContext *pb = s->pb;
     AVStream *st;
-    uint8_t header[9];
+    uint8_t header[19] = { 0 };
+    int read, back = 0, ret;
 
-    avio_read(pb, header, 6);
+    ret = ffio_ensure_seekback(s->pb, sizeof(header));
+    if (ret < 0)
+        return ret;
+
+    read = avio_read(pb, header, sizeof(header));
+    if (read < 0)
+        return read;
 
     st = avformat_new_stream(s, NULL);
     if (!st)
         return AVERROR(ENOMEM);
-    if (memcmp(header, AMR_header, 6)) {
-        avio_read(pb, header + 6, 3);
-        if (memcmp(header, AMRWB_header, 9)) {
-            return -1;
-        }
-
-        st->codec->codec_tag   = MKTAG('s', 'a', 'w', 'b');
-        st->codec->codec_id    = AV_CODEC_ID_AMR_WB;
-        st->codec->sample_rate = 16000;
+    if (!memcmp(header, AMR_header, sizeof(AMR_header))) {
+        st->codecpar->codec_tag   = MKTAG('s', 'a', 'm', 'r');
+        st->codecpar->codec_id    = AV_CODEC_ID_AMR_NB;
+        st->codecpar->sample_rate = 8000;
+        st->codecpar->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
+        back = read - sizeof(AMR_header);
+    } else if (!memcmp(header, AMRWB_header, sizeof(AMRWB_header))) {
+        st->codecpar->codec_tag   = MKTAG('s', 'a', 'w', 'b');
+        st->codecpar->codec_id    = AV_CODEC_ID_AMR_WB;
+        st->codecpar->sample_rate = 16000;
+        st->codecpar->ch_layout      = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
+        back = read - sizeof(AMRWB_header);
+    } else if (!memcmp(header, AMRMC_header, sizeof(AMRMC_header))) {
+        st->codecpar->codec_tag   = MKTAG('s', 'a', 'm', 'r');
+        st->codecpar->codec_id    = AV_CODEC_ID_AMR_NB;
+        st->codecpar->sample_rate = 8000;
+        st->codecpar->ch_layout.nb_channels = AV_RL32(header + 12);
+        back = read - 4 - sizeof(AMRMC_header);
+    } else if (!memcmp(header, AMRWBMC_header, sizeof(AMRWBMC_header))) {
+        st->codecpar->codec_tag   = MKTAG('s', 'a', 'w', 'b');
+        st->codecpar->codec_id    = AV_CODEC_ID_AMR_WB;
+        st->codecpar->sample_rate = 16000;
+        st->codecpar->ch_layout.nb_channels = AV_RL32(header + 15);
+        back = read - 4 - sizeof(AMRWBMC_header);
     } else {
-        st->codec->codec_tag   = MKTAG('s', 'a', 'm', 'r');
-        st->codec->codec_id    = AV_CODEC_ID_AMR_NB;
-        st->codec->sample_rate = 8000;
+        return AVERROR_INVALIDDATA;
     }
-    st->codec->channels   = 1;
-    st->codec->channel_layout = AV_CH_LAYOUT_MONO;
-    st->codec->codec_type = AVMEDIA_TYPE_AUDIO;
-    avpriv_set_pts_info(st, 64, 1, st->codec->sample_rate);
+
+    if (st->codecpar->ch_layout.nb_channels < 1)
+        return AVERROR_INVALIDDATA;
+
+    st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
+    ffstream(st)->need_parsing = AVSTREAM_PARSE_FULL_RAW;
+    avpriv_set_pts_info(st, 64, 1, st->codecpar->sample_rate);
+
+    if (back > 0)
+        avio_seek(pb, -back, SEEK_CUR);
 
     return 0;
 }
 
-static int amr_read_packet(AVFormatContext *s, AVPacket *pkt)
-{
-    AVCodecContext *enc = s->streams[0]->codec;
-    int read, size = 0, toc, mode;
-    int64_t pos = avio_tell(s->pb);
-    AMRContext *amr = s->priv_data;
-
-    if (avio_feof(s->pb)) {
-        return AVERROR(EIO);
-    }
-
-    // FIXME this is wrong, this should rather be in a AVParser
-    toc  = avio_r8(s->pb);
-    mode = (toc >> 3) & 0x0F;
-
-    if (enc->codec_id == AV_CODEC_ID_AMR_NB) {
-        static const uint8_t packed_size[16] = {
-            12, 13, 15, 17, 19, 20, 26, 31, 5, 0, 0, 0, 0, 0, 0, 0
-        };
-
-        size = packed_size[mode] + 1;
-    } else if (enc->codec_id == AV_CODEC_ID_AMR_WB) {
-        static const uint8_t packed_size[16] = {
-            18, 24, 33, 37, 41, 47, 51, 59, 61, 6, 6, 0, 0, 0, 1, 1
-        };
-
-        size = packed_size[mode];
-    }
-
-    if (!size || av_new_packet(pkt, size))
-        return AVERROR(EIO);
-
-    if (amr->cumulated_size < UINT64_MAX - size) {
-        amr->cumulated_size += size;
-        /* Both AMR formats have 50 frames per second */
-        s->streams[0]->codec->bit_rate = amr->cumulated_size / ++amr->block_count * 8 * 50;
-    }
-
-    pkt->stream_index = 0;
-    pkt->pos          = pos;
-    pkt->data[0]      = toc;
-    pkt->duration     = enc->codec_id == AV_CODEC_ID_AMR_NB ? 160 : 320;
-    read              = avio_read(s->pb, pkt->data + 1, size - 1);
-
-    if (read != size - 1) {
-        av_free_packet(pkt);
-        return AVERROR(EIO);
-    }
-
-    return 0;
-}
-
-#if CONFIG_AMR_DEMUXER
-AVInputFormat ff_amr_demuxer = {
-    .name           = "amr",
-    .long_name      = NULL_IF_CONFIG_SMALL("3GPP AMR"),
+const FFInputFormat ff_amr_demuxer = {
+    .p.name         = "amr",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("3GPP AMR"),
+    .p.flags        = AVFMT_GENERIC_INDEX,
+    .p.priv_class   = &ff_raw_demuxer_class,
     .priv_data_size = sizeof(AMRContext),
     .read_probe     = amr_probe,
     .read_header    = amr_read_header,
-    .read_packet    = amr_read_packet,
-    .flags          = AVFMT_GENERIC_INDEX,
+    .read_packet    = ff_raw_read_partial_packet,
+};
+#endif
+
+#if CONFIG_AMRNB_DEMUXER
+static int amrnb_probe(const AVProbeData *p)
+{
+    int mode, i = 0, valid = 0, invalid = 0;
+    const uint8_t *b = p->buf;
+
+    while (i < p->buf_size) {
+        mode = b[i] >> 3 & 0x0F;
+        if (mode < 9 && (b[i] & 0x4) == 0x4) {
+            int last = b[i];
+            int size = amrnb_packed_size[mode];
+            while (size--) {
+                if (b[++i] != last)
+                    break;
+            }
+            if (size > 0) {
+                valid++;
+                i += size;
+            }
+        } else {
+            valid = 0;
+            invalid++;
+            i++;
+        }
+    }
+    if (valid > 100 && valid >> 4 > invalid)
+        return AVPROBE_SCORE_EXTENSION / 2 + 1;
+    return 0;
+}
+
+static int amrnb_read_header(AVFormatContext *s)
+{
+    AVStream *st = avformat_new_stream(s, NULL);
+    if (!st)
+        return AVERROR(ENOMEM);
+    st->codecpar->codec_id       = AV_CODEC_ID_AMR_NB;
+    st->codecpar->sample_rate    = 8000;
+    st->codecpar->ch_layout      = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
+    st->codecpar->codec_type     = AVMEDIA_TYPE_AUDIO;
+    ffstream(st)->need_parsing   = AVSTREAM_PARSE_FULL_RAW;
+    avpriv_set_pts_info(st, 64, 1, 8000);
+
+    return 0;
+}
+
+const FFInputFormat ff_amrnb_demuxer = {
+    .p.name         = "amrnb",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("raw AMR-NB"),
+    .p.flags        = AVFMT_GENERIC_INDEX,
+    .p.priv_class   = &ff_raw_demuxer_class,
+    .priv_data_size = sizeof(AMRContext),
+    .read_probe     = amrnb_probe,
+    .read_header    = amrnb_read_header,
+    .read_packet    = ff_raw_read_partial_packet,
+};
+#endif
+
+#if CONFIG_AMRWB_DEMUXER
+static int amrwb_probe(const AVProbeData *p)
+{
+    int mode, i = 0, valid = 0, invalid = 0;
+    const uint8_t *b = p->buf;
+
+    while (i < p->buf_size) {
+        mode = b[i] >> 3 & 0x0F;
+        if (mode < 10 && (b[i] & 0x4) == 0x4) {
+            int last = b[i];
+            int size = amrwb_packed_size[mode];
+            while (size--) {
+                if (b[++i] != last)
+                    break;
+            }
+            if (size > 0) {
+                valid++;
+                i += size;
+            }
+        } else {
+            valid = 0;
+            invalid++;
+            i++;
+        }
+    }
+    if (valid > 100 && valid >> 4 > invalid)
+        return AVPROBE_SCORE_EXTENSION / 2 + 1;
+    return 0;
+}
+
+static int amrwb_read_header(AVFormatContext *s)
+{
+    AVStream *st = avformat_new_stream(s, NULL);
+    if (!st)
+        return AVERROR(ENOMEM);
+    st->codecpar->codec_id       = AV_CODEC_ID_AMR_WB;
+    st->codecpar->sample_rate    = 16000;
+    st->codecpar->ch_layout      = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
+    st->codecpar->codec_type     = AVMEDIA_TYPE_AUDIO;
+    ffstream(st)->need_parsing   = AVSTREAM_PARSE_FULL_RAW;
+    avpriv_set_pts_info(st, 64, 1, 16000);
+
+    return 0;
+}
+
+const FFInputFormat ff_amrwb_demuxer = {
+    .p.name         = "amrwb",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("raw AMR-WB"),
+    .p.flags        = AVFMT_GENERIC_INDEX,
+    .p.priv_class   = &ff_raw_demuxer_class,
+    .priv_data_size = sizeof(AMRContext),
+    .read_probe     = amrwb_probe,
+    .read_header    = amrwb_read_header,
+    .read_packet    = ff_raw_read_partial_packet,
 };
 #endif
 
 #if CONFIG_AMR_MUXER
-AVOutputFormat ff_amr_muxer = {
-    .name              = "amr",
-    .long_name         = NULL_IF_CONFIG_SMALL("3GPP AMR"),
-    .mime_type         = "audio/amr",
-    .extensions        = "amr",
-    .audio_codec       = AV_CODEC_ID_AMR_NB,
-    .video_codec       = AV_CODEC_ID_NONE,
+static int amr_write_header(AVFormatContext *s)
+{
+    AVIOContext    *pb  = s->pb;
+    AVCodecParameters *par = s->streams[0]->codecpar;
+
+    if (par->codec_id == AV_CODEC_ID_AMR_NB) {
+        avio_write(pb, AMR_header,   sizeof(AMR_header));   /* magic number */
+    } else if (par->codec_id == AV_CODEC_ID_AMR_WB) {
+        avio_write(pb, AMRWB_header, sizeof(AMRWB_header)); /* magic number */
+    } else {
+        return -1;
+    }
+    return 0;
+}
+
+const FFOutputFormat ff_amr_muxer = {
+    .p.name            = "amr",
+    .p.long_name       = NULL_IF_CONFIG_SMALL("3GPP AMR"),
+    .p.mime_type       = "audio/amr",
+    .p.extensions      = "amr",
+    .p.audio_codec     = AV_CODEC_ID_AMR_NB,
+    .p.video_codec     = AV_CODEC_ID_NONE,
+    .p.subtitle_codec  = AV_CODEC_ID_NONE,
+    .p.flags           = AVFMT_NOTIMESTAMPS,
+    .flags_internal    = FF_OFMT_FLAG_MAX_ONE_OF_EACH,
     .write_header      = amr_write_header,
-    .write_packet      = amr_write_packet,
-    .flags             = AVFMT_NOTIMESTAMPS,
+    .write_packet      = ff_raw_write_packet,
 };
 #endif

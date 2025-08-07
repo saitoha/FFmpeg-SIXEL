@@ -18,19 +18,165 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/emms.h"
 #include "libavutil/intmath.h"
 #include "libavutil/log.h"
-#include "libavutil/opt.h"
+#include "libavutil/mem.h"
 #include "avcodec.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include "snow_dwt.h"
-#include "internal.h"
 #include "snow.h"
 
 #include "rangecoder.h"
 #include "mathops.h"
 
-#include "mpegvideo.h"
-#include "h263.h"
+static inline int get_symbol(RangeCoder *c, uint8_t *state, int is_signed)
+{
+    if (get_rac(c, state + 0))
+        return 0;
+    else {
+        int e;
+        unsigned a;
+        e = 0;
+        while (get_rac(c, state + 1 + FFMIN(e, 9))) { //1..10
+            e++;
+            if (e > 31)
+                return AVERROR_INVALIDDATA;
+        }
+
+        a = 1;
+        for (int i = e - 1; i >= 0; i--)
+            a += a + get_rac(c, state + 22 + FFMIN(i, 9)); //22..31
+
+        e = -(is_signed && get_rac(c, state + 11 + FFMIN(e, 10))); //11..21
+        return (a ^ e) - e;
+    }
+}
+
+static inline int get_symbol2(RangeCoder *c, uint8_t *state, int log2)
+{
+    int r = log2 >= 0 ? 1 << log2 : 1;
+    int v = 0;
+
+    av_assert2(log2 >= -4);
+
+    while (log2 < 28 && get_rac(c, state + 4 + log2)) {
+        v += r;
+        log2++;
+        if (log2 > 0) r += r;
+    }
+
+    for (int i = log2 - 1; i >= 0; i--)
+        v += get_rac(c, state + 31 - i) << i;
+
+    return v;
+}
+
+static void unpack_coeffs(SnowContext *s, SubBand *b, SubBand * parent, int orientation)
+{
+    const int w = b->width;
+    const int h = b->height;
+
+    int run, runs;
+    x_and_coeff *xc = b->x_coeff;
+    x_and_coeff *prev_xc = NULL;
+    x_and_coeff *prev2_xc = xc;
+    x_and_coeff *parent_xc = parent ? parent->x_coeff : NULL;
+    x_and_coeff *prev_parent_xc = parent_xc;
+
+    runs = get_symbol2(&s->c, b->state[30], 0);
+    if (runs-- > 0) run = get_symbol2(&s->c, b->state[1], 3);
+    else            run = INT_MAX;
+
+    for (int y = 0; y < h; y++) {
+        int v = 0;
+        int lt = 0, t = 0, rt = 0;
+
+        if (y && prev_xc->x == 0)
+            rt = prev_xc->coeff;
+
+        for (int x = 0; x < w; x++) {
+            int p = 0;
+            const int l = v;
+
+            lt= t; t= rt;
+
+            if (y) {
+                if (prev_xc->x <= x)
+                    prev_xc++;
+                if (prev_xc->x == x + 1)
+                    rt = prev_xc->coeff;
+                else
+                    rt = 0;
+            }
+            if (parent_xc) {
+                if (x>>1 > parent_xc->x)
+                    parent_xc++;
+                if (x>>1 == parent_xc->x)
+                    p = parent_xc->coeff;
+            }
+            if (/*ll|*/l|lt|t|rt|p) {
+                int context = av_log2(/*FFABS(ll) + */3*(l>>1) + (lt>>1) + (t&~1) + (rt>>1) + (p>>1));
+
+                v = get_rac(&s->c, &b->state[0][context]);
+                if (v) {
+                    v  = 2*(get_symbol2(&s->c, b->state[context + 2], context-4) + 1);
+                    v += get_rac(&s->c, &b->state[0][16 + 1 + 3 + ff_quant3bA[l&0xFF] + 3 * ff_quant3bA[t&0xFF]]);
+                    if ((uint16_t)v != v) {
+                        av_log(s->avctx, AV_LOG_ERROR, "Coefficient damaged\n");
+                        v = 1;
+                    }
+                    xc->x = x;
+                    (xc++)->coeff = v;
+                }
+            } else {
+                if (!run) {
+                    if (runs-- > 0) run = get_symbol2(&s->c, b->state[1], 3);
+                    else            run = INT_MAX;
+                    v  = 2 * (get_symbol2(&s->c, b->state[0 + 2], 0-4) + 1);
+                    v += get_rac(&s->c, &b->state[0][16 + 1 + 3]);
+                    if ((uint16_t)v != v) {
+                        av_log(s->avctx, AV_LOG_ERROR, "Coefficient damaged\n");
+                        v = 1;
+                    }
+
+                    xc->x = x;
+                    (xc++)->coeff = v;
+                } else {
+                    int max_run;
+                    run--;
+                    v = 0;
+                    av_assert2(run >= 0);
+                    if (y) max_run = FFMIN(run, prev_xc->x - x - 2);
+                    else   max_run = FFMIN(run, w-x-1);
+                    if (parent_xc)
+                        max_run = FFMIN(max_run, 2*parent_xc->x - x - 1);
+                    av_assert2(max_run >= 0 && max_run <= run);
+
+                    x   += max_run;
+                    run -= max_run;
+                }
+            }
+        }
+        (xc++)->x = w+1; //end marker
+        prev_xc  = prev2_xc;
+        prev2_xc = xc;
+
+        if (parent_xc) {
+            if (y & 1) {
+                while (parent_xc->x != parent->width+1)
+                    parent_xc++;
+                parent_xc++;
+                prev_parent_xc= parent_xc;
+            } else {
+                parent_xc= prev_parent_xc;
+            }
+        }
+    }
+
+    (xc++)->x = w + 1; //end marker
+}
 
 static av_always_inline void predict_slice_buffered(SnowContext *s, slice_buffer * sb, IDWTELEM * old_buffer, int plane_index, int add, int mb_y){
     Plane *p= &s->plane[plane_index];
@@ -104,8 +250,11 @@ static av_always_inline void predict_slice_buffered(SnowContext *s, slice_buffer
             avmv->h = block_h;
             avmv->dst_x = block_w*mb_x - block_w/2;
             avmv->dst_y = block_h*mb_y - block_h/2;
-            avmv->src_x = avmv->dst_x + (bn->mx * s->mv_scale)/8;
-            avmv->src_y = avmv->dst_y + (bn->my * s->mv_scale)/8;
+            avmv->motion_scale = 8;
+            avmv->motion_x = bn->mx * s->mv_scale;
+            avmv->motion_y = bn->my * s->mv_scale;
+            avmv->src_x = avmv->dst_x + avmv->motion_x / 8;
+            avmv->src_y = avmv->dst_y + avmv->motion_y / 8;
             avmv->source= -1 - bn->ref;
             avmv->flags = 0;
         }
@@ -114,7 +263,7 @@ static av_always_inline void predict_slice_buffered(SnowContext *s, slice_buffer
 static inline void decode_subband_slice_buffered(SnowContext *s, SubBand *b, slice_buffer * sb, int start_y, int h, int save_state[1]){
     const int w= b->width;
     int y;
-    const int qlog= av_clip(s->qlog + b->qlog, 0, QROOT*16);
+    const int qlog= av_clip(s->qlog + (int64_t)b->qlog, 0, QROOT*16);
     int qmul= ff_qexp[qlog&(QROOT-1)]<<(qlog>>QSHIFT);
     int qadd= (s->qbias*qmul)>>QBIAS_SHIFT;
     int new_index = 0;
@@ -137,7 +286,7 @@ static inline void decode_subband_slice_buffered(SnowContext *s, SubBand *b, sli
         v = b->x_coeff[new_index].coeff;
         x = b->x_coeff[new_index++].x;
         while(x < w){
-            register int t= ( (v>>1)*qmul + qadd)>>QEXPSHIFT;
+            register int t= (int)( (v>>1)*(unsigned)qmul + qadd)>>QEXPSHIFT;
             register int u= -(v&1);
             line[x] = (t^u) - u;
 
@@ -180,13 +329,22 @@ static int decode_q_branch(SnowContext *s, int level, int x, int y){
         int my_context= av_log2(2*FFABS(left->my - top->my)) + 0*av_log2(2*FFABS(tr->my - top->my));
 
         type= get_rac(&s->c, &s->block_state[1 + left->type + top->type]) ? BLOCK_INTRA : 0;
-
         if(type){
+            int ld, cbd, crd;
             pred_mv(s, &mx, &my, 0, left, top, tr);
-            l += get_symbol(&s->c, &s->block_state[32], 1);
+            ld = get_symbol(&s->c, &s->block_state[32], 1);
+            if (ld < -255 || ld > 255) {
+                return AVERROR_INVALIDDATA;
+            }
+            l += ld;
             if (s->nb_planes > 2) {
-                cb+= get_symbol(&s->c, &s->block_state[64], 1);
-                cr+= get_symbol(&s->c, &s->block_state[96], 1);
+                cbd = get_symbol(&s->c, &s->block_state[64], 1);
+                crd = get_symbol(&s->c, &s->block_state[96], 1);
+                if (cbd < -255 || cbd > 255 || crd < -255 || crd > 255) {
+                    return AVERROR_INVALIDDATA;
+                }
+                cb += cbd;
+                cr += crd;
             }
         }else{
             if(s->ref_frames > 1)
@@ -196,8 +354,8 @@ static int decode_q_branch(SnowContext *s, int level, int x, int y){
                 return AVERROR_INVALIDDATA;
             }
             pred_mv(s, &mx, &my, ref, left, top, tr);
-            mx+= get_symbol(&s->c, &s->block_state[128 + 32*(mx_context + 16*!!ref)], 1);
-            my+= get_symbol(&s->c, &s->block_state[128 + 32*(my_context + 16*!!ref)], 1);
+            mx+= (unsigned)get_symbol(&s->c, &s->block_state[128 + 32*(mx_context + 16*!!ref)], 1);
+            my+= (unsigned)get_symbol(&s->c, &s->block_state[128 + 32*(my_context + 16*!!ref)], 1);
         }
         set_blocks(s, level, x, y, l, cb, cr, mx, my, ref, type);
     }else{
@@ -212,7 +370,7 @@ static int decode_q_branch(SnowContext *s, int level, int x, int y){
 
 static void dequantize_slice_buffered(SnowContext *s, slice_buffer * sb, SubBand *b, IDWTELEM *src, int stride, int start_y, int end_y){
     const int w= b->width;
-    const int qlog= av_clip(s->qlog + b->qlog, 0, QROOT*16);
+    const int qlog= av_clip(s->qlog + (int64_t)b->qlog, 0, QROOT*16);
     const int qmul= ff_qexp[qlog&(QROOT-1)]<<(qlog>>QSHIFT);
     const int qadd= (s->qbias*qmul)>>QBIAS_SHIFT;
     int x,y;
@@ -225,9 +383,9 @@ static void dequantize_slice_buffered(SnowContext *s, slice_buffer * sb, SubBand
         for(x=0; x<w; x++){
             int i= line[x];
             if(i<0){
-                line[x]= -((-i*qmul + qadd)>>(QEXPSHIFT)); //FIXME try different bias
+                line[x]= -((-i*(unsigned)qmul + qadd)>>(QEXPSHIFT)); //FIXME try different bias
             }else if(i>0){
-                line[x]=  (( i*qmul + qadd)>>(QEXPSHIFT));
+                line[x]=  (( i*(unsigned)qmul + qadd)>>(QEXPSHIFT));
             }
         }
     }
@@ -323,14 +481,16 @@ static int decode_header(SnowContext *s){
             }else if(s->chroma_h_shift == 2 && s->chroma_v_shift==2){
                 s->avctx->pix_fmt= AV_PIX_FMT_YUV410P;
             } else {
-                av_log(s, AV_LOG_ERROR, "unsupported color subsample mode %d %d\n", s->chroma_h_shift, s->chroma_v_shift);
+                av_log(s->avctx, AV_LOG_ERROR,
+                       "unsupported color subsample mode %d %d\n",
+                       s->chroma_h_shift, s->chroma_v_shift);
                 s->chroma_h_shift = s->chroma_v_shift = 1;
                 s->avctx->pix_fmt= AV_PIX_FMT_YUV420P;
                 return AVERROR_INVALIDDATA;
             }
             s->nb_planes = 3;
         } else {
-            av_log(s, AV_LOG_ERROR, "unsupported color space\n");
+            av_log(s->avctx, AV_LOG_ERROR, "unsupported color space\n");
             s->chroma_h_shift = s->chroma_v_shift = 1;
             s->avctx->pix_fmt= AV_PIX_FMT_YUV420P;
             return AVERROR_INVALIDDATA;
@@ -351,12 +511,16 @@ static int decode_header(SnowContext *s){
                 int htaps, i, sum=0;
                 Plane *p= &s->plane[plane_index];
                 p->diag_mc= get_rac(&s->c, s->header_state);
-                htaps= get_symbol(&s->c, s->header_state, 0)*2 + 2;
-                if((unsigned)htaps > HTAPS_MAX || htaps==0)
+                htaps= get_symbol(&s->c, s->header_state, 0);
+                if((unsigned)htaps >= HTAPS_MAX/2 - 1)
                     return AVERROR_INVALIDDATA;
+                htaps = htaps*2 + 2;
                 p->htaps= htaps;
                 for(i= htaps/2; i; i--){
-                    p->hcoeff[i]= get_symbol(&s->c, s->header_state, 0) * (1-2*(i&1));
+                    unsigned hcoeff = get_symbol(&s->c, s->header_state, 0);
+                    if (hcoeff > 127)
+                        return AVERROR_INVALIDDATA;
+                    p->hcoeff[i]= hcoeff * (1-2*(i&1));
                     sum += p->hcoeff[i];
                 }
                 p->hcoeff[0]= 32-sum;
@@ -371,7 +535,7 @@ static int decode_header(SnowContext *s){
         }
     }
 
-    s->spatial_decomposition_type+= get_symbol(&s->c, s->header_state, 1);
+    s->spatial_decomposition_type+= (unsigned)get_symbol(&s->c, s->header_state, 1);
     if(s->spatial_decomposition_type > 1U){
         av_log(s->avctx, AV_LOG_ERROR, "spatial_decomposition_type %d not supported\n", s->spatial_decomposition_type);
         return AVERROR_INVALIDDATA;
@@ -381,27 +545,26 @@ static int decode_header(SnowContext *s){
         av_log(s->avctx, AV_LOG_ERROR, "spatial_decomposition_count %d too large for size\n", s->spatial_decomposition_count);
         return AVERROR_INVALIDDATA;
     }
-
-
-    s->qlog           += get_symbol(&s->c, s->header_state, 1);
-    s->mv_scale       += get_symbol(&s->c, s->header_state, 1);
-    s->qbias          += get_symbol(&s->c, s->header_state, 1);
-    s->block_max_depth+= get_symbol(&s->c, s->header_state, 1);
-    if(s->block_max_depth > 1 || s->block_max_depth < 0){
-        av_log(s->avctx, AV_LOG_ERROR, "block_max_depth= %d is too large\n", s->block_max_depth);
-        s->block_max_depth= 0;
+    if (s->avctx->width > 65536-4) {
+        av_log(s->avctx, AV_LOG_ERROR, "Width %d is too large\n", s->avctx->width);
         return AVERROR_INVALIDDATA;
     }
 
-    return 0;
-}
 
-static av_cold int decode_init(AVCodecContext *avctx)
-{
-    int ret;
-
-    if ((ret = ff_snow_common_init(avctx)) < 0) {
-        return ret;
+    s->qlog           += (unsigned)get_symbol(&s->c, s->header_state, 1);
+    s->mv_scale       += (unsigned)get_symbol(&s->c, s->header_state, 1);
+    s->qbias          += (unsigned)get_symbol(&s->c, s->header_state, 1);
+    s->block_max_depth+= (unsigned)get_symbol(&s->c, s->header_state, 1);
+    if(s->block_max_depth > 1 || s->block_max_depth < 0 || s->mv_scale > 256U){
+        av_log(s->avctx, AV_LOG_ERROR, "block_max_depth= %d is too large\n", s->block_max_depth);
+        s->block_max_depth= 0;
+        s->mv_scale = 0;
+        return AVERROR_INVALIDDATA;
+    }
+    if (FFABS(s->qbias) > 127) {
+        av_log(s->avctx, AV_LOG_ERROR, "qbias %d is too large\n", s->qbias);
+        s->qbias = 0;
+        return AVERROR_INVALIDDATA;
     }
 
     return 0;
@@ -415,6 +578,8 @@ static int decode_blocks(SnowContext *s){
 
     for(y=0; y<h; y++){
         for(x=0; x<w; x++){
+            if (s->c.bytestream >= s->c.bytestream_end)
+                return AVERROR_INVALIDDATA;
             if ((res = decode_q_branch(s, 0, x, y)) < 0)
                 return res;
         }
@@ -422,15 +587,14 @@ static int decode_blocks(SnowContext *s){
     return 0;
 }
 
-static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
-                        AVPacket *avpkt)
+static int decode_frame(AVCodecContext *avctx, AVFrame *picture,
+                        int *got_frame, AVPacket *avpkt)
 {
     const uint8_t *buf = avpkt->data;
     int buf_size = avpkt->size;
     SnowContext *s = avctx->priv_data;
     RangeCoder * const c= &s->c;
     int bytes_read;
-    AVFrame *picture = data;
     int level, orientation, plane_index;
     int res;
 
@@ -440,6 +604,17 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
     s->current_picture->pict_type= AV_PICTURE_TYPE_I; //FIXME I vs. P
     if ((res = decode_header(s)) < 0)
         return res;
+
+    if (!s->mconly_picture->data[0]) {
+        res = ff_get_buffer(avctx, s->mconly_picture, AV_GET_BUFFER_FLAG_REF);
+        if (res < 0)
+            return res;
+    }
+    if (s->mconly_picture->format != avctx->pix_fmt) {
+        av_log(avctx, AV_LOG_ERROR, "pixel format changed\n");
+        return AVERROR_INVALIDDATA;
+    }
+
     if ((res=ff_snow_common_init_after_header(avctx)) < 0)
         return res;
 
@@ -461,7 +636,13 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
 
     ff_snow_alloc_blocks(s);
 
-    if((res = ff_snow_frame_start(s)) < 0)
+    if ((res = ff_snow_frames_prepare(s)) < 0)
+        return res;
+
+    s->current_picture->width  = s->avctx->width;
+    s->current_picture->height = s->avctx->height;
+    res = ff_get_buffer(s->avctx, s->current_picture, AV_GET_BUFFER_FLAG_REF);
+    if (res < 0)
         return res;
 
     s->current_picture->pict_type = s->keyframe ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_P;
@@ -476,9 +657,17 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
                s->spatial_decomposition_count
               );
 
-    av_assert0(!s->avmv);
-    if (s->avctx->flags2 & CODEC_FLAG2_EXPORT_MVS) {
-        s->avmv = av_malloc_array(s->b_width * s->b_height, sizeof(AVMotionVector) << (s->block_max_depth*2));
+    if (s->avctx->export_side_data & AV_CODEC_EXPORT_DATA_MVS) {
+        size_t size;
+        res = av_size_mult(s->b_width * s->b_height, sizeof(AVMotionVector) << (s->block_max_depth*2), &size);
+        if (res)
+            return res;
+        av_fast_malloc(&s->avmv, &s->avmv_size, size);
+        if (!s->avmv)
+            return AVERROR(ENOMEM);
+    } else {
+        s->avmv_size = 0;
+        av_freep(&s->avmv);
     }
     s->avmv_index = 0;
 
@@ -504,13 +693,11 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
             }
         }
 
-        {
         for(level=0; level<s->spatial_decomposition_count; level++){
             for(orientation=level ? 1 : 0; orientation<4; orientation++){
                 SubBand *b= &p->band[level][orientation];
                 unpack_coeffs(s, b, b->parent, orientation);
             }
-        }
         }
 
         {
@@ -574,7 +761,7 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
                 for(; yq<slice_h && yq<h; yq++){
                     IDWTELEM * line = slice_buffer_get_line(&s->sb, yq);
                     for(x=0; x<w; x++){
-                        line[x] <<= FRAC_BITS;
+                        line[x] *= 1<<FRAC_BITS;
                     }
                 }
             }
@@ -594,7 +781,7 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
 
     emms_c();
 
-    ff_snow_release_buffer(avctx);
+    av_frame_unref(s->last_picture[s->max_ref_frames - 1]);
 
     if(!(s->avctx->debug&2048))
         res = av_frame_ref(picture, s->current_picture);
@@ -608,8 +795,6 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
             return AVERROR(ENOMEM);
         memcpy(sd->data, s->avmv, s->avmv_index * sizeof(AVMotionVector));
     }
-
-    av_freep(&s->avmv);
 
     if (res < 0)
         return res;
@@ -630,19 +815,21 @@ static av_cold int decode_end(AVCodecContext *avctx)
 
     ff_snow_common_end(s);
 
+    s->avmv_size = 0;
+    av_freep(&s->avmv);
+
     return 0;
 }
 
-AVCodec ff_snow_decoder = {
-    .name           = "snow",
-    .long_name      = NULL_IF_CONFIG_SMALL("Snow"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_SNOW,
+const FFCodec ff_snow_decoder = {
+    .p.name         = "snow",
+    CODEC_LONG_NAME("Snow"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_SNOW,
     .priv_data_size = sizeof(SnowContext),
-    .init           = decode_init,
+    .init           = ff_snow_common_init,
     .close          = decode_end,
-    .decode         = decode_frame,
-    .capabilities   = CODEC_CAP_DR1 /*| CODEC_CAP_DRAW_HORIZ_BAND*/,
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE |
-                      FF_CODEC_CAP_INIT_CLEANUP,
+    FF_CODEC_DECODE_CB(decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };

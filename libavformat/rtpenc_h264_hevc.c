@@ -31,6 +31,7 @@
 
 #include "avformat.h"
 #include "avc.h"
+#include "nal.h"
 #include "rtpenc.h"
 
 static void flush_buffered(AVFormatContext *s1, int last)
@@ -40,7 +41,7 @@ static void flush_buffered(AVFormatContext *s1, int last)
         // If we're only sending one single NAL unit, send it as such, skip
         // the STAP-A/AP framing
         if (s->buffered_nals == 1) {
-            enum AVCodecID codec = s1->streams[0]->codec->codec_id;
+            enum AVCodecID codec = s1->streams[0]->codecpar->codec_id;
             if (codec == AV_CODEC_ID_H264)
                 ff_rtp_send_data(s1, s->buf + 3, s->buf_ptr - s->buf - 3, last);
             else
@@ -55,7 +56,7 @@ static void flush_buffered(AVFormatContext *s1, int last)
 static void nal_send(AVFormatContext *s1, const uint8_t *buf, int size, int last)
 {
     RTPMuxContext *s = s1->priv_data;
-    enum AVCodecID codec = s1->streams[0]->codec->codec_id;
+    enum AVCodecID codec = s1->streams[0]->codecpar->codec_id;
 
     av_log(s1, AV_LOG_DEBUG, "Sending NAL %x of len %d M=%d\n", buf[0] & 0x1F, size, last);
     if (size <= s->max_payload_size) {
@@ -185,20 +186,20 @@ void ff_rtp_send_h264_hevc(AVFormatContext *s1, const uint8_t *buf1, int size)
     s->timestamp = s->cur_timestamp;
     s->buf_ptr   = s->buf;
     if (s->nal_length_size)
-        r = ff_avc_mp4_find_startcode(buf1, end, s->nal_length_size) ? buf1 : end;
+        r = ff_nal_mp4_find_startcode(buf1, end, s->nal_length_size) ? buf1 : end;
     else
-        r = ff_avc_find_startcode(buf1, end);
+        r = ff_nal_find_startcode(buf1, end);
     while (r < end) {
         const uint8_t *r1;
 
         if (s->nal_length_size) {
-            r1 = ff_avc_mp4_find_startcode(r, end, s->nal_length_size);
+            r1 = ff_nal_mp4_find_startcode(r, end, s->nal_length_size);
             if (!r1)
                 r1 = end;
             r += s->nal_length_size;
         } else {
             while (!*(r++));
-            r1 = ff_avc_find_startcode(r, end);
+            r1 = ff_nal_find_startcode(r, end);
         }
         nal_send(s1, r, r1 - r, r1 == end);
         r = r1;

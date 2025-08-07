@@ -27,8 +27,23 @@
 #ifndef AVFILTER_TINTERLACE_H
 #define AVFILTER_TINTERLACE_H
 
+#include "libavutil/bswap.h"
 #include "libavutil/opt.h"
+#include "libavutil/pixdesc.h"
+#include "drawutils.h"
 #include "avfilter.h"
+#include "ccfifo.h"
+
+#define TINTERLACE_FLAG_VLPF 01
+#define TINTERLACE_FLAG_CVLPF 2
+#define TINTERLACE_FLAG_EXACT_TB 4
+#define TINTERLACE_FLAG_BYPASS_IL 8
+
+enum VLPFilter {
+    VLPF_OFF = 0,
+    VLPF_LIN = 1,
+    VLPF_CMP = 2,
+};
 
 enum TInterlaceMode {
     MODE_MERGE = 0,
@@ -38,22 +53,32 @@ enum TInterlaceMode {
     MODE_INTERLEAVE_TOP,
     MODE_INTERLEAVE_BOTTOM,
     MODE_INTERLACEX2,
+    MODE_MERGEX2,
     MODE_NB,
 };
 
-typedef struct {
+enum InterlaceScanMode {
+    MODE_TFF = 0,
+    MODE_BFF,
+};
+
+typedef struct TInterlaceContext {
     const AVClass *class;
     int mode;                   ///< TInterlaceMode, interlace mode selected
     AVRational preout_time_base;
     int flags;                  ///< flags affecting interlacing algorithm
-    int frame;                  ///< number of the output frame
+    int lowpass;                ///< legacy interlace filter lowpass mode
     int vsub;                   ///< chroma vertical subsampling
     AVFrame *cur;
     AVFrame *next;
-    uint8_t *black_data[4];     ///< buffer used to fill padded lines
+    uint8_t *black_data[2][4];  ///< buffer used to fill padded lines (limited/full)
     int black_linesize[4];
+    FFDrawContext draw;
+    FFDrawColor color;
+    const AVPixFmtDescriptor *csp;
     void (*lowpass_line)(uint8_t *dstp, ptrdiff_t width, const uint8_t *srcp,
-                         const uint8_t *srcp_above, const uint8_t *srcp_below);
+                         ptrdiff_t mref, ptrdiff_t pref, int clip_max);
+    CCFifo cc_fifo;
 } TInterlaceContext;
 
 void ff_tinterlace_init_x86(TInterlaceContext *interlace);

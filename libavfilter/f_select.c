@@ -23,17 +23,21 @@
  * filter for selecting which frame passes in the filterchain
  */
 
+#include "config_components.h"
+
 #include "libavutil/avstring.h"
 #include "libavutil/eval.h"
 #include "libavutil/fifo.h"
+#include "libavutil/imgutils.h"
 #include "libavutil/internal.h"
 #include "libavutil/opt.h"
-#include "libavutil/pixelutils.h"
+#include "libavutil/pixdesc.h"
 #include "avfilter.h"
 #include "audio.h"
+#include "filters.h"
 #include "formats.h"
-#include "internal.h"
 #include "video.h"
+#include "scene_sad.h"
 
 static const char *const var_names[] = {
     "TB",                ///< timebase
@@ -78,9 +82,15 @@ static const char *const var_names[] = {
     "prev_selected_n",   ///< number of the last selected frame
 
     "key",               ///< tell if the frame is a key frame
-    "pos",               ///< original position in the file of the frame
 
     "scene",
+
+    "concatdec_select",  ///< frame is within the interval set by the concat demuxer
+
+    "ih",                ///< ih: Represents the height of the input video frame.
+    "iw",                ///< iw: Represents the width of the input video frame.
+
+    "view",
 
     NULL
 };
@@ -128,9 +138,15 @@ enum var_name {
     VAR_PREV_SELECTED_N,
 
     VAR_KEY,
-    VAR_POS,
 
     VAR_SCENE,
+
+    VAR_CONCATDEC_SELECT,
+
+    VAR_IH,
+    VAR_IW,
+
+    VAR_VIEW,
 
     VAR_VARS_NB
 };
@@ -140,8 +156,12 @@ typedef struct SelectContext {
     char *expr_str;
     AVExpr *expr;
     double var_values[VAR_VARS_NB];
+    int bitdepth;
+    int nb_planes;
+    ptrdiff_t width[4];
+    ptrdiff_t height[4];
     int do_scene_detect;            ///< 1 if the expression requires scene detection variables, 0 otherwise
-    av_pixelutils_sad_fn sad;       ///< Sum of the absolute difference function (scene detect only)
+    ff_scene_sad_fn sad;            ///< Sum of the absolute difference function (scene detect only)
     double prev_mafd;               ///< previous MAFD                           (scene detect only)
     AVFrame *prev_picref;           ///< previous frame                          (scene detect only)
     double select;
@@ -158,8 +178,6 @@ static const AVOption filt_name##_options[] = {                     \
     { "n",       "set the number of outputs", OFFSET(nb_outputs), AV_OPT_TYPE_INT, {.i64 = 1}, 1, INT_MAX, .flags=FLAGS }, \
     { NULL }                                                            \
 }
-
-static int request_frame(AVFilterLink *outlink);
 
 static av_cold int init(AVFilterContext *ctx)
 {
@@ -181,8 +199,8 @@ static av_cold int init(AVFilterContext *ctx)
         if (!pad.name)
             return AVERROR(ENOMEM);
         pad.type = ctx->filter->inputs[0].type;
-        pad.request_frame = request_frame;
-        ff_insert_outpad(ctx, i, &pad);
+        if ((ret = ff_append_outpad_free_name(ctx, &pad)) < 0)
+            return ret;
     }
 
     return 0;
@@ -195,12 +213,28 @@ static av_cold int init(AVFilterContext *ctx)
 static int config_input(AVFilterLink *inlink)
 {
     SelectContext *select = inlink->dst->priv;
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(inlink->format);
+    int is_yuv = !(desc->flags & AV_PIX_FMT_FLAG_RGB) &&
+                 (desc->flags & AV_PIX_FMT_FLAG_PLANAR) &&
+                 desc->nb_components >= 3;
+
+    select->bitdepth = desc->comp[0].depth;
+    select->nb_planes = is_yuv ? 1 : av_pix_fmt_count_planes(inlink->format);
+
+    for (int plane = 0; plane < select->nb_planes; plane++) {
+        ptrdiff_t line_size = av_image_get_linesize(inlink->format, inlink->w, plane);
+        int vsub = desc->log2_chroma_h;
+
+        select->width[plane] = line_size >> (select->bitdepth > 8);
+        select->height[plane] = plane == 1 || plane == 2 ?  AV_CEIL_RSHIFT(inlink->h, vsub) : inlink->h;
+    }
 
     select->var_values[VAR_N]          = 0.0;
     select->var_values[VAR_SELECTED_N] = 0.0;
 
     select->var_values[VAR_TB] = av_q2d(inlink->time_base);
 
+    select->var_values[VAR_PREV_SELECTED_N]   = NAN;
     select->var_values[VAR_PREV_PTS]          = NAN;
     select->var_values[VAR_PREV_SELECTED_PTS] = NAN;
     select->var_values[VAR_PREV_SELECTED_T]   = NAN;
@@ -231,11 +265,14 @@ static int config_input(AVFilterLink *inlink)
     select->var_values[VAR_CONSUMED_SAMPLES_N] = NAN;
     select->var_values[VAR_SAMPLES_N]          = NAN;
 
+    select->var_values[VAR_IH] = NAN;
+    select->var_values[VAR_IW] = NAN;
+
     select->var_values[VAR_SAMPLE_RATE] =
         inlink->type == AVMEDIA_TYPE_AUDIO ? inlink->sample_rate : NAN;
 
-    if (select->do_scene_detect) {
-        select->sad = av_pixelutils_get_sad_fn(3, 3, 2, select); // 8x8 both sources aligned
+    if (CONFIG_SELECT_FILTER && select->do_scene_detect) {
+        select->sad = ff_scene_sad_get_fn(select->bitdepth);
         if (!select->sad)
             return AVERROR(EINVAL);
     }
@@ -251,24 +288,20 @@ static double get_scene_score(AVFilterContext *ctx, AVFrame *frame)
     if (prev_picref &&
         frame->height == prev_picref->height &&
         frame->width  == prev_picref->width) {
-        int x, y, nb_sad = 0;
-        int64_t sad = 0;
+        uint64_t sad = 0;
         double mafd, diff;
-        uint8_t *p1 =      frame->data[0];
-        uint8_t *p2 = prev_picref->data[0];
-        const int p1_linesize =       frame->linesize[0];
-        const int p2_linesize = prev_picref->linesize[0];
+        uint64_t count = 0;
 
-        for (y = 0; y < frame->height - 7; y += 8) {
-            for (x = 0; x < frame->width*3 - 7; x += 8) {
-                sad += select->sad(p1 + x, p1_linesize, p2 + x, p2_linesize);
-                nb_sad += 8 * 8;
-            }
-            p1 += 8 * p1_linesize;
-            p2 += 8 * p2_linesize;
+        for (int plane = 0; plane < select->nb_planes; plane++) {
+            uint64_t plane_sad;
+            select->sad(prev_picref->data[plane], prev_picref->linesize[plane],
+                    frame->data[plane], frame->linesize[plane],
+                    select->width[plane], select->height[plane], &plane_sad);
+            sad += plane_sad;
+            count += select->width[plane] * select->height[plane];
         }
-        emms_c();
-        mafd = nb_sad ? (double)sad / nb_sad : 0;
+
+        mafd = (double)sad / count / (1ULL << (select->bitdepth - 8));
         diff = fabs(mafd - select->prev_mafd);
         ret  = av_clipf(FFMIN(mafd, diff) / 100., 0, 1);
         select->prev_mafd = mafd;
@@ -278,13 +311,34 @@ static double get_scene_score(AVFilterContext *ctx, AVFrame *frame)
     return ret;
 }
 
-#define D2TS(d)  (isnan(d) ? AV_NOPTS_VALUE : (int64_t)(d))
-#define TS2D(ts) ((ts) == AV_NOPTS_VALUE ? NAN : (double)(ts))
+static double get_concatdec_select(AVFrame *frame, int64_t pts)
+{
+    AVDictionary *metadata = frame->metadata;
+    AVDictionaryEntry *start_time_entry = av_dict_get(metadata, "lavf.concatdec.start_time", NULL, 0);
+    AVDictionaryEntry *duration_entry = av_dict_get(metadata, "lavf.concatdec.duration", NULL, 0);
+    if (start_time_entry) {
+        int64_t start_time = strtoll(start_time_entry->value, NULL, 10);
+        if (pts >= start_time) {
+            if (duration_entry) {
+              int64_t duration = strtoll(duration_entry->value, NULL, 10);
+              if (pts < start_time + duration)
+                  return -1;
+              else
+                  return 0;
+            }
+            return -1;
+        }
+        return 0;
+    }
+    return NAN;
+}
 
 static void select_frame(AVFilterContext *ctx, AVFrame *frame)
 {
     SelectContext *select = ctx->priv;
     AVFilterLink *inlink = ctx->inputs[0];
+    FilterLink      *inl = ff_filter_link(inlink);
+    const AVFrameSideData *sd;
     double res;
 
     if (isnan(select->var_values[VAR_START_PTS]))
@@ -292,11 +346,11 @@ static void select_frame(AVFilterContext *ctx, AVFrame *frame)
     if (isnan(select->var_values[VAR_START_T]))
         select->var_values[VAR_START_T] = TS2D(frame->pts) * av_q2d(inlink->time_base);
 
-    select->var_values[VAR_N  ] = inlink->frame_count;
+    select->var_values[VAR_N  ] = inl->frame_count_out - 1;
     select->var_values[VAR_PTS] = TS2D(frame->pts);
     select->var_values[VAR_T  ] = TS2D(frame->pts) * av_q2d(inlink->time_base);
-    select->var_values[VAR_POS] = av_frame_get_pkt_pos(frame) == -1 ? NAN : av_frame_get_pkt_pos(frame);
-    select->var_values[VAR_KEY] = frame->key_frame;
+    select->var_values[VAR_KEY] = !!(frame->flags & AV_FRAME_FLAG_KEY);
+    select->var_values[VAR_CONCATDEC_SELECT] = get_concatdec_select(frame, av_rescale_q(frame->pts, inlink->time_base, AV_TIME_BASE_Q));
 
     switch (inlink->type) {
     case AVMEDIA_TYPE_AUDIO:
@@ -304,17 +358,24 @@ static void select_frame(AVFilterContext *ctx, AVFrame *frame)
         break;
 
     case AVMEDIA_TYPE_VIDEO:
+        select->var_values[VAR_IH] = frame->height;
+        select->var_values[VAR_IW] = frame->width;
+
         select->var_values[VAR_INTERLACE_TYPE] =
-            !frame->interlaced_frame ? INTERLACE_TYPE_P :
-        frame->top_field_first ? INTERLACE_TYPE_T : INTERLACE_TYPE_B;
+            !(frame->flags & AV_FRAME_FLAG_INTERLACED) ? INTERLACE_TYPE_P :
+        (frame->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST) ? INTERLACE_TYPE_T : INTERLACE_TYPE_B;
         select->var_values[VAR_PICT_TYPE] = frame->pict_type;
         if (select->do_scene_detect) {
             char buf[32];
             select->var_values[VAR_SCENE] = get_scene_score(ctx, frame);
             // TODO: document metadata
             snprintf(buf, sizeof(buf), "%f", select->var_values[VAR_SCENE]);
-            av_dict_set(avpriv_frame_get_metadatap(frame), "lavfi.scene_score", buf, 0);
+            av_dict_set(&frame->metadata, "lavfi.scene_score", buf, 0);
         }
+
+        sd = av_frame_side_data_get(frame->side_data, frame->nb_side_data,
+                                    AV_FRAME_DATA_VIEW_ID);
+        select->var_values[VAR_VIEW] = sd ? *(int*)sd->data : NAN;
         break;
     }
 
@@ -324,13 +385,13 @@ static void select_frame(AVFilterContext *ctx, AVFrame *frame)
            select->var_values[VAR_N],
            select->var_values[VAR_PTS],
            select->var_values[VAR_T],
-           frame->key_frame);
+           !!(frame->flags & AV_FRAME_FLAG_KEY));
 
     switch (inlink->type) {
     case AVMEDIA_TYPE_VIDEO:
         av_log(inlink->dst, AV_LOG_DEBUG, " interlace_type:%c pict_type:%c scene:%f",
-               (!frame->interlaced_frame) ? 'P' :
-               frame->top_field_first     ? 'T' : 'B',
+               !(frame->flags & AV_FRAME_FLAG_INTERLACED)     ? 'P' :
+               (frame->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST) ? 'T' : 'B',
                av_get_picture_type_char(frame->pict_type),
                select->var_values[VAR_SCENE]);
         break;
@@ -364,72 +425,47 @@ static void select_frame(AVFilterContext *ctx, AVFrame *frame)
     select->var_values[VAR_PREV_T]   = select->var_values[VAR_T];
 }
 
-static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
+static int activate(AVFilterContext *ctx)
 {
-    AVFilterContext *ctx = inlink->dst;
     SelectContext *select = ctx->priv;
+    AVFilterLink *inlink = ctx->inputs[0];
+    AVFrame *in;
+    int nb_eofs = 0;
+    int ret;
 
-    select_frame(ctx, frame);
-    if (select->select)
-        return ff_filter_frame(ctx->outputs[select->select_out], frame);
+    for (int i = 0; i < ctx->nb_outputs; i++)
+        nb_eofs += ff_outlink_get_status(ctx->outputs[i]) == AVERROR_EOF;
 
-    av_frame_free(&frame);
-    return 0;
-}
+    if (nb_eofs == ctx->nb_outputs) {
+        ff_inlink_set_status(inlink, AVERROR_EOF);
+        return 0;
+    }
 
-static int request_frame(AVFilterLink *outlink)
-{
-    AVFilterContext *ctx = outlink->src;
-    SelectContext *select = ctx->priv;
-    AVFilterLink *inlink = outlink->src->inputs[0];
-    int out_no = FF_OUTLINK_IDX(outlink);
-
-    do {
-        int ret = ff_request_frame(inlink);
+    while ((ret = ff_inlink_consume_frame(inlink, &in))) {
         if (ret < 0)
             return ret;
-    } while (select->select_out != out_no);
+        select_frame(ctx, in);
+        if (select->select && !ff_outlink_get_status(ctx->outputs[select->select_out]))
+            return ff_filter_frame(ctx->outputs[select->select_out], in);
+        av_frame_free(&in);
+    };
 
-    return 0;
+    FF_FILTER_FORWARD_STATUS_ALL(inlink, ctx);
+    FF_FILTER_FORWARD_WANTED_ANY(ctx, inlink);
+
+    return FFERROR_NOT_READY;
 }
 
 static av_cold void uninit(AVFilterContext *ctx)
 {
     SelectContext *select = ctx->priv;
-    int i;
 
     av_expr_free(select->expr);
     select->expr = NULL;
 
-    for (i = 0; i < ctx->nb_outputs; i++)
-        av_freep(&ctx->output_pads[i].name);
-
     if (select->do_scene_detect) {
         av_frame_free(&select->prev_picref);
     }
-}
-
-static int query_formats(AVFilterContext *ctx)
-{
-    SelectContext *select = ctx->priv;
-
-    if (!select->do_scene_detect) {
-        return ff_default_query_formats(ctx);
-    } else {
-        int ret;
-        static const enum AVPixelFormat pix_fmts[] = {
-            AV_PIX_FMT_RGB24, AV_PIX_FMT_BGR24,
-            AV_PIX_FMT_NONE
-        };
-        AVFilterFormats *fmts_list = ff_make_format_list(pix_fmts);
-
-        if (!fmts_list)
-            return AVERROR(ENOMEM);
-        ret = ff_set_common_formats(ctx, fmts_list);
-        if (ret < 0)
-            return ret;
-    }
-    return 0;
 }
 
 #if CONFIG_ASELECT_FILTER
@@ -458,24 +494,42 @@ static const AVFilterPad avfilter_af_aselect_inputs[] = {
         .name         = "default",
         .type         = AVMEDIA_TYPE_AUDIO,
         .config_props = config_input,
-        .filter_frame = filter_frame,
     },
-    { NULL }
 };
 
-AVFilter ff_af_aselect = {
-    .name        = "aselect",
-    .description = NULL_IF_CONFIG_SMALL("Select audio frames to pass in output."),
+const FFFilter ff_af_aselect = {
+    .p.name        = "aselect",
+    .p.description = NULL_IF_CONFIG_SMALL("Select audio frames to pass in output."),
+    .p.priv_class  = &aselect_class,
+    .p.flags       = AVFILTER_FLAG_DYNAMIC_OUTPUTS,
     .init        = aselect_init,
     .uninit      = uninit,
     .priv_size   = sizeof(SelectContext),
-    .inputs      = avfilter_af_aselect_inputs,
-    .priv_class  = &aselect_class,
-    .flags       = AVFILTER_FLAG_DYNAMIC_OUTPUTS,
+    FILTER_INPUTS(avfilter_af_aselect_inputs),
 };
 #endif /* CONFIG_ASELECT_FILTER */
 
 #if CONFIG_SELECT_FILTER
+
+static int query_formats(const AVFilterContext *ctx,
+                         AVFilterFormatsConfig **cfg_in,
+                         AVFilterFormatsConfig **cfg_out)
+{
+    const SelectContext *select = ctx->priv;
+
+    if (select->do_scene_detect) {
+        static const enum AVPixelFormat pix_fmts[] = {
+            AV_PIX_FMT_RGB24, AV_PIX_FMT_BGR24, AV_PIX_FMT_RGBA,
+            AV_PIX_FMT_ABGR, AV_PIX_FMT_BGRA, AV_PIX_FMT_GRAY8,
+            AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUVJ420P,
+            AV_PIX_FMT_YUV422P, AV_PIX_FMT_YUVJ422P,
+            AV_PIX_FMT_YUV420P10,
+            AV_PIX_FMT_NONE
+        };
+        return ff_set_common_formats_from_list2(ctx, cfg_in, cfg_out, pix_fmts);
+    }
+    return 0;
+}
 
 DEFINE_OPTIONS(select, AV_OPT_FLAG_VIDEO_PARAM|AV_OPT_FLAG_FILTERING_PARAM);
 AVFILTER_DEFINE_CLASS(select);
@@ -495,20 +549,19 @@ static const AVFilterPad avfilter_vf_select_inputs[] = {
         .name         = "default",
         .type         = AVMEDIA_TYPE_VIDEO,
         .config_props = config_input,
-        .filter_frame = filter_frame,
     },
-    { NULL }
 };
 
-AVFilter ff_vf_select = {
-    .name          = "select",
-    .description   = NULL_IF_CONFIG_SMALL("Select video frames to pass in output."),
+const FFFilter ff_vf_select = {
+    .p.name        = "select",
+    .p.description = NULL_IF_CONFIG_SMALL("Select video frames to pass in output."),
+    .p.priv_class  = &select_class,
+    .p.flags       = AVFILTER_FLAG_DYNAMIC_OUTPUTS | AVFILTER_FLAG_METADATA_ONLY,
     .init          = select_init,
     .uninit        = uninit,
-    .query_formats = query_formats,
+    .activate      = activate,
     .priv_size     = sizeof(SelectContext),
-    .priv_class    = &select_class,
-    .inputs        = avfilter_vf_select_inputs,
-    .flags         = AVFILTER_FLAG_DYNAMIC_OUTPUTS,
+    FILTER_INPUTS(avfilter_vf_select_inputs),
+    FILTER_QUERY_FUNC2(query_formats),
 };
 #endif /* CONFIG_SELECT_FILTER */

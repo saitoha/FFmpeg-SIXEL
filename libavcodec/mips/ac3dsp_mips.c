@@ -53,13 +53,18 @@
  * Reference: libavcodec/ac3dsp.c
  */
 
+#include <stddef.h>
+#include <string.h>
+
 #include "config.h"
 #include "libavcodec/ac3dsp.h"
 #include "libavcodec/ac3.h"
+#include "libavcodec/ac3tab.h"
+#include "libavutil/macros.h"
 #include "libavutil/mips/asmdefs.h"
 
 #if HAVE_INLINE_ASM
-#if HAVE_MIPSDSPR1
+#if HAVE_MIPSDSP
 static void ac3_bit_alloc_calc_bap_mips(int16_t *mask, int16_t *psd,
                                         int start, int end,
                                         int snr_offset, int floor,
@@ -201,7 +206,8 @@ static void ac3_update_bap_counts_mips(uint16_t mant_cnt[16], uint8_t *bap,
 #endif
 
 #if HAVE_MIPSFPU
-static void float_to_fixed24_mips(int32_t *dst, const float *src, unsigned int len)
+#if !HAVE_MIPS32R6 && !HAVE_MIPS64R6
+static void float_to_fixed24_mips(int32_t *dst, const float *src, size_t len)
 {
     const float scale = 1 << 24;
     float src0, src1, src2, src3, src4, src5, src6, src7;
@@ -395,19 +401,23 @@ static void ac3_downmix_mips(float **samples, float (*matrix)[2],
         :"memory"
     );
 }
-#endif
+#endif /* !HAVE_MIPS32R6 && !HAVE_MIPS64R6 */
+#endif /* HAVE_MIPSFPU */
 #endif /* HAVE_INLINE_ASM */
 
-void ff_ac3dsp_init_mips(AC3DSPContext *c, int bit_exact) {
+void ff_ac3dsp_init_mips(AC3DSPContext *c)
+{
 #if HAVE_INLINE_ASM
-#if HAVE_MIPSDSPR1
+#if HAVE_MIPSDSP
     c->bit_alloc_calc_bap = ac3_bit_alloc_calc_bap_mips;
     c->update_bap_counts  = ac3_update_bap_counts_mips;
 #endif
 #if HAVE_MIPSFPU
+#if !HAVE_MIPS32R6 && !HAVE_MIPS64R6
     c->float_to_fixed24 = float_to_fixed24_mips;
-    c->downmix          = ac3_downmix_mips;
+    //c->downmix          = ac3_downmix_mips;
 #endif
 #endif
 
+#endif
 }

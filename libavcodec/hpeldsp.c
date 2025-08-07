@@ -314,9 +314,6 @@ CALL_2X_PIXELS(OPNAME ## _pixels16_y2_8_c,                              \
 CALL_2X_PIXELS(OPNAME ## _pixels16_xy2_8_c,                             \
                OPNAME ## _pixels8_xy2_8_c,                              \
                8)                                                       \
-CALL_2X_PIXELS(OPNAME ## _no_rnd_pixels16_8_c,                          \
-               OPNAME ## _pixels8_8_c,                                  \
-               8)                                                       \
 CALL_2X_PIXELS(OPNAME ## _no_rnd_pixels16_x2_8_c,                       \
                OPNAME ## _no_rnd_pixels8_x2_8_c,                        \
                8)                                                       \
@@ -330,6 +327,8 @@ CALL_2X_PIXELS(OPNAME ## _no_rnd_pixels16_xy2_8_c,                      \
 #define op_avg(a, b) a = rnd_avg32(a, b)
 #define op_put(a, b) a = b
 #define put_no_rnd_pixels8_8_c put_pixels8_8_c
+#define put_no_rnd_pixels16_8_c put_pixels16_8_c
+#define avg_no_rnd_pixels16_8_c avg_pixels16_8_c
 PIXOP2(avg, op_avg)
 PIXOP2(put, op_put)
 #undef op_avg
@@ -355,14 +354,17 @@ av_cold void ff_hpeldsp_init(HpelDSPContext *c, int flags)
     hpel_funcs(avg, [3],  2);
     hpel_funcs(avg_no_rnd,, 16);
 
-    if (ARCH_AARCH64)
-        ff_hpeldsp_init_aarch64(c, flags);
-    if (ARCH_ALPHA)
-        ff_hpeldsp_init_alpha(c, flags);
-    if (ARCH_ARM)
-        ff_hpeldsp_init_arm(c, flags);
-    if (ARCH_PPC)
-        ff_hpeldsp_init_ppc(c, flags);
-    if (ARCH_X86)
-        ff_hpeldsp_init_x86(c, flags);
+#if ARCH_AARCH64
+    ff_hpeldsp_init_aarch64(c, flags);
+#elif ARCH_ARM
+    ff_hpeldsp_init_arm(c, flags);
+#elif ARCH_PPC
+    ff_hpeldsp_init_ppc(c, flags);
+#elif ARCH_X86
+    ff_hpeldsp_init_x86(c, flags);
+#elif ARCH_MIPS
+    ff_hpeldsp_init_mips(c, flags);
+#elif ARCH_LOONGARCH64
+    ff_hpeldsp_init_loongarch(c, flags);
+#endif
 }

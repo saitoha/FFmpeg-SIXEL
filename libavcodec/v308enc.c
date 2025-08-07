@@ -22,6 +22,8 @@
 
 #include "libavutil/intreadwrite.h"
 #include "avcodec.h"
+#include "codec_internal.h"
+#include "encode.h"
 #include "internal.h"
 
 static av_cold int v308_encode_init(AVCodecContext *avctx)
@@ -31,12 +33,10 @@ static av_cold int v308_encode_init(AVCodecContext *avctx)
         return AVERROR_INVALIDDATA;
     }
 
-    avctx->coded_frame = av_frame_alloc();
+    av_log(avctx, AV_LOG_WARNING, "This encoder is deprecated and will be removed.\n");
 
-    if (!avctx->coded_frame) {
-        av_log(avctx, AV_LOG_ERROR, "Could not allocate frame.\n");
-        return AVERROR(ENOMEM);
-    }
+    avctx->bits_per_coded_sample = 24;
+    avctx->bit_rate = ff_guess_coded_bitrate(avctx);
 
     return 0;
 }
@@ -45,15 +45,13 @@ static int v308_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
                              const AVFrame *pic, int *got_packet)
 {
     uint8_t *dst;
-    uint8_t *y, *u, *v;
+    const uint8_t *y, *u, *v;
     int i, j, ret;
 
-    if ((ret = ff_alloc_packet2(avctx, pkt, avctx->width * avctx->height * 3)) < 0)
+    ret = ff_get_encode_buffer(avctx, pkt, avctx->width * avctx->height * 3, 0);
+    if (ret < 0)
         return ret;
     dst = pkt->data;
-
-    avctx->coded_frame->key_frame = 1;
-    avctx->coded_frame->pict_type = AV_PICTURE_TYPE_I;
 
     y = pic->data[0];
     u = pic->data[1];
@@ -70,25 +68,17 @@ static int v308_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
         v += pic->linesize[2];
     }
 
-    pkt->flags |= AV_PKT_FLAG_KEY;
     *got_packet = 1;
     return 0;
 }
 
-static av_cold int v308_encode_close(AVCodecContext *avctx)
-{
-    av_frame_free(&avctx->coded_frame);
-
-    return 0;
-}
-
-AVCodec ff_v308_encoder = {
-    .name         = "v308",
-    .long_name    = NULL_IF_CONFIG_SMALL("Uncompressed packed 4:4:4"),
-    .type         = AVMEDIA_TYPE_VIDEO,
-    .id           = AV_CODEC_ID_V308,
+const FFCodec ff_v308_encoder = {
+    .p.name       = "v308",
+    CODEC_LONG_NAME("Uncompressed packed 4:4:4"),
+    .p.type       = AVMEDIA_TYPE_VIDEO,
+    .p.id         = AV_CODEC_ID_V308,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
     .init         = v308_encode_init,
-    .encode2      = v308_encode_frame,
-    .close        = v308_encode_close,
-    .pix_fmts     = (const enum AVPixelFormat[]){ AV_PIX_FMT_YUV444P, AV_PIX_FMT_NONE },
+    FF_CODEC_ENCODE_CB(v308_encode_frame),
+    CODEC_PIXFMTS(AV_PIX_FMT_YUV444P),
 };

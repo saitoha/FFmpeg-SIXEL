@@ -19,9 +19,12 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <stddef.h>
+
+#include "config.h"
 #include "libavutil/attributes.h"
 #include "libavutil/cpu.h"
-#include "libavutil/internal.h"
+#include "libavutil/mem_internal.h"
 #include "libavutil/x86/asm.h"
 #include "libavutil/x86/cpu.h"
 #include "libavcodec/mpegaudiodsp.h"
@@ -30,18 +33,20 @@
 static void imdct36_blocks_ ## CPU(float *out, float *buf, float *in, int count, int switch_point, int block_type);\
 void ff_imdct36_float_ ## CPU(float *out, float *buf, float *in, float *win);
 
-#if ARCH_X86_32
-DECL(sse)
-#endif
+#if HAVE_X86ASM
 DECL(sse2)
 DECL(sse3)
 DECL(ssse3)
 DECL(avx)
+#endif /* HAVE_X86ASM */
 
 void ff_four_imdct36_float_sse(float *out, float *buf, float *in, float *win,
                                float *tmpbuf);
 void ff_four_imdct36_float_avx(float *out, float *buf, float *in, float *win,
                                float *tmpbuf);
+
+void ff_dct32_float_sse2(float *out, const float *in);
+void ff_dct32_float_avx (float *out, const float *in);
 
 DECLARE_ALIGNED(16, static float, mdct_win_sse)[2][4][4*40];
 
@@ -107,7 +112,7 @@ static void apply_window(const float *buf, const float *win1,
 }
 
 static void apply_window_mp3(float *in, float *win, int *unused, float *out,
-                             int incr)
+                             ptrdiff_t incr)
 {
     LOCAL_ALIGNED_16(float, suma, [17]);
     LOCAL_ALIGNED_16(float, sumb, [17]);
@@ -191,7 +196,7 @@ static void apply_window_mp3(float *in, float *win, int *unused, float *out,
 
 #endif /* HAVE_6REGS && HAVE_SSE_INLINE */
 
-#if HAVE_YASM
+#if HAVE_X86ASM
 #define DECL_IMDCT_BLOCKS(CPU1, CPU2)                                       \
 static void imdct36_blocks_ ## CPU1(float *out, float *buf, float *in,      \
                                int count, int switch_point, int block_type) \
@@ -225,9 +230,6 @@ static void imdct36_blocks_ ## CPU1(float *out, float *buf, float *in,      \
 }
 
 #if HAVE_SSE
-#if ARCH_X86_32
-DECL_IMDCT_BLOCKS(sse,sse)
-#endif
 DECL_IMDCT_BLOCKS(sse2,sse)
 DECL_IMDCT_BLOCKS(sse3,sse)
 DECL_IMDCT_BLOCKS(ssse3,sse)
@@ -235,12 +237,10 @@ DECL_IMDCT_BLOCKS(ssse3,sse)
 #if HAVE_AVX_EXTERNAL
 DECL_IMDCT_BLOCKS(avx,avx)
 #endif
-#endif /* HAVE_YASM */
+#endif /* HAVE_X86ASM */
 
-av_cold void ff_mpadsp_init_x86(MPADSPContext *s)
+av_cold void ff_mpadsp_init_x86_tabs(void)
 {
-    int cpu_flags = av_get_cpu_flags();
-
     int i, j;
     for (j = 0; j < 4; j++) {
         for (i = 0; i < 40; i ++) {
@@ -254,6 +254,11 @@ av_cold void ff_mpadsp_init_x86(MPADSPContext *s)
             mdct_win_sse[1][j][4*i + 3] = ff_mdct_win_float[j + 4][i];
         }
     }
+}
+
+av_cold void ff_mpadsp_init_x86(MPADSPContext *s)
+{
+    av_unused int cpu_flags = av_get_cpu_flags();
 
 #if HAVE_6REGS && HAVE_SSE_INLINE
     if (INLINE_SSE(cpu_flags)) {
@@ -261,15 +266,11 @@ av_cold void ff_mpadsp_init_x86(MPADSPContext *s)
     }
 #endif /* HAVE_SSE_INLINE */
 
-#if HAVE_YASM
+#if HAVE_X86ASM
 #if HAVE_SSE
-#if ARCH_X86_32
-    if (EXTERNAL_SSE(cpu_flags)) {
-        s->imdct36_blocks_float = imdct36_blocks_sse;
-    }
-#endif
     if (EXTERNAL_SSE2(cpu_flags)) {
         s->imdct36_blocks_float = imdct36_blocks_sse2;
+        s->dct32_float          = ff_dct32_float_sse2;
     }
     if (EXTERNAL_SSE3(cpu_flags)) {
         s->imdct36_blocks_float = imdct36_blocks_sse3;
@@ -282,6 +283,8 @@ av_cold void ff_mpadsp_init_x86(MPADSPContext *s)
     if (EXTERNAL_AVX(cpu_flags)) {
         s->imdct36_blocks_float = imdct36_blocks_avx;
     }
+    if (EXTERNAL_AVX_FAST(cpu_flags))
+        s->dct32_float          = ff_dct32_float_avx;
 #endif
-#endif /* HAVE_YASM */
+#endif /* HAVE_X86ASM */
 }

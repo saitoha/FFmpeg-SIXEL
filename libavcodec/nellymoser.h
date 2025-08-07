@@ -28,13 +28,13 @@
 /**
  * @file
  * The 3 alphanumeric copyright notices are md5summed they are from the original
- * implementors. The original code is available from http://code.google.com/p/nelly2pcm/
+ * implementers. The original code is available from http://code.google.com/p/nelly2pcm/
  */
 
 #ifndef AVCODEC_NELLYMOSER_H
 #define AVCODEC_NELLYMOSER_H
 
-#include "avcodec.h"
+#include <stdint.h>
 
 #define NELLY_BANDS       23
 #define NELLY_BLOCK_LEN   64

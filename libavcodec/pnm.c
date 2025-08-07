@@ -22,8 +22,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "libavutil/avassert.h"
 #include "libavutil/imgutils.h"
+#include "libavutil/avstring.h"
 #include "avcodec.h"
+#include "decode.h"
 #include "pnm.h"
 
 static inline int pnm_space(int c)
@@ -35,13 +38,15 @@ static void pnm_get(PNMContext *sc, char *str, int buf_size)
 {
     char *s;
     int c;
+    const uint8_t *bs  = sc->bytestream;
+    const uint8_t *end = sc->bytestream_end;
 
     /* skip spaces and comments */
-    while (sc->bytestream < sc->bytestream_end) {
-        c = *sc->bytestream++;
+    while (bs < end) {
+        c = *bs++;
         if (c == '#')  {
-            while (c != '\n' && sc->bytestream < sc->bytestream_end) {
-                c = *sc->bytestream++;
+            while (c != '\n' && bs < end) {
+                c = *bs++;
             }
         } else if (!pnm_space(c)) {
             break;
@@ -49,31 +54,55 @@ static void pnm_get(PNMContext *sc, char *str, int buf_size)
     }
 
     s = str;
-    while (sc->bytestream < sc->bytestream_end && !pnm_space(c)) {
-        if ((s - str)  < buf_size - 1)
-            *s++ = c;
-        c = *sc->bytestream++;
+    while (bs < end && !pnm_space(c) && (s - str) < buf_size - 1) {
+        *s++ = c;
+        c = *bs++;
     }
     *s = '\0';
+    sc->bytestream = bs;
 }
 
 int ff_pnm_decode_header(AVCodecContext *avctx, PNMContext * const s)
 {
     char buf1[32], tuple_type[32];
     int h, w, depth, maxval;
+    int ret;
 
-    pnm_get(s, buf1, sizeof(buf1));
-    if(buf1[0] != 'P')
+    if (s->bytestream_end - s->bytestream < 3 ||
+        s->bytestream[0] != 'P' ||
+        (s->bytestream[1] < '1' ||
+         s->bytestream[1] > '7' &&
+         s->bytestream[1] != 'f' &&
+         s->bytestream[1] != 'F' &&
+         s->bytestream[1] != 'H' &&
+         s->bytestream[1] != 'h')) {
+        s->bytestream += s->bytestream_end > s->bytestream;
+        s->bytestream += s->bytestream_end > s->bytestream;
         return AVERROR_INVALIDDATA;
+    }
+    pnm_get(s, buf1, sizeof(buf1));
     s->type= buf1[1]-'0';
+    s->half = 0;
 
-    if (s->type==1 || s->type==4) {
+    if (buf1[1] == 'F') {
+        avctx->pix_fmt = AV_PIX_FMT_GBRPF32;
+    } else if (buf1[1] == 'f') {
+        avctx->pix_fmt = AV_PIX_FMT_GRAYF32;
+    } else if (buf1[1] == 'H') {
+        avctx->pix_fmt = AV_PIX_FMT_GBRPF32;
+        s->half = 1;
+    } else if (buf1[1] == 'h') {
+        avctx->pix_fmt = AV_PIX_FMT_GRAYF32;
+        s->half = 1;
+    } else if (s->type==1 || s->type==4) {
         avctx->pix_fmt = AV_PIX_FMT_MONOWHITE;
     } else if (s->type==2 || s->type==5) {
-        if (avctx->codec_id == AV_CODEC_ID_PGMYUV)
+        if (avctx->codec_id == AV_CODEC_ID_PGMYUV) {
             avctx->pix_fmt = AV_PIX_FMT_YUV420P;
-        else
+            avctx->color_range = AVCOL_RANGE_MPEG;
+        } else {
             avctx->pix_fmt = AV_PIX_FMT_GRAY8;
+        }
     } else if (s->type==3 || s->type==6) {
         avctx->pix_fmt = AV_PIX_FMT_RGB24;
     } else if (s->type==7) {
@@ -106,12 +135,17 @@ int ff_pnm_decode_header(AVCodecContext *avctx, PNMContext * const s)
                 return AVERROR_INVALIDDATA;
             }
         }
-        /* check that all tags are present */
-        if (w <= 0 || h <= 0 || maxval <= 0 || depth <= 0 || tuple_type[0] == '\0' || av_image_check_size(w, h, 0, avctx) || s->bytestream >= s->bytestream_end)
+        if (!pnm_space(s->bytestream[-1]))
             return AVERROR_INVALIDDATA;
 
-        avctx->width  = w;
-        avctx->height = h;
+        /* check that all tags are present */
+        if (w <= 0 || h <= 0 || maxval <= 0 || maxval > UINT16_MAX || depth <= 0 || tuple_type[0] == '\0' ||
+            av_image_check_size(w, h, 0, avctx) || s->bytestream >= s->bytestream_end)
+            return AVERROR_INVALIDDATA;
+
+        ret = ff_set_dimensions(avctx, w, h);
+        if (ret < 0)
+            return ret;
         s->maxval     = maxval;
         if (depth == 1) {
             if (maxval == 1) {
@@ -144,7 +178,7 @@ int ff_pnm_decode_header(AVCodecContext *avctx, PNMContext * const s)
         }
         return 0;
     } else {
-        return AVERROR_INVALIDDATA;
+        av_assert0(0);
     }
     pnm_get(s, buf1, sizeof(buf1));
     w = atoi(buf1);
@@ -153,13 +187,23 @@ int ff_pnm_decode_header(AVCodecContext *avctx, PNMContext * const s)
     if(w <= 0 || h <= 0 || av_image_check_size(w, h, 0, avctx) || s->bytestream >= s->bytestream_end)
         return AVERROR_INVALIDDATA;
 
-    avctx->width  = w;
-    avctx->height = h;
+    ret = ff_set_dimensions(avctx, w, h);
+    if (ret < 0)
+        return ret;
 
-    if (avctx->pix_fmt != AV_PIX_FMT_MONOWHITE && avctx->pix_fmt != AV_PIX_FMT_MONOBLACK) {
+    if (avctx->pix_fmt == AV_PIX_FMT_GBRPF32 || avctx->pix_fmt == AV_PIX_FMT_GRAYF32) {
+        pnm_get(s, buf1, sizeof(buf1));
+        if (av_sscanf(buf1, "%f", &s->scale) != 1 || s->scale == 0.0 || !isfinite(s->scale)) {
+            av_log(avctx, AV_LOG_ERROR, "Invalid scale.\n");
+            return AVERROR_INVALIDDATA;
+        }
+        s->endian = s->scale < 0.f;
+        s->scale = fabsf(s->scale);
+        s->maxval = (1ULL << 32) - 1;
+    } else if (avctx->pix_fmt != AV_PIX_FMT_MONOWHITE && avctx->pix_fmt != AV_PIX_FMT_MONOBLACK) {
         pnm_get(s, buf1, sizeof(buf1));
         s->maxval = atoi(buf1);
-        if (s->maxval <= 0) {
+        if (s->maxval <= 0 || s->maxval > UINT16_MAX) {
             av_log(avctx, AV_LOG_ERROR, "Invalid maxval: %d\n", s->maxval);
             s->maxval = 255;
         }
@@ -183,8 +227,13 @@ int ff_pnm_decode_header(AVCodecContext *avctx, PNMContext * const s)
         }
     }else
         s->maxval=1;
+
+    if (!pnm_space(s->bytestream[-1]))
+        return AVERROR_INVALIDDATA;
+
     /* more check if YUV420 */
-    if (av_pix_fmt_desc_get(avctx->pix_fmt)->flags & AV_PIX_FMT_FLAG_PLANAR) {
+    if ((av_pix_fmt_desc_get(avctx->pix_fmt)->flags & AV_PIX_FMT_FLAG_PLANAR) &&
+        avctx->pix_fmt != AV_PIX_FMT_GBRPF32) {
         if ((avctx->width & 1) != 0)
             return AVERROR_INVALIDDATA;
         h = (avctx->height * 2);

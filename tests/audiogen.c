@@ -26,7 +26,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define MAX_CHANNELS 8
+#define MAX_CHANNELS 12
 
 static unsigned int myrnd(unsigned int *seed_ptr, int n)
 {
@@ -109,7 +109,7 @@ static void put32(uint32_t v)
     fputc((v >> 24) & 0xff, outfile);
 }
 
-#define HEADER_SIZE      46
+#define HEADER_SIZE      38
 #define FMT_SIZE         18
 #define SAMPLE_SIZE       2
 #define WFORMAT_PCM  0x0001

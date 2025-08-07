@@ -22,12 +22,14 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "libavutil/intreadwrite.h"
+#include <string.h>
+
 #include "libavutil/imgutils.h"
+#include "libavutil/internal.h"
 
 #include "avcodec.h"
-#include "get_bits.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 
 typedef struct YopDecContext {
     AVCodecContext *avctx;
@@ -37,9 +39,9 @@ typedef struct YopDecContext {
     int first_color[2];
     int frame_data_length;
 
-    uint8_t *low_nibble;
-    uint8_t *srcptr;
-    uint8_t *src_end;
+    const uint8_t *low_nibble;
+    const uint8_t *srcptr;
+    const uint8_t *src_end;
     uint8_t *dstptr;
     uint8_t *dstbuf;
 } YopDecContext;
@@ -188,8 +190,8 @@ static uint8_t yop_get_next_nibble(YopDecContext *s)
     return ret;
 }
 
-static int yop_decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
-                            AVPacket *avpkt)
+static int yop_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
+                            int *got_frame, AVPacket *avpkt)
 {
     YopDecContext *s = avctx->priv_data;
     AVFrame *frame = s->frame;
@@ -202,10 +204,10 @@ static int yop_decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
         return AVERROR_INVALIDDATA;
     }
 
-    if ((ret = ff_reget_buffer(avctx, frame)) < 0)
+    if ((ret = ff_reget_buffer(avctx, frame, 0)) < 0)
         return ret;
 
-    if (!avctx->frame_number)
+    if (!avctx->frame_num)
         memset(frame->data[1], 0, AVPALETTE_SIZE);
 
     s->dstbuf     = frame->data[0];
@@ -229,8 +231,6 @@ static int yop_decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
         palette[i + firstcolor] |= 0xFFU << 24 |
                                    (palette[i + firstcolor] >> 6) & 0x30303;
     }
-
-    frame->palette_has_changed = 1;
 
     for (y = 0; y < avctx->height; y += 2) {
         for (x = 0; x < avctx->width; x += 2) {
@@ -256,20 +256,21 @@ static int yop_decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
         s->dstptr += 2*frame->linesize[0] - x;
     }
 
-    if ((ret = av_frame_ref(data, s->frame)) < 0)
+    if ((ret = av_frame_ref(rframe, s->frame)) < 0)
         return ret;
 
     *got_frame = 1;
     return avpkt->size;
 }
 
-AVCodec ff_yop_decoder = {
-    .name           = "yop",
-    .long_name      = NULL_IF_CONFIG_SMALL("Psygnosis YOP Video"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_YOP,
+const FFCodec ff_yop_decoder = {
+    .p.name         = "yop",
+    CODEC_LONG_NAME("Psygnosis YOP Video"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_YOP,
+    .p.capabilities = AV_CODEC_CAP_DR1,
     .priv_data_size = sizeof(YopDecContext),
     .init           = yop_decode_init,
     .close          = yop_decode_close,
-    .decode         = yop_decode_frame,
+    FF_CODEC_DECODE_CB(yop_decode_frame),
 };

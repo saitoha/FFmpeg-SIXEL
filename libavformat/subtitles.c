@@ -23,6 +23,7 @@
 #include "avio_internal.h"
 #include "libavutil/avassert.h"
 #include "libavutil/avstring.h"
+#include "libavutil/mem.h"
 
 void ff_text_init_avio(void *s, FFTextReader *r, AVIOContext *pb)
 {
@@ -50,11 +51,10 @@ void ff_text_init_avio(void *s, FFTextReader *r, AVIOContext *pb)
                "UTF16 is automatically converted to UTF8, do not specify a character encoding\n");
 }
 
-void ff_text_init_buf(FFTextReader *r, void *buf, size_t size)
+void ff_text_init_buf(FFTextReader *r, const void *buf, size_t size)
 {
-    memset(&r->buf_pb, 0, sizeof(r->buf_pb));
-    ffio_init_context(&r->buf_pb, buf, size, 0, NULL, NULL, NULL, NULL);
-    ff_text_init_avio(NULL, r, &r->buf_pb);
+    ffio_init_read_context(&r->buf_pb, buf, size);
+    ff_text_init_avio(NULL, r, &r->buf_pb.pub);
 }
 
 int64_t ff_text_pos(FFTextReader *r)
@@ -111,17 +111,21 @@ int ff_text_peek_r8(FFTextReader *r)
 AVPacket *ff_subtitles_queue_insert(FFDemuxSubtitlesQueue *q,
                                     const uint8_t *event, size_t len, int merge)
 {
-    AVPacket *subs, *sub;
+    AVPacket **subs, *sub;
+
+    av_assert1(event || len == 0);
 
     if (merge && q->nb_subs > 0) {
         /* merge with previous event */
 
         int old_len;
-        sub = &q->subs[q->nb_subs - 1];
+        sub = q->subs[q->nb_subs - 1];
         old_len = sub->size;
-        if (av_grow_packet(sub, len) < 0)
-            return NULL;
-        memcpy(sub->data + old_len, event, len);
+        if (event) {
+            if (av_grow_packet(sub, len) < 0)
+                return NULL;
+            memcpy(sub->data + old_len, event, len);
+        }
     } else {
         /* new event */
 
@@ -132,32 +136,44 @@ AVPacket *ff_subtitles_queue_insert(FFDemuxSubtitlesQueue *q,
         if (!subs)
             return NULL;
         q->subs = subs;
-        sub = &subs[q->nb_subs++];
-        if (av_new_packet(sub, len) < 0)
+        sub = av_packet_alloc();
+        if (!sub)
             return NULL;
+        if (event) {
+            if (av_new_packet(sub, len) < 0) {
+                av_packet_free(&sub);
+                return NULL;
+            }
+            memcpy(sub->data, event, len);
+        }
         sub->flags |= AV_PKT_FLAG_KEY;
         sub->pts = sub->dts = 0;
-        memcpy(sub->data, event, len);
+        subs[q->nb_subs++] = sub;
     }
     return sub;
 }
 
+AVPacket *ff_subtitles_queue_insert_bprint(FFDemuxSubtitlesQueue *q,
+                                           const AVBPrint *event, int merge)
+{
+    if (!av_bprint_is_complete(event))
+        return NULL;
+    return ff_subtitles_queue_insert(q, event->str, event->len, merge);
+}
+
 static int cmp_pkt_sub_ts_pos(const void *a, const void *b)
 {
-    const AVPacket *s1 = a;
-    const AVPacket *s2 = b;
-    if (s1->pts == s2->pts) {
-        if (s1->pos == s2->pos)
-            return 0;
-        return s1->pos > s2->pos ? 1 : -1;
-    }
-    return s1->pts > s2->pts ? 1 : -1;
+    const AVPacket *s1 = *(const AVPacket **)a;
+    const AVPacket *s2 = *(const AVPacket **)b;
+    if (s1->pts == s2->pts)
+        return FFDIFFSIGN(s1->pos, s2->pos);
+    return FFDIFFSIGN(s1->pts , s2->pts);
 }
 
 static int cmp_pkt_sub_pos_ts(const void *a, const void *b)
 {
-    const AVPacket *s1 = a;
-    const AVPacket *s2 = b;
+    const AVPacket *s1 = *(const AVPacket **)a;
+    const AVPacket *s2 = *(const AVPacket **)b;
     if (s1->pos == s2->pos) {
         if (s1->pts == s2->pts)
             return 0;
@@ -166,26 +182,61 @@ static int cmp_pkt_sub_pos_ts(const void *a, const void *b)
     return s1->pos > s2->pos ? 1 : -1;
 }
 
-void ff_subtitles_queue_finalize(FFDemuxSubtitlesQueue *q)
+static void drop_dups(void *log_ctx, FFDemuxSubtitlesQueue *q)
+{
+    int i, drop = 0;
+
+    for (i = 1; i < q->nb_subs; i++) {
+        const int last_id = i - 1 - drop;
+        const AVPacket *last = q->subs[last_id];
+
+        if (q->subs[i]->pts        == last->pts &&
+            q->subs[i]->duration   == last->duration &&
+            q->subs[i]->stream_index == last->stream_index &&
+            !strcmp(q->subs[i]->data, last->data)) {
+
+            av_packet_free(&q->subs[i]);
+            drop++;
+        } else if (drop) {
+            q->subs[last_id + 1] = q->subs[i];
+            q->subs[i] = NULL;
+        }
+    }
+
+    if (drop) {
+        q->nb_subs -= drop;
+        av_log(log_ctx, AV_LOG_WARNING, "Dropping %d duplicated subtitle events\n", drop);
+    }
+}
+
+void ff_subtitles_queue_finalize(void *log_ctx, FFDemuxSubtitlesQueue *q)
 {
     int i;
+
+    if (!q->nb_subs)
+        return;
 
     qsort(q->subs, q->nb_subs, sizeof(*q->subs),
           q->sort == SUB_SORT_TS_POS ? cmp_pkt_sub_ts_pos
                                      : cmp_pkt_sub_pos_ts);
     for (i = 0; i < q->nb_subs; i++)
-        if (q->subs[i].duration == -1 && i < q->nb_subs - 1)
-            q->subs[i].duration = q->subs[i + 1].pts - q->subs[i].pts;
+        if (q->subs[i]->duration < 0 && i < q->nb_subs - 1 && q->subs[i + 1]->pts - (uint64_t)q->subs[i]->pts <= INT64_MAX)
+            q->subs[i]->duration = q->subs[i + 1]->pts - q->subs[i]->pts;
+
+    if (!q->keep_duplicates)
+        drop_dups(log_ctx, q);
 }
 
 int ff_subtitles_queue_read_packet(FFDemuxSubtitlesQueue *q, AVPacket *pkt)
 {
-    AVPacket *sub = q->subs + q->current_sub_idx;
+    AVPacket *sub;
+    int ret;
 
     if (q->current_sub_idx == q->nb_subs)
         return AVERROR_EOF;
-    if (av_copy_packet(pkt, sub) < 0) {
-        return AVERROR(ENOMEM);
+    sub = q->subs[q->current_sub_idx];
+    if ((ret = av_packet_ref(pkt, sub)) < 0) {
+        return ret;
     }
 
     pkt->dts = pkt->pts;
@@ -206,9 +257,9 @@ static int search_sub_ts(const FFDemuxSubtitlesQueue *q, int64_t ts)
         if (s1 == s2)
             return s1;
         if (s1 == s2 - 1)
-            return q->subs[s1].pts <= q->subs[s2].pts ? s1 : s2;
+            return q->subs[s1]->pts <= q->subs[s2]->pts ? s1 : s2;
         mid = (s1 + s2) / 2;
-        if (q->subs[mid].pts <= ts)
+        if (q->subs[mid]->pts <= ts)
             s1 = mid;
         else
             s2 = mid;
@@ -230,24 +281,24 @@ int ff_subtitles_queue_seek(FFDemuxSubtitlesQueue *q, AVFormatContext *s, int st
 
         if (idx < 0)
             return idx;
-        for (i = idx; i < q->nb_subs && q->subs[i].pts < min_ts; i++)
-            if (stream_index == -1 || q->subs[i].stream_index == stream_index)
+        for (i = idx; i < q->nb_subs && q->subs[i]->pts < min_ts; i++)
+            if (stream_index == -1 || q->subs[i]->stream_index == stream_index)
                 idx = i;
-        for (i = idx; i > 0 && q->subs[i].pts > max_ts; i--)
-            if (stream_index == -1 || q->subs[i].stream_index == stream_index)
+        for (i = idx; i > 0 && q->subs[i]->pts > max_ts; i--)
+            if (stream_index == -1 || q->subs[i]->stream_index == stream_index)
                 idx = i;
 
-        ts_selected = q->subs[idx].pts;
+        ts_selected = q->subs[idx]->pts;
         if (ts_selected < min_ts || ts_selected > max_ts)
             return AVERROR(ERANGE);
 
         /* look back in the latest subtitles for overlapping subtitles */
         for (i = idx - 1; i >= 0; i--) {
-            int64_t pts = q->subs[i].pts;
-            if (q->subs[i].duration <= 0 ||
-                (stream_index != -1 && q->subs[i].stream_index != stream_index))
+            int64_t pts = q->subs[i]->pts;
+            if (q->subs[i]->duration <= 0 ||
+                (stream_index != -1 && q->subs[i]->stream_index != stream_index))
                 continue;
-            if (pts >= min_ts && pts > ts_selected - q->subs[i].duration)
+            if (pts >= min_ts && pts > ts_selected - q->subs[i]->duration)
                 idx = i;
             else
                 break;
@@ -259,7 +310,7 @@ int ff_subtitles_queue_seek(FFDemuxSubtitlesQueue *q, AVFormatContext *s, int st
          * queue is ordered by pts and then filepos, so we can take the first
          * entry for a given timestamp. */
         if (stream_index == -1)
-            while (idx > 0 && q->subs[idx - 1].pts == q->subs[idx].pts)
+            while (idx > 0 && q->subs[idx - 1]->pts == q->subs[idx]->pts)
                 idx--;
 
         q->current_sub_idx = idx;
@@ -272,9 +323,30 @@ void ff_subtitles_queue_clean(FFDemuxSubtitlesQueue *q)
     int i;
 
     for (i = 0; i < q->nb_subs; i++)
-        av_free_packet(&q->subs[i]);
+        av_packet_free(&q->subs[i]);
     av_freep(&q->subs);
     q->nb_subs = q->allocated_size = q->current_sub_idx = 0;
+}
+
+int ff_subtitles_read_packet(AVFormatContext *s, AVPacket *pkt)
+{
+    FFDemuxSubtitlesQueue *q = s->priv_data;
+    return ff_subtitles_queue_read_packet(q, pkt);
+}
+
+int ff_subtitles_read_seek(AVFormatContext *s, int stream_index,
+                           int64_t min_ts, int64_t ts, int64_t max_ts, int flags)
+{
+    FFDemuxSubtitlesQueue *q = s->priv_data;
+    return ff_subtitles_queue_seek(q, s, stream_index,
+                                   min_ts, ts, max_ts, flags);
+}
+
+int ff_subtitles_read_close(AVFormatContext *s)
+{
+    FFDemuxSubtitlesQueue *q = s->priv_data;
+    ff_subtitles_queue_clean(q);
+    return 0;
 }
 
 int ff_smil_extract_next_text_chunk(FFTextReader *tr, AVBPrint *buf, char *c)
@@ -291,13 +363,15 @@ int ff_smil_extract_next_text_chunk(FFTextReader *tr, AVBPrint *buf, char *c)
     do {
         av_bprint_chars(buf, *c, 1);
         *c = ff_text_r8(tr);
+        if (i == INT_MAX)
+            return AVERROR_INVALIDDATA;
         i++;
     } while (*c != end_chr && *c);
     if (end_chr == '>') {
         av_bprint_chars(buf, '>', 1);
         *c = 0;
     }
-    return i;
+    return av_bprint_is_complete(buf) ? i : AVERROR(ENOMEM);
 }
 
 const char *ff_smil_get_attr_ptr(const char *s, const char *attr)
@@ -325,7 +399,7 @@ static inline int is_eol(char c)
     return c == '\r' || c == '\n';
 }
 
-void ff_subtitles_read_text_chunk(FFTextReader *tr, AVBPrint *buf)
+int ff_subtitles_read_text_chunk(FFTextReader *tr, AVBPrint *buf)
 {
     char eol_buf[5], last_was_cr = 0;
     int n = 0, i = 0, nb_eol = 0;
@@ -365,15 +439,16 @@ void ff_subtitles_read_text_chunk(FFTextReader *tr, AVBPrint *buf)
         av_bprint_chars(buf, c, 1);
         n++;
     }
+    return av_bprint_is_complete(buf) ? 0 : AVERROR(ENOMEM);
 }
 
-void ff_subtitles_read_chunk(AVIOContext *pb, AVBPrint *buf)
+int ff_subtitles_read_chunk(AVIOContext *pb, AVBPrint *buf)
 {
     FFTextReader tr;
     tr.buf_pos = tr.buf_len = 0;
     tr.type = 0;
     tr.pb = pb;
-    ff_subtitles_read_text_chunk(&tr, buf);
+    return ff_subtitles_read_text_chunk(&tr, buf);
 }
 
 ptrdiff_t ff_subtitles_read_line(FFTextReader *tr, char *buf, size_t size)
@@ -381,6 +456,7 @@ ptrdiff_t ff_subtitles_read_line(FFTextReader *tr, char *buf, size_t size)
     size_t cur = 0;
     if (!size)
         return 0;
+    buf[0] = '\0';
     while (cur + 1 < size) {
         unsigned char c = ff_text_r8(tr);
         if (!c)
@@ -390,7 +466,7 @@ ptrdiff_t ff_subtitles_read_line(FFTextReader *tr, char *buf, size_t size)
         buf[cur++] = c;
         buf[cur] = '\0';
     }
-    if (ff_text_peek_r8(tr) == '\r')
+    while (ff_text_peek_r8(tr) == '\r')
         ff_text_r8(tr);
     if (ff_text_peek_r8(tr) == '\n')
         ff_text_r8(tr);

@@ -31,7 +31,7 @@
 #include "atrac3plus.h"
 #include "atrac3plus_data.h"
 
-static VLC_TYPE tables_data[154276][2];
+static VLCElem tables_data[154276];
 static VLC wl_vlc_tabs[4];
 static VLC sf_vlc_tabs[8];
 static VLC ct_vlc_tabs[4];
@@ -39,177 +39,79 @@ static VLC spec_vlc_tabs[112];
 static VLC gain_vlc_tabs[11];
 static VLC tone_vlc_tabs[7];
 
-#define GET_DELTA(gb, delta_bits) \
-    ((delta_bits) ? get_bits((gb), (delta_bits)) : 0)
-
 /**
  * Generate canonical VLC table from given descriptor.
  *
  * @param[in]     cb          ptr to codebook descriptor
- * @param[in]     xlat        ptr to translation table or NULL
+ * @param[in,out] xlat        ptr to ptr to translation table
  * @param[in,out] tab_offset  starting offset to the generated vlc table
  * @param[out]    out_vlc     ptr to vlc table to be generated
  */
-static av_cold void build_canonical_huff(const uint8_t *cb, const uint8_t *xlat,
+static av_cold void build_canonical_huff(const uint8_t *cb, const uint8_t **xlat,
                                          int *tab_offset, VLC *out_vlc)
 {
-    int i, b;
-    uint16_t codes[256];
+    int i, max_len;
     uint8_t bits[256];
-    unsigned code = 0;
     int index = 0;
-    int min_len = *cb++; // get shortest codeword length
-    int max_len = *cb++; // get longest  codeword length
 
-    for (b = min_len; b <= max_len; b++) {
+    for (int b = 1; b <= 12; b++) {
         for (i = *cb++; i > 0; i--) {
             av_assert0(index < 256);
             bits[index]  = b;
-            codes[index] = code++;
             index++;
         }
-        code <<= 1;
     }
+    max_len = bits[index - 1];
 
     out_vlc->table = &tables_data[*tab_offset];
     out_vlc->table_allocated = 1 << max_len;
 
-    ff_init_vlc_sparse(out_vlc, max_len, index, bits, 1, 1, codes, 2, 2,
-                       xlat, 1, 1, INIT_VLC_USE_NEW_STATIC);
+    ff_vlc_init_from_lengths(out_vlc, max_len, index, bits, 1,
+                             *xlat, 1, 1, 0, VLC_INIT_USE_STATIC, NULL);
 
     *tab_offset += 1 << max_len;
+    *xlat       += index;
 }
 
 av_cold void ff_atrac3p_init_vlcs(void)
 {
-    int i, wl_vlc_offs, ct_vlc_offs, sf_vlc_offs, tab_offset;
+    int i, tab_offset = 0;
+    const uint8_t *xlats;
 
-    static const int wl_nb_bits[4]  = { 2, 3, 5, 5 };
-    static const int wl_nb_codes[4] = { 3, 5, 8, 8 };
-    static const uint8_t * const wl_bits[4] = {
-        atrac3p_wl_huff_bits1, atrac3p_wl_huff_bits2,
-        atrac3p_wl_huff_bits3, atrac3p_wl_huff_bits4
-    };
-    static const uint8_t * const wl_codes[4] = {
-        atrac3p_wl_huff_code1, atrac3p_wl_huff_code2,
-        atrac3p_wl_huff_code3, atrac3p_wl_huff_code4
-    };
-    static const uint8_t * const wl_xlats[4] = {
-        atrac3p_wl_huff_xlat1, atrac3p_wl_huff_xlat2, NULL, NULL
-    };
-
-    static const int ct_nb_bits[4]  = { 3, 4, 4, 4 };
-    static const int ct_nb_codes[4] = { 4, 8, 8, 8 };
-    static const uint8_t * const ct_bits[4]  = {
-        atrac3p_ct_huff_bits1, atrac3p_ct_huff_bits2,
-        atrac3p_ct_huff_bits2, atrac3p_ct_huff_bits3
-    };
-    static const uint8_t * const ct_codes[4] = {
-        atrac3p_ct_huff_code1, atrac3p_ct_huff_code2,
-        atrac3p_ct_huff_code2, atrac3p_ct_huff_code3
-    };
-    static const uint8_t * const ct_xlats[4] = {
-        NULL, NULL, atrac3p_ct_huff_xlat1, NULL
-    };
-
-    static const  int sf_nb_bits[8]  = {  9,  9,  9,  9,  6,  6,  7,  7 };
-    static const  int sf_nb_codes[8] = { 64, 64, 64, 64, 16, 16, 16, 16 };
-    static const uint8_t  * const sf_bits[8]  = {
-        atrac3p_sf_huff_bits1, atrac3p_sf_huff_bits1, atrac3p_sf_huff_bits2,
-        atrac3p_sf_huff_bits3, atrac3p_sf_huff_bits4, atrac3p_sf_huff_bits4,
-        atrac3p_sf_huff_bits5, atrac3p_sf_huff_bits6
-    };
-    static const uint16_t * const sf_codes[8] = {
-        atrac3p_sf_huff_code1, atrac3p_sf_huff_code1, atrac3p_sf_huff_code2,
-        atrac3p_sf_huff_code3, atrac3p_sf_huff_code4, atrac3p_sf_huff_code4,
-        atrac3p_sf_huff_code5, atrac3p_sf_huff_code6
-    };
-    static const uint8_t  * const sf_xlats[8] = {
-        atrac3p_sf_huff_xlat1, atrac3p_sf_huff_xlat2, NULL, NULL,
-        atrac3p_sf_huff_xlat4, atrac3p_sf_huff_xlat5, NULL, NULL
-    };
-
-    static const uint8_t * const gain_cbs[11] = {
-        atrac3p_huff_gain_npoints1_cb, atrac3p_huff_gain_npoints1_cb,
-        atrac3p_huff_gain_lev1_cb, atrac3p_huff_gain_lev2_cb,
-        atrac3p_huff_gain_lev3_cb, atrac3p_huff_gain_lev4_cb,
-        atrac3p_huff_gain_loc3_cb, atrac3p_huff_gain_loc1_cb,
-        atrac3p_huff_gain_loc4_cb, atrac3p_huff_gain_loc2_cb,
-        atrac3p_huff_gain_loc5_cb
-    };
-    static const uint8_t * const gain_xlats[11] = {
-        NULL, atrac3p_huff_gain_npoints2_xlat, atrac3p_huff_gain_lev1_xlat,
-        atrac3p_huff_gain_lev2_xlat, atrac3p_huff_gain_lev3_xlat,
-        atrac3p_huff_gain_lev4_xlat, atrac3p_huff_gain_loc3_xlat,
-        atrac3p_huff_gain_loc1_xlat, atrac3p_huff_gain_loc4_xlat,
-        atrac3p_huff_gain_loc2_xlat, atrac3p_huff_gain_loc5_xlat
-    };
-
-    static const uint8_t * const tone_cbs[7] = {
-        atrac3p_huff_tonebands_cb,  atrac3p_huff_numwavs1_cb,
-        atrac3p_huff_numwavs2_cb,   atrac3p_huff_wav_ampsf1_cb,
-        atrac3p_huff_wav_ampsf2_cb, atrac3p_huff_wav_ampsf3_cb,
-        atrac3p_huff_freq_cb
-    };
-    static const uint8_t * const tone_xlats[7] = {
-        NULL, NULL, atrac3p_huff_numwavs2_xlat, atrac3p_huff_wav_ampsf1_xlat,
-        atrac3p_huff_wav_ampsf2_xlat, atrac3p_huff_wav_ampsf3_xlat,
-        atrac3p_huff_freq_xlat
-    };
-
-    for (i = 0, wl_vlc_offs = 0, ct_vlc_offs = 2508; i < 4; i++) {
-        wl_vlc_tabs[i].table = &tables_data[wl_vlc_offs];
-        wl_vlc_tabs[i].table_allocated = 1 << wl_nb_bits[i];
-        ct_vlc_tabs[i].table = &tables_data[ct_vlc_offs];
-        ct_vlc_tabs[i].table_allocated = 1 << ct_nb_bits[i];
-
-        ff_init_vlc_sparse(&wl_vlc_tabs[i], wl_nb_bits[i], wl_nb_codes[i],
-                           wl_bits[i],  1, 1,
-                           wl_codes[i], 1, 1,
-                           wl_xlats[i], 1, 1,
-                           INIT_VLC_USE_NEW_STATIC);
-
-        ff_init_vlc_sparse(&ct_vlc_tabs[i], ct_nb_bits[i], ct_nb_codes[i],
-                           ct_bits[i],  1, 1,
-                           ct_codes[i], 1, 1,
-                           ct_xlats[i], 1, 1,
-                           INIT_VLC_USE_NEW_STATIC);
-
-        wl_vlc_offs += wl_vlc_tabs[i].table_allocated;
-        ct_vlc_offs += ct_vlc_tabs[i].table_allocated;
+    xlats = atrac3p_wl_ct_xlats;
+    for (int i = 0; i < 4; i++) {
+        build_canonical_huff(atrac3p_wl_cbs[i], &xlats,
+                             &tab_offset, &wl_vlc_tabs[i]);
+        build_canonical_huff(atrac3p_ct_cbs[i], &xlats,
+                             &tab_offset, &ct_vlc_tabs[i]);
     }
 
-    for (i = 0, sf_vlc_offs = 76; i < 8; i++) {
-        sf_vlc_tabs[i].table = &tables_data[sf_vlc_offs];
-        sf_vlc_tabs[i].table_allocated = 1 << sf_nb_bits[i];
-
-        ff_init_vlc_sparse(&sf_vlc_tabs[i], sf_nb_bits[i], sf_nb_codes[i],
-                           sf_bits[i],  1, 1,
-                           sf_codes[i], 2, 2,
-                           sf_xlats[i], 1, 1,
-                           INIT_VLC_USE_NEW_STATIC);
-        sf_vlc_offs += sf_vlc_tabs[i].table_allocated;
-    }
-
-    tab_offset = 2564;
+    xlats = atrac3p_sf_xlats;
+    for (int i = 0; i < 8; i++)
+        build_canonical_huff(atrac3p_sf_cbs[i], &xlats,
+                             &tab_offset, &sf_vlc_tabs[i]);
 
     /* build huffman tables for spectrum decoding */
+    xlats = atrac3p_spectra_xlats;
     for (i = 0; i < 112; i++) {
-        if (atrac3p_spectra_tabs[i].cb)
-            build_canonical_huff(atrac3p_spectra_tabs[i].cb,
-                                 atrac3p_spectra_tabs[i].xlat,
-                                 &tab_offset, &spec_vlc_tabs[i]);
-        else
-            spec_vlc_tabs[i].table = 0;
+        if (atrac3p_spectra_cbs[i][0] >= 0)
+            build_canonical_huff(atrac3p_spectra_cbs[i],
+                                 &xlats, &tab_offset, &spec_vlc_tabs[i]);
+        else /* Reuse already initialized VLC table */
+            spec_vlc_tabs[i] = spec_vlc_tabs[-atrac3p_spectra_cbs[i][0]];
     }
 
     /* build huffman tables for gain data decoding */
+    xlats = atrac3p_gain_xlats;
     for (i = 0; i < 11; i++)
-        build_canonical_huff(gain_cbs[i], gain_xlats[i], &tab_offset, &gain_vlc_tabs[i]);
+        build_canonical_huff(atrac3p_gain_cbs[i], &xlats,
+                             &tab_offset, &gain_vlc_tabs[i]);
 
     /* build huffman tables for tone decoding */
+    xlats = atrac3p_tone_xlats;
     for (i = 0; i < 7; i++)
-        build_canonical_huff(tone_cbs[i], tone_xlats[i], &tab_offset, &tone_vlc_tabs[i]);
+        build_canonical_huff(atrac3p_tone_cbs[i], &xlats,
+                             &tab_offset, &tone_vlc_tabs[i]);
 }
 
 /**
@@ -384,7 +286,7 @@ static int decode_channel_wordlen(GetBitContext *gb, Atrac3pChanUnitCtx *ctx,
                     chan->qu_wordlen[i] = get_bits(gb, 3);
 
                 for (i = pos; i < chan->num_coded_vals; i++)
-                    chan->qu_wordlen[i] = (min_val + GET_DELTA(gb, delta_bits)) & 7;
+                    chan->qu_wordlen[i] = (min_val + get_bitsz(gb, delta_bits)) & 7;
             }
         }
         break;
@@ -459,6 +361,10 @@ static int decode_channel_wordlen(GetBitContext *gb, Atrac3pChanUnitCtx *ctx,
     } else if (chan->fill_mode == 3) {
         pos = ch_num ? chan->num_coded_vals + chan->split_point
                      : ctx->num_quant_units - chan->split_point;
+        if (pos > FF_ARRAY_ELEMS(chan->qu_wordlen)) {
+            av_log(avctx, AV_LOG_ERROR, "Split point beyond array\n");
+            pos = FF_ARRAY_ELEMS(chan->qu_wordlen);
+        }
         for (i = chan->num_coded_vals; i < pos; i++)
             chan->qu_wordlen[i] = 1;
     }
@@ -516,7 +422,7 @@ static int decode_channel_sf_idx(GetBitContext *gb, Atrac3pChanUnitCtx *ctx,
                 /* all others are: min_val + delta */
                 for (i = num_long_vals; i < ctx->used_quant_units; i++)
                     chan->qu_sf_idx[i] = (chan->qu_sf_idx[i] + min_val +
-                                          GET_DELTA(gb, delta_bits)) & 0x3F;
+                                          get_bitsz(gb, delta_bits)) & 0x3F;
             } else {
                 num_long_vals = get_bits(gb, 5);
                 delta_bits    = get_bits(gb, 3);
@@ -534,7 +440,7 @@ static int decode_channel_sf_idx(GetBitContext *gb, Atrac3pChanUnitCtx *ctx,
                 /* all others are: min_val + delta */
                 for (i = num_long_vals; i < ctx->used_quant_units; i++)
                     chan->qu_sf_idx[i] = (min_val +
-                                          GET_DELTA(gb, delta_bits)) & 0x3F;
+                                          get_bitsz(gb, delta_bits)) & 0x3F;
             }
         }
         break;
@@ -828,7 +734,7 @@ static void decode_qu_spectra(GetBitContext *gb, const Atrac3pSpecCodeTab *tab,
                 val = get_vlc2(gb, vlc_tab->table, vlc_tab->bits, 1);
 
                 for (i = 0; i < num_coeffs; i++) {
-                    cf = av_mod_uintp2(val, bits);
+                    cf = av_zero_extend(val, bits);
                     if (is_signed)
                         cf = sign_extend(cf, bits);
                     else if (cf && get_bits1(gb))
@@ -878,10 +784,6 @@ static void decode_spectrum(GetBitContext *gb, Atrac3pChanUnitCtx *ctx,
 
                 tab_index = (chan->table_type * 8 + codetab) * 7 + wordlen - 1;
                 tab       = &atrac3p_spectra_tabs[tab_index];
-
-                /* this allows reusing VLC tables */
-                if (tab->redirect >= 0)
-                    tab_index = tab->redirect;
 
                 decode_qu_spectra(gb, tab, &spec_vlc_tabs[tab_index],
                                   &chan->spectrum[ff_atrac3p_qu_to_spec_pos[qu]],
@@ -1014,7 +916,7 @@ static int decode_gainc_npoints(GetBitContext *gb, Atrac3pChanUnitCtx *ctx,
             min_val    = get_bits(gb, 3);
 
             for (i = 0; i < coded_subbands; i++) {
-                chan->gain_data[i].num_points = min_val + GET_DELTA(gb, delta_bits);
+                chan->gain_data[i].num_points = min_val + get_bitsz(gb, delta_bits);
                 if (chan->gain_data[i].num_points > 7)
                     return AVERROR_INVALIDDATA;
             }
@@ -1134,7 +1036,7 @@ static int decode_gainc_levels(GetBitContext *gb, Atrac3pChanUnitCtx *ctx,
 
             for (sb = 0; sb < coded_subbands; sb++)
                 for (i = 0; i < chan->gain_data[sb].num_points; i++) {
-                    chan->gain_data[sb].lev_code[i] = min_val + GET_DELTA(gb, delta_bits);
+                    chan->gain_data[sb].lev_code[i] = min_val + get_bitsz(gb, delta_bits);
                     if (chan->gain_data[sb].lev_code[i] > 15)
                         return AVERROR_INVALIDDATA;
                 }
@@ -1489,9 +1391,9 @@ static int decode_band_numwavs(GetBitContext *gb, Atrac3pChanUnitCtx *ctx,
         if (band_has_tones[sb]) {
             if (ctx->waves_info->tones_index + dst[sb].num_wavs > 48) {
                 av_log(avctx, AV_LOG_ERROR,
-                       "Too many tones: %d (max. 48), frame: %d!\n",
+                       "Too many tones: %d (max. 48), frame: %"PRId64"!\n",
                        ctx->waves_info->tones_index + dst[sb].num_wavs,
-                       avctx->frame_number);
+                       avctx->frame_num);
                 return AVERROR_INVALIDDATA;
             }
             dst[sb].start_index           = ctx->waves_info->tones_index;
@@ -1724,11 +1626,7 @@ static int decode_tones_info(GetBitContext *gb, Atrac3pChanUnitCtx *ctx,
     if (num_channels == 2) {
         get_subband_flags(gb, ctx->waves_info->tone_sharing, ctx->waves_info->num_tone_bands);
         get_subband_flags(gb, ctx->waves_info->tone_master,  ctx->waves_info->num_tone_bands);
-        if (get_subband_flags(gb, ctx->waves_info->phase_shift,
-                              ctx->waves_info->num_tone_bands)) {
-            avpriv_report_missing_feature(avctx, "GHA Phase shifting");
-            return AVERROR_PATCHWELCOME;
-        }
+        get_subband_flags(gb, ctx->waves_info->invert_phase, ctx->waves_info->num_tone_bands);
     }
 
     ctx->waves_info->tones_index = 0;

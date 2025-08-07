@@ -19,11 +19,11 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "libavcodec/get_bits.h"
+#include "libavutil/intreadwrite.h"
 #include "avformat.h"
 #include "rawdec.h"
 
-static int h261_probe(AVProbeData *p)
+static int h261_probe(const AVProbeData *p)
 {
     int i;
     int valid_psc=0;

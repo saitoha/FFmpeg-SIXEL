@@ -33,24 +33,44 @@
 #include <lzma.h>
 #endif
 
+#include <float.h>
+
 #include "libavutil/attributes.h"
+#include "libavutil/attributes_internal.h"
 #include "libavutil/avstring.h"
+#include "libavutil/error.h"
 #include "libavutil/intreadwrite.h"
-#include "libavutil/imgutils.h"
+#include "libavutil/mem.h"
+#include "libavutil/opt.h"
+#include "libavutil/reverse.h"
 #include "avcodec.h"
 #include "bytestream.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include "faxcompr.h"
-#include "internal.h"
 #include "lzw.h"
-#include "mathops.h"
 #include "tiff.h"
+#include "tiff_common.h"
 #include "tiff_data.h"
+#include "mjpegdec.h"
 #include "thread.h"
+#include "get_bits.h"
 
 typedef struct TiffContext {
+    AVClass *class;
     AVCodecContext *avctx;
     GetByteContext gb;
 
+    /* JPEG decoding for DNG */
+    AVCodecContext *avctx_mjpeg; // wrapper context for MJPEG
+    AVPacket *jpkt;              // encoded JPEG tile
+    AVFrame *jpgframe;           // decoded JPEG tile
+
+    int get_subimage;
+    uint16_t get_page;
+    int get_thumbnail;
+
+    enum TiffType tiff_type;
     int width, height;
     unsigned int bpp, bppcount;
     uint32_t palette[256];
@@ -64,11 +84,38 @@ typedef struct TiffContext {
     int predictor;
     int fill_order;
     uint32_t res[4];
+    int is_thumbnail;
+    unsigned last_tag;
+
+    int is_bayer;
+    int use_color_matrix;
+    uint8_t pattern[4];
+
+    float   analog_balance[4];
+    float   as_shot_neutral[4];
+    float   as_shot_white[4];
+    float   color_matrix[3][4];
+    float   camera_calibration[4][4];
+    float   premultiply[4];
+    float   black_level[4];
+
+    unsigned white_level;
+    uint16_t dng_lut[65536];
+
+    uint32_t sub_ifd;
+    uint16_t cur_page;
 
     int strips, rps, sstype;
     int sot;
     int stripsizesoff, stripsize, stripoff, strippos;
     LZWState *lzw;
+
+    /* Tile support */
+    int is_tiled;
+    int tile_byte_counts_offset, tile_offsets_offset;
+    int tile_width, tile_length;
+
+    int is_jpeg;
 
     uint8_t *deinvert_buf;
     int deinvert_buf_size;
@@ -79,38 +126,46 @@ typedef struct TiffContext {
     TiffGeoTag *geotags;
 } TiffContext;
 
+static const float d65_white[3] = { 0.950456f, 1.f, 1.088754f };
+
+static void tiff_set_type(TiffContext *s, enum TiffType tiff_type) {
+    if (s->tiff_type < tiff_type) // Prioritize higher-valued entries
+        s->tiff_type = tiff_type;
+}
+
 static void free_geotags(TiffContext *const s)
 {
-    int i;
-    for (i = 0; i < s->geotag_count; i++) {
-        if (s->geotags[i].val)
-            av_freep(&s->geotags[i].val);
-    }
+    for (int i = 0; i < s->geotag_count; i++)
+        av_freep(&s->geotags[i].val);
     av_freep(&s->geotags);
     s->geotag_count = 0;
 }
 
-#define RET_GEOKEY(TYPE, array, element)\
-    if (key >= TIFF_##TYPE##_KEY_ID_OFFSET &&\
-        key - TIFF_##TYPE##_KEY_ID_OFFSET < FF_ARRAY_ELEMS(ff_tiff_##array##_name_type_map))\
-        return ff_tiff_##array##_name_type_map[key - TIFF_##TYPE##_KEY_ID_OFFSET].element;
-
 static const char *get_geokey_name(int key)
 {
-    RET_GEOKEY(VERT, vert, name);
-    RET_GEOKEY(PROJ, proj, name);
-    RET_GEOKEY(GEOG, geog, name);
-    RET_GEOKEY(CONF, conf, name);
+#define RET_GEOKEY_STR(TYPE, array)\
+    if (key >= TIFF_##TYPE##_KEY_ID_OFFSET &&\
+        key - TIFF_##TYPE##_KEY_ID_OFFSET < FF_ARRAY_ELEMS(tiff_##array##_name_type_map))\
+        return tiff_##array##_name_type_string + tiff_##array##_name_type_map[key - TIFF_##TYPE##_KEY_ID_OFFSET].offset;
+
+    RET_GEOKEY_STR(VERT, vert);
+    RET_GEOKEY_STR(PROJ, proj);
+    RET_GEOKEY_STR(GEOG, geog);
+    RET_GEOKEY_STR(CONF, conf);
 
     return NULL;
 }
 
 static int get_geokey_type(int key)
 {
-    RET_GEOKEY(VERT, vert, type);
-    RET_GEOKEY(PROJ, proj, type);
-    RET_GEOKEY(GEOG, geog, type);
-    RET_GEOKEY(CONF, conf, type);
+#define RET_GEOKEY_TYPE(TYPE, array)\
+    if (key >= TIFF_##TYPE##_KEY_ID_OFFSET &&\
+        key - TIFF_##TYPE##_KEY_ID_OFFSET < FF_ARRAY_ELEMS(tiff_##array##_name_type_map))\
+        return tiff_##array##_name_type_map[key - TIFF_##TYPE##_KEY_ID_OFFSET].type;
+    RET_GEOKEY_TYPE(VERT, vert);
+    RET_GEOKEY_TYPE(PROJ, proj);
+    RET_GEOKEY_TYPE(GEOG, geog);
+    RET_GEOKEY_TYPE(CONF, conf);
 
     return AVERROR_INVALIDDATA;
 }
@@ -122,26 +177,24 @@ static int cmp_id_key(const void *id, const void *k)
 
 static const char *search_keyval(const TiffGeoTagKeyName *keys, int n, int id)
 {
-    TiffGeoTagKeyName *r = bsearch(&id, keys, n, sizeof(keys[0]), cmp_id_key);
+    const TiffGeoTagKeyName *r = bsearch(&id, keys, n, sizeof(keys[0]), cmp_id_key);
     if(r)
         return r->name;
 
     return NULL;
 }
 
-static char *get_geokey_val(int key, int val)
+static const char *get_geokey_val(int key, uint16_t val)
 {
-    char *ap;
-
     if (val == TIFF_GEO_KEY_UNDEFINED)
-        return av_strdup("undefined");
+        return "undefined";
     if (val == TIFF_GEO_KEY_USER_DEFINED)
-        return av_strdup("User-Defined");
+        return "User-Defined";
 
 #define RET_GEOKEY_VAL(TYPE, array)\
     if (val >= TIFF_##TYPE##_OFFSET &&\
-        val - TIFF_##TYPE##_OFFSET < FF_ARRAY_ELEMS(ff_tiff_##array##_codes))\
-        return av_strdup(ff_tiff_##array##_codes[val - TIFF_##TYPE##_OFFSET]);
+        val - TIFF_##TYPE##_OFFSET < FF_ARRAY_ELEMS(tiff_##array##_codes))\
+        return tiff_##array##_codes[val - TIFF_##TYPE##_OFFSET];
 
     switch (key) {
     case TIFF_GT_MODEL_TYPE_GEOKEY:
@@ -174,13 +227,9 @@ static char *get_geokey_val(int key, int val)
         RET_GEOKEY_VAL(PRIME_MERIDIAN, prime_meridian);
         break;
     case TIFF_PROJECTED_CS_TYPE_GEOKEY:
-        ap = av_strdup(search_keyval(ff_tiff_proj_cs_type_codes, FF_ARRAY_ELEMS(ff_tiff_proj_cs_type_codes), val));
-        if(ap) return ap;
-        break;
+        return search_keyval(tiff_proj_cs_type_codes, FF_ARRAY_ELEMS(tiff_proj_cs_type_codes), val);
     case TIFF_PROJECTION_GEOKEY:
-        ap = av_strdup(search_keyval(ff_tiff_projection_codes, FF_ARRAY_ELEMS(ff_tiff_projection_codes), val));
-        if(ap) return ap;
-        break;
+        return search_keyval(tiff_projection_codes, FF_ARRAY_ELEMS(tiff_projection_codes), val);
     case TIFF_PROJ_COORD_TRANS_GEOKEY:
         RET_GEOKEY_VAL(COORD_TRANS, coord_trans);
         break;
@@ -191,10 +240,7 @@ static char *get_geokey_val(int key, int val)
 
     }
 
-    ap = av_malloc(14);
-    if (ap)
-        snprintf(ap, 14, "Unknown-%d", val);
-    return ap;
+    return NULL;
 }
 
 static char *doubles2str(double *dp, int count, const char *sep)
@@ -227,14 +273,118 @@ static int add_metadata(int count, int type,
                         const char *name, const char *sep, TiffContext *s, AVFrame *frame)
 {
     switch(type) {
-    case TIFF_DOUBLE: return ff_tadd_doubles_metadata(count, name, sep, &s->gb, s->le, avpriv_frame_get_metadatap(frame));
-    case TIFF_SHORT : return ff_tadd_shorts_metadata(count, name, sep, &s->gb, s->le, 0, avpriv_frame_get_metadatap(frame));
-    case TIFF_STRING: return ff_tadd_string_metadata(count, name, &s->gb, s->le, avpriv_frame_get_metadatap(frame));
+    case TIFF_DOUBLE: return ff_tadd_doubles_metadata(count, name, sep, &s->gb, s->le, &frame->metadata);
+    case TIFF_SHORT : return ff_tadd_shorts_metadata(count, name, sep, &s->gb, s->le, 0, &frame->metadata);
+    case TIFF_STRING: return ff_tadd_string_metadata(count, name, &s->gb, s->le, &frame->metadata);
     default         : return AVERROR_INVALIDDATA;
     };
 }
 
-static void av_always_inline horizontal_fill(unsigned int bpp, uint8_t* dst,
+/**
+ * Map stored raw sensor values into linear reference values (see: DNG Specification - Chapter 5)
+ */
+static uint16_t av_always_inline dng_process_color16(uint16_t value,
+                                                     const uint16_t *lut,
+                                                     float black_level,
+                                                     float scale_factor)
+{
+    float value_norm;
+
+    // Lookup table lookup
+    value = lut[value];
+
+    // Black level subtraction
+    // Color scaling
+    value_norm = ((float)value - black_level) * scale_factor;
+
+    value = av_clip_uint16(lrintf(value_norm));
+
+    return value;
+}
+
+static uint16_t av_always_inline dng_process_color8(uint16_t value,
+                                                    const uint16_t *lut,
+                                                    float black_level,
+                                                    float scale_factor)
+{
+    return dng_process_color16(value, lut, black_level, scale_factor) >> 8;
+}
+
+static void av_always_inline dng_blit(TiffContext *s, uint8_t *dst, int dst_stride,
+                                      const uint8_t *src, int src_stride, int width, int height,
+                                      int is_single_comp, int is_u16, int odd_line)
+{
+    float scale_factor[4];
+    int line, col;
+
+    if (s->is_bayer) {
+        for (int i = 0; i < 4; i++)
+            scale_factor[i] = s->premultiply[s->pattern[i]] * 65535.f / (s->white_level - s->black_level[i]);
+    } else {
+        for (int i = 0; i < 4; i++)
+            scale_factor[i] = s->premultiply[           i ] * 65535.f / (s->white_level - s->black_level[i]);
+    }
+
+    if (is_single_comp) {
+        if (!is_u16)
+            return; /* <= 8bpp unsupported */
+
+        /* Image is double the width and half the height we need, each row comprises 2 rows of the output
+           (split vertically in the middle). */
+        for (line = 0; line < height / 2; line++) {
+            uint16_t *dst_u16 = (uint16_t *)dst;
+            const uint16_t *src_u16 = (const uint16_t *)src;
+
+            /* Blit first half of input row row to initial row of output */
+            for (col = 0; col < width; col++)
+                *dst_u16++ = dng_process_color16(*src_u16++, s->dng_lut, s->black_level[col&1], scale_factor[col&1]);
+
+            /* Advance the destination pointer by a row (source pointer remains in the same place) */
+            dst += dst_stride * sizeof(uint16_t);
+            dst_u16 = (uint16_t *)dst;
+
+            /* Blit second half of input row row to next row of output */
+            for (col = 0; col < width; col++)
+                *dst_u16++ = dng_process_color16(*src_u16++, s->dng_lut, s->black_level[(col&1) + 2], scale_factor[(col&1) + 2]);
+
+            dst += dst_stride * sizeof(uint16_t);
+            src += src_stride * sizeof(uint16_t);
+        }
+    } else {
+        /* Input and output image are the same size and the MJpeg decoder has done per-component
+           deinterleaving, so blitting here is straightforward. */
+        if (is_u16) {
+            for (line = 0; line < height; line++) {
+                uint16_t *dst_u16 = (uint16_t *)dst;
+                const uint16_t *src_u16 = (const uint16_t *)src;
+
+                for (col = 0; col < width; col++)
+                    *dst_u16++ = dng_process_color16(*src_u16++, s->dng_lut,
+                                                     s->black_level[(col&1) + 2 * ((line&1) + odd_line)],
+                                                     scale_factor[(col&1) + 2 * ((line&1) + odd_line)]);
+
+                dst += dst_stride * sizeof(uint16_t);
+                src += src_stride * sizeof(uint16_t);
+            }
+        } else {
+            for (line = 0; line < height; line++) {
+                uint8_t *dst_u8 = dst;
+                const uint8_t *src_u8 = src;
+
+                for (col = 0; col < width; col++)
+                    *dst_u8++ = dng_process_color8(*src_u8++, s->dng_lut,
+                                                   s->black_level[(col&1) + 2 * ((line&1) + odd_line)],
+                                                   scale_factor[(col&1) + 2 * ((line&1) + odd_line)]);
+
+                dst += dst_stride;
+                src += src_stride;
+            }
+        }
+    }
+}
+
+static void av_always_inline horizontal_fill(TiffContext *s,
+                                             unsigned int bpp, uint8_t* dst,
                                              int usePtr, const uint8_t *src,
                                              uint8_t c, int width, int offset)
 {
@@ -265,6 +415,21 @@ static void av_always_inline horizontal_fill(unsigned int bpp, uint8_t* dst,
             dst[(width+offset)*2+0] = (usePtr ? src[width] : c) >> 4;
         }
         break;
+    case 10:
+    case 12:
+    case 14: {
+            uint16_t *dst16 = (uint16_t *)dst;
+            int is_dng = (s->tiff_type == TIFF_TYPE_DNG || s->tiff_type == TIFF_TYPE_CINEMADNG);
+            uint8_t shift = is_dng ? 0 : 16 - bpp;
+            GetBitContext gb;
+
+            av_unused int ret = init_get_bits8(&gb, src, width);
+            av_assert1(ret >= 0);
+            for (int i = 0; i < s->width; i++) {
+                dst16[i] = get_bits(&gb, bpp) << shift;
+            }
+        }
+        break;
     default:
         if (usePtr) {
             memcpy(dst + offset, src, width);
@@ -285,6 +450,20 @@ static int deinvert_buffer(TiffContext *s, const uint8_t *src, int size)
         s->deinvert_buf[i] = ff_reverse[src[i]];
 
     return 0;
+}
+
+static void unpack_gray(TiffContext *s, AVFrame *p,
+                       const uint8_t *src, int lnum, int width, int bpp)
+{
+    GetBitContext gb;
+    uint16_t *dst = (uint16_t *)(p->data[0] + lnum * p->linesize[0]);
+
+    av_unused int ret = init_get_bits8(&gb, src, width);
+    av_assert1(ret >= 0);
+
+    for (int i = 0; i < s->width; i++) {
+        dst[i] = get_bits(&gb, bpp);
+    }
 }
 
 static void unpack_yuv(TiffContext *s, AVFrame *p,
@@ -322,7 +501,7 @@ static int tiff_uncompress(uint8_t *dst, unsigned long *len, const uint8_t *src,
     z_stream zstream = { 0 };
     int zret;
 
-    zstream.next_in   = (uint8_t *)src;
+    zstream.next_in   = src;
     zstream.avail_in  = size;
     zstream.next_out  = dst;
     zstream.avail_out = *len;
@@ -366,7 +545,7 @@ static int tiff_unpack_zlib(TiffContext *s, AVFrame *p, uint8_t *dst, int stride
     src = zbuf;
     for (line = 0; line < lines; line++) {
         if (s->bpp < 8 && s->avctx->pix_fmt == AV_PIX_FMT_PAL8) {
-            horizontal_fill(s->bpp, dst, 1, src, 0, width, 0);
+            horizontal_fill(s, s->bpp, dst, 1, src, 0, width, 0);
         } else {
             memcpy(dst, src, width);
         }
@@ -389,7 +568,7 @@ static int tiff_uncompress_lzma(uint8_t *dst, uint64_t *len, const uint8_t *src,
     lzma_stream stream = LZMA_STREAM_INIT;
     lzma_ret ret;
 
-    stream.next_in   = (uint8_t *)src;
+    stream.next_in   = src;
     stream.avail_in  = size;
     stream.next_out  = dst;
     stream.avail_out = *len;
@@ -408,7 +587,7 @@ static int tiff_unpack_lzma(TiffContext *s, AVFrame *p, uint8_t *dst, int stride
                             const uint8_t *src, int size, int width, int lines,
                             int strip_start, int is_yuv)
 {
-    uint64_t outlen = width * lines;
+    uint64_t outlen = width * (uint64_t)lines;
     int ret, line;
     uint8_t *buf = av_malloc(outlen);
     if (!buf)
@@ -431,7 +610,7 @@ static int tiff_unpack_lzma(TiffContext *s, AVFrame *p, uint8_t *dst, int stride
     src = buf;
     for (line = 0; line < lines; line++) {
         if (s->bpp < 8 && s->avctx->pix_fmt == AV_PIX_FMT_PAL8) {
-            horizontal_fill(s->bpp, dst, 1, src, 0, width, 0);
+            horizontal_fill(s, s->bpp, dst, 1, src, 0, width, 0);
         } else {
             memcpy(dst, src, width);
         }
@@ -450,37 +629,112 @@ static int tiff_unpack_lzma(TiffContext *s, AVFrame *p, uint8_t *dst, int stride
 static int tiff_unpack_fax(TiffContext *s, uint8_t *dst, int stride,
                            const uint8_t *src, int size, int width, int lines)
 {
-    int i, ret = 0;
     int line;
-    uint8_t *src2 = av_malloc((unsigned)size +
-                              FF_INPUT_BUFFER_PADDING_SIZE);
+    int ret;
 
-    if (!src2) {
-        av_log(s->avctx, AV_LOG_ERROR,
-               "Error allocating temporary buffer\n");
-        return AVERROR(ENOMEM);
+    if (s->fill_order) {
+        if ((ret = deinvert_buffer(s, src, size)) < 0)
+            return ret;
+        src = s->deinvert_buf;
     }
-    if (s->fax_opts & 2) {
-        avpriv_request_sample(s->avctx, "Uncompressed fax mode");
-        av_free(src2);
-        return AVERROR_PATCHWELCOME;
-    }
-    if (!s->fill_order) {
-        memcpy(src2, src, size);
-    } else {
-        for (i = 0; i < size; i++)
-            src2[i] = ff_reverse[src[i]];
-    }
-    memset(src2 + size, 0, FF_INPUT_BUFFER_PADDING_SIZE);
-    ret = ff_ccitt_unpack(s->avctx, src2, size, dst, lines, stride,
+    ret = ff_ccitt_unpack(s->avctx, src, size, dst, lines, stride,
                           s->compr, s->fax_opts);
     if (s->bpp < 8 && s->avctx->pix_fmt == AV_PIX_FMT_PAL8)
         for (line = 0; line < lines; line++) {
-            horizontal_fill(s->bpp, dst, 1, dst, 0, width, 0);
+            horizontal_fill(s, s->bpp, dst, 1, dst, 0, width, 0);
             dst += stride;
         }
-    av_free(src2);
     return ret;
+}
+
+static int dng_decode_jpeg(AVCodecContext *avctx, AVFrame *frame,
+                           int tile_byte_count, int dst_x, int dst_y, int w, int h)
+{
+    TiffContext *s = avctx->priv_data;
+    uint8_t *dst_data, *src_data;
+    uint32_t dst_offset; /* offset from dst buffer in pixels */
+    int is_single_comp, is_u16, pixel_size;
+    int ret;
+
+    if (tile_byte_count < 0 || tile_byte_count > bytestream2_get_bytes_left(&s->gb))
+        return AVERROR_INVALIDDATA;
+
+    /* Prepare a packet and send to the MJPEG decoder */
+    av_packet_unref(s->jpkt);
+    s->jpkt->data = (uint8_t*)s->gb.buffer;
+    s->jpkt->size = tile_byte_count;
+
+    if (s->is_bayer) {
+        MJpegDecodeContext *mjpegdecctx = s->avctx_mjpeg->priv_data;
+        /* We have to set this information here, there is no way to know if a given JPEG is a DNG-embedded
+           image or not from its own data (and we need that information when decoding it). */
+        mjpegdecctx->bayer = 1;
+    }
+
+    ret = avcodec_send_packet(s->avctx_mjpeg, s->jpkt);
+    if (ret < 0) {
+        av_log(avctx, AV_LOG_ERROR, "Error submitting a packet for decoding\n");
+        return ret;
+    }
+
+    ret = avcodec_receive_frame(s->avctx_mjpeg, s->jpgframe);
+    if (ret < 0) {
+        av_log(avctx, AV_LOG_ERROR, "JPEG decoding error: %s.\n", av_err2str(ret));
+
+        /* Normally skip, error if explode */
+        if (avctx->err_recognition & AV_EF_EXPLODE)
+            return AVERROR_INVALIDDATA;
+        else
+            return 0;
+    }
+
+    is_u16 = (s->bpp > 8);
+
+    /* Copy the outputted tile's pixels from 'jpgframe' to 'frame' (final buffer) */
+
+    if (s->jpgframe->width  != s->avctx_mjpeg->width  ||
+        s->jpgframe->height != s->avctx_mjpeg->height ||
+        s->jpgframe->format != s->avctx_mjpeg->pix_fmt)
+        return AVERROR_INVALIDDATA;
+
+    /* See dng_blit for explanation */
+    if (s->avctx_mjpeg->width  == w * 2 &&
+        s->avctx_mjpeg->height == h / 2 &&
+        s->avctx_mjpeg->pix_fmt == AV_PIX_FMT_GRAY16LE) {
+        is_single_comp = 1;
+    } else if (s->avctx_mjpeg->width  >= w &&
+               s->avctx_mjpeg->height >= h &&
+               s->avctx_mjpeg->pix_fmt == (is_u16 ? AV_PIX_FMT_GRAY16 : AV_PIX_FMT_GRAY8)
+              ) {
+        is_single_comp = 0;
+    } else
+        return AVERROR_INVALIDDATA;
+
+    pixel_size = (is_u16 ? sizeof(uint16_t) : sizeof(uint8_t));
+
+    if (is_single_comp && !is_u16) {
+        av_log(s->avctx, AV_LOG_ERROR, "DNGs with bpp <= 8 and 1 component are unsupported\n");
+        av_frame_unref(s->jpgframe);
+        return AVERROR_PATCHWELCOME;
+    }
+
+    dst_offset = dst_x + frame->linesize[0] * dst_y / pixel_size;
+    dst_data = frame->data[0] + dst_offset * pixel_size;
+    src_data = s->jpgframe->data[0];
+
+    dng_blit(s,
+             dst_data,
+             frame->linesize[0] / pixel_size,
+             src_data,
+             s->jpgframe->linesize[0] / pixel_size,
+             w,
+             h,
+             is_single_comp,
+             is_u16, 0);
+
+    av_frame_unref(s->jpgframe);
+
+    return 0;
 }
 
 static int tiff_unpack_strip(TiffContext *s, AVFrame *p, uint8_t *dst, int stride,
@@ -494,6 +748,7 @@ static int tiff_unpack_strip(TiffContext *s, AVFrame *p, uint8_t *dst, int strid
     int is_yuv = !(desc->flags & AV_PIX_FMT_FLAG_RGB) &&
                  (desc->flags & AV_PIX_FMT_FLAG_PLANAR) &&
                  desc->nb_components >= 3;
+    int is_dng;
 
     if (s->planar)
         width /= s->bppcount;
@@ -516,6 +771,19 @@ static int tiff_unpack_strip(TiffContext *s, AVFrame *p, uint8_t *dst, int strid
         width = width * s->subsampling[0] * s->subsampling[1] + 2*width;
         av_assert0(width <= bytes_per_row);
         av_assert0(s->bpp == 24);
+    }
+    if (s->is_bayer) {
+        av_assert0(width == (s->bpp * s->width + 7) >> 3);
+    }
+    av_assert0(!(s->is_bayer && is_yuv));
+    if (p->format == AV_PIX_FMT_GRAY12) {
+        av_fast_padded_malloc(&s->yuv_line, &s->yuv_line_size, width);
+        if (s->yuv_line == NULL) {
+            av_log(s->avctx, AV_LOG_ERROR, "Not enough memory\n");
+            return AVERROR(ENOMEM);
+        }
+        dst = s->yuv_line;
+        stride = 0;
     }
 
     if (s->compr == TIFF_DEFLATE || s->compr == TIFF_ADOBE_DEFLATE) {
@@ -560,10 +828,12 @@ static int tiff_unpack_strip(TiffContext *s, AVFrame *p, uint8_t *dst, int strid
                 return AVERROR_INVALIDDATA;
             }
             if (s->bpp < 8 && s->avctx->pix_fmt == AV_PIX_FMT_PAL8)
-                horizontal_fill(s->bpp, dst, 1, dst, 0, width, 0);
+                horizontal_fill(s, s->bpp, dst, 1, dst, 0, width, 0);
             if (is_yuv) {
                 unpack_yuv(s, p, dst, strip_start + line);
                 line += s->subsampling[1] - 1;
+            } else if (p->format == AV_PIX_FMT_GRAY12) {
+                unpack_gray(s, p, dst, strip_start + line, width, s->bpp);
             }
             dst += stride;
         }
@@ -572,7 +842,7 @@ static int tiff_unpack_strip(TiffContext *s, AVFrame *p, uint8_t *dst, int strid
     if (s->compr == TIFF_CCITT_RLE ||
         s->compr == TIFF_G3        ||
         s->compr == TIFF_G4) {
-        if (is_yuv)
+        if (is_yuv || p->format == AV_PIX_FMT_GRAY12)
             return AVERROR_INVALIDDATA;
 
         return tiff_unpack_fax(s, dst, stride, src, size, width, lines);
@@ -580,6 +850,24 @@ static int tiff_unpack_strip(TiffContext *s, AVFrame *p, uint8_t *dst, int strid
 
     bytestream2_init(&s->gb, src, size);
     bytestream2_init_writer(&pb, dst, is_yuv ? s->yuv_line_size : (stride * lines));
+
+    is_dng = (s->tiff_type == TIFF_TYPE_DNG || s->tiff_type == TIFF_TYPE_CINEMADNG);
+
+    /* Decode JPEG-encoded DNGs with strips */
+    if (s->compr == TIFF_NEWJPEG && is_dng) {
+        if (s->strips > 1) {
+            av_log(s->avctx, AV_LOG_ERROR, "More than one DNG JPEG strips unsupported\n");
+            return AVERROR_PATCHWELCOME;
+        }
+        if (!s->is_bayer)
+            return AVERROR_PATCHWELCOME;
+        if ((ret = dng_decode_jpeg(s->avctx, p, s->stripsize, 0, 0, s->width, s->height)) < 0)
+            return ret;
+        return 0;
+    }
+
+    if (is_dng && stride == 0)
+        return AVERROR_INVALIDDATA;
 
     for (line = 0; line < lines; line++) {
         if (src - ssrc > size) {
@@ -596,13 +884,36 @@ static int tiff_unpack_strip(TiffContext *s, AVFrame *p, uint8_t *dst, int strid
                 return AVERROR_INVALIDDATA;
 
             if (!s->fill_order) {
-                horizontal_fill(s->bpp * (s->avctx->pix_fmt == AV_PIX_FMT_PAL8),
+                horizontal_fill(s, s->bpp * (s->avctx->pix_fmt == AV_PIX_FMT_PAL8 || s->is_bayer),
                                 dst, 1, src, 0, width, 0);
             } else {
                 int i;
                 for (i = 0; i < width; i++)
                     dst[i] = ff_reverse[src[i]];
             }
+
+            /* Color processing for DNG images with uncompressed strips (non-tiled) */
+            if (is_dng) {
+                int is_u16, pixel_size_bytes, pixel_size_bits, elements;
+
+                is_u16 = (s->bpp / s->bppcount > 8);
+                pixel_size_bits = (is_u16 ? 16 : 8);
+                pixel_size_bytes = (is_u16 ? sizeof(uint16_t) : sizeof(uint8_t));
+
+                elements = width / pixel_size_bytes * pixel_size_bits / s->bpp * s->bppcount; // need to account for [1, 16] bpp
+                av_assert0 (elements * pixel_size_bytes <= FFABS(stride));
+                dng_blit(s,
+                         dst,
+                         0, // no stride, only 1 line
+                         dst,
+                         0, // no stride, only 1 line
+                         elements,
+                         1,
+                         0, // single-component variation is only preset in JPEG-encoded DNGs
+                         is_u16,
+                         (line + strip_start)&1);
+            }
+
             src += width;
             break;
         case TIFF_PACKBITS:
@@ -620,7 +931,7 @@ static int tiff_unpack_strip(TiffContext *s, AVFrame *p, uint8_t *dst, int strid
                                "Copy went out of bounds\n");
                         return AVERROR_INVALIDDATA;
                     }
-                    horizontal_fill(s->bpp * (s->avctx->pix_fmt == AV_PIX_FMT_PAL8),
+                    horizontal_fill(s, s->bpp * (s->avctx->pix_fmt == AV_PIX_FMT_PAL8),
                                     dst, 1, src, 0, code, pixels);
                     src    += code;
                     pixels += code;
@@ -632,7 +943,7 @@ static int tiff_unpack_strip(TiffContext *s, AVFrame *p, uint8_t *dst, int strid
                         return AVERROR_INVALIDDATA;
                     }
                     c = *src++;
-                    horizontal_fill(s->bpp * (s->avctx->pix_fmt == AV_PIX_FMT_PAL8),
+                    horizontal_fill(s, s->bpp * (s->avctx->pix_fmt == AV_PIX_FMT_PAL8),
                                     dst, 0, NULL, c, code, pixels);
                     pixels += code;
                 }
@@ -647,26 +958,101 @@ static int tiff_unpack_strip(TiffContext *s, AVFrame *p, uint8_t *dst, int strid
         if (is_yuv) {
             unpack_yuv(s, p, dst, strip_start + line);
             line += s->subsampling[1] - 1;
+        } else if (p->format == AV_PIX_FMT_GRAY12) {
+            unpack_gray(s, p, dst, strip_start + line, width, s->bpp);
         }
         dst += stride;
     }
     return 0;
 }
 
-static int init_image(TiffContext *s, ThreadFrame *frame)
+static int dng_decode_tiles(AVCodecContext *avctx, AVFrame *frame,
+                            const AVPacket *avpkt)
+{
+    TiffContext *s = avctx->priv_data;
+    int tile_idx;
+    int tile_offset_offset, tile_offset;
+    int tile_byte_count_offset, tile_byte_count;
+    int tile_count_x, tile_count_y;
+    int tile_width, tile_length;
+    int has_width_leftover, has_height_leftover;
+    int tile_x = 0, tile_y = 0;
+    int pos_x = 0, pos_y = 0;
+    int ret;
+
+    if (s->tile_width <= 0 || s->tile_length <= 0)
+        return AVERROR_INVALIDDATA;
+
+    has_width_leftover = (s->width % s->tile_width != 0);
+    has_height_leftover = (s->height % s->tile_length != 0);
+
+    /* Calculate tile counts (round up) */
+    tile_count_x = (s->width + s->tile_width - 1) / s->tile_width;
+    tile_count_y = (s->height + s->tile_length - 1) / s->tile_length;
+
+    /* Iterate over the number of tiles */
+    for (tile_idx = 0; tile_idx < tile_count_x * tile_count_y; tile_idx++) {
+        tile_x = tile_idx % tile_count_x;
+        tile_y = tile_idx / tile_count_x;
+
+        if (has_width_leftover && tile_x == tile_count_x - 1) // If on the right-most tile
+            tile_width = s->width % s->tile_width;
+        else
+            tile_width = s->tile_width;
+
+        if (has_height_leftover && tile_y == tile_count_y - 1) // If on the bottom-most tile
+            tile_length = s->height % s->tile_length;
+        else
+            tile_length = s->tile_length;
+
+        /* Read tile offset */
+        tile_offset_offset = s->tile_offsets_offset + tile_idx * sizeof(int);
+        bytestream2_seek(&s->gb, tile_offset_offset, SEEK_SET);
+        tile_offset = ff_tget_long(&s->gb, s->le);
+
+        /* Read tile byte size */
+        tile_byte_count_offset = s->tile_byte_counts_offset + tile_idx * sizeof(int);
+        bytestream2_seek(&s->gb, tile_byte_count_offset, SEEK_SET);
+        tile_byte_count = ff_tget_long(&s->gb, s->le);
+
+        /* Seek to tile data */
+        bytestream2_seek(&s->gb, tile_offset, SEEK_SET);
+
+        /* Decode JPEG tile and copy it in the reference frame */
+        ret = dng_decode_jpeg(avctx, frame, tile_byte_count, pos_x, pos_y, tile_width, tile_length);
+
+        if (ret < 0)
+            return ret;
+
+        /* Advance current positions */
+        pos_x += tile_width;
+        if (tile_x == tile_count_x - 1) { // If on the right edge
+            pos_x = 0;
+            pos_y += tile_length;
+        }
+    }
+
+    /* Frame is ready to be output */
+    frame->pict_type = AV_PICTURE_TYPE_I;
+    frame->flags |= AV_FRAME_FLAG_KEY;
+
+    return avpkt->size;
+}
+
+static int init_image(TiffContext *s, AVFrame *frame)
 {
     int ret;
     int create_gray_palette = 0;
 
     // make sure there is no aliasing in the following switch
-    if (s->bpp >= 100 || s->bppcount >= 10) {
+    if (s->bpp > 128 || s->bppcount >= 10) {
         av_log(s->avctx, AV_LOG_ERROR,
                "Unsupported image parameters: bpp=%d, bppcount=%d\n",
                s->bpp, s->bppcount);
         return AVERROR_INVALIDDATA;
     }
 
-    switch (s->planar * 1000 + s->bpp * 10 + s->bppcount) {
+    switch (s->planar * 10000 + s->bpp * 10 + s->bppcount + s->is_bayer * 100000) {
     case 11:
         if (!s->palette_is_set) {
             s->avctx->pix_fmt = AV_PIX_FMT_MONOBLACK;
@@ -681,6 +1067,52 @@ static int init_image(TiffContext *s, ThreadFrame *frame)
         break;
     case 81:
         s->avctx->pix_fmt = s->palette_is_set ? AV_PIX_FMT_PAL8 : AV_PIX_FMT_GRAY8;
+        break;
+    case 121:
+        s->avctx->pix_fmt = AV_PIX_FMT_GRAY12;
+        break;
+    case 100081:
+        switch (AV_RL32(s->pattern)) {
+        case 0x02010100:
+            s->avctx->pix_fmt = AV_PIX_FMT_BAYER_RGGB8;
+            break;
+        case 0x00010102:
+            s->avctx->pix_fmt = AV_PIX_FMT_BAYER_BGGR8;
+            break;
+        case 0x01000201:
+            s->avctx->pix_fmt = AV_PIX_FMT_BAYER_GBRG8;
+            break;
+        case 0x01020001:
+            s->avctx->pix_fmt = AV_PIX_FMT_BAYER_GRBG8;
+            break;
+        default:
+            av_log(s->avctx, AV_LOG_ERROR, "Unsupported Bayer pattern: 0x%X\n",
+                   AV_RL32(s->pattern));
+            return AVERROR_PATCHWELCOME;
+        }
+        break;
+    case 100101:
+    case 100121:
+    case 100141:
+    case 100161:
+        switch (AV_RL32(s->pattern)) {
+        case 0x02010100:
+            s->avctx->pix_fmt = AV_PIX_FMT_BAYER_RGGB16;
+            break;
+        case 0x00010102:
+            s->avctx->pix_fmt = AV_PIX_FMT_BAYER_BGGR16;
+            break;
+        case 0x01000201:
+            s->avctx->pix_fmt = AV_PIX_FMT_BAYER_GBRG16;
+            break;
+        case 0x01020001:
+            s->avctx->pix_fmt = AV_PIX_FMT_BAYER_GRBG16;
+            break;
+        default:
+            av_log(s->avctx, AV_LOG_ERROR, "Unsupported Bayer pattern: 0x%X\n",
+                   AV_RL32(s->pattern));
+            return AVERROR_PATCHWELCOME;
+        }
         break;
     case 243:
         if (s->photometric == TIFF_PHOTOMETRIC_YCBCR) {
@@ -713,7 +1145,16 @@ static int init_image(TiffContext *s, ThreadFrame *frame)
         s->avctx->pix_fmt = s->le ? AV_PIX_FMT_YA16LE : AV_PIX_FMT_YA16BE;
         break;
     case 324:
-        s->avctx->pix_fmt = AV_PIX_FMT_RGBA;
+        s->avctx->pix_fmt = s->photometric == TIFF_PHOTOMETRIC_SEPARATED ? AV_PIX_FMT_RGB0 : AV_PIX_FMT_RGBA;
+        break;
+    case 405:
+        if (s->photometric == TIFF_PHOTOMETRIC_SEPARATED)
+            s->avctx->pix_fmt = AV_PIX_FMT_RGBA;
+        else {
+            av_log(s->avctx, AV_LOG_ERROR,
+                "bpp=40 without PHOTOMETRIC_SEPARATED is unsupported\n");
+            return AVERROR_PATCHWELCOME;
+        }
         break;
     case 483:
         s->avctx->pix_fmt = s->le ? AV_PIX_FMT_RGB48LE  : AV_PIX_FMT_RGB48BE;
@@ -721,17 +1162,29 @@ static int init_image(TiffContext *s, ThreadFrame *frame)
     case 644:
         s->avctx->pix_fmt = s->le ? AV_PIX_FMT_RGBA64LE  : AV_PIX_FMT_RGBA64BE;
         break;
-    case 1243:
+    case 10243:
         s->avctx->pix_fmt = AV_PIX_FMT_GBRP;
         break;
-    case 1324:
+    case 10324:
         s->avctx->pix_fmt = AV_PIX_FMT_GBRAP;
         break;
-    case 1483:
+    case 10483:
         s->avctx->pix_fmt = s->le ? AV_PIX_FMT_GBRP16LE : AV_PIX_FMT_GBRP16BE;
         break;
-    case 1644:
+    case 10644:
         s->avctx->pix_fmt = s->le ? AV_PIX_FMT_GBRAP16LE : AV_PIX_FMT_GBRAP16BE;
+        break;
+    case 963:
+        s->avctx->pix_fmt = s->le ? AV_PIX_FMT_RGBF32LE : AV_PIX_FMT_RGBF32BE;
+        break;
+    case 1284:
+        s->avctx->pix_fmt = s->le ? AV_PIX_FMT_RGBAF32LE : AV_PIX_FMT_RGBAF32BE;
+        break;
+    case 10963:
+        s->avctx->pix_fmt = s->le ? AV_PIX_FMT_GBRPF32LE : AV_PIX_FMT_GBRPF32BE;
+        break;
+    case 11284:
+        s->avctx->pix_fmt = s->le ? AV_PIX_FMT_GBRAPF32LE : AV_PIX_FMT_GBRAPF32BE;
         break;
     default:
         av_log(s->avctx, AV_LOG_ERROR,
@@ -755,20 +1208,24 @@ static int init_image(TiffContext *s, ThreadFrame *frame)
         if (ret < 0)
             return ret;
     }
+
+    if (s->avctx->skip_frame >= AVDISCARD_ALL)
+        return 0;
+
     if ((ret = ff_thread_get_buffer(s->avctx, frame, 0)) < 0)
         return ret;
     if (s->avctx->pix_fmt == AV_PIX_FMT_PAL8) {
         if (!create_gray_palette)
-            memcpy(frame->f->data[1], s->palette, sizeof(s->palette));
+            memcpy(frame->data[1], s->palette, sizeof(s->palette));
         else {
             /* make default grayscale pal */
             int i;
-            uint32_t *pal = (uint32_t *)frame->f->data[1];
+            uint32_t *pal = (uint32_t *)frame->data[1];
             for (i = 0; i < 1<<s->bpp; i++)
                 pal[i] = 0xFFU << 24 | i * 255 / ((1<<s->bpp) - 1) * 0x010101;
         }
     }
-    return 0;
+    return 1;
 }
 
 static void set_sar(TiffContext *s, unsigned tag, unsigned num, unsigned den)
@@ -776,14 +1233,25 @@ static void set_sar(TiffContext *s, unsigned tag, unsigned num, unsigned den)
     int offset = tag == TIFF_YRES ? 2 : 0;
     s->res[offset++] = num;
     s->res[offset]   = den;
-    if (s->res[0] && s->res[1] && s->res[2] && s->res[3])
+    if (s->res[0] && s->res[1] && s->res[2] && s->res[3]) {
+        uint64_t num = s->res[2] * (uint64_t)s->res[1];
+        uint64_t den = s->res[0] * (uint64_t)s->res[3];
+        if (num > INT64_MAX || den > INT64_MAX) {
+            num = num >> 1;
+            den = den >> 1;
+        }
         av_reduce(&s->avctx->sample_aspect_ratio.num, &s->avctx->sample_aspect_ratio.den,
-                  s->res[2] * (uint64_t)s->res[1], s->res[0] * (uint64_t)s->res[3], INT32_MAX);
+                  num, den, INT32_MAX);
+        if (!s->avctx->sample_aspect_ratio.den)
+            s->avctx->sample_aspect_ratio = (AVRational) {0, 1};
+    }
 }
 
 static int tiff_decode_tag(TiffContext *s, AVFrame *frame)
 {
-    unsigned tag, type, count, off, value = 0, value2 = 0;
+    AVFrameSideData *sd;
+    GetByteContext gb_temp;
+    unsigned tag, type, count, off, value = 0, value2 = 1; // value2 is a denominator so init. to 1
     int i, start;
     int pos;
     int ret;
@@ -793,6 +1261,12 @@ static int tiff_decode_tag(TiffContext *s, AVFrame *frame)
     if (ret < 0) {
         goto end;
     }
+    if (tag <= s->last_tag)
+        return AVERROR_INVALIDDATA;
+
+    // We ignore TIFF_STRIP_SIZE as it is sometimes in the logic but wrong order around TIFF_STRIP_OFFS
+    if (tag != TIFF_STRIP_SIZE)
+        s->last_tag = tag;
 
     off = bytestream2_tell(&s->gb);
     if (count == 1) {
@@ -803,8 +1277,13 @@ static int tiff_decode_tag(TiffContext *s, AVFrame *frame)
             value = ff_tget(&s->gb, type, s->le);
             break;
         case TIFF_RATIONAL:
-            value  = ff_tget(&s->gb, TIFF_LONG, s->le);
-            value2 = ff_tget(&s->gb, TIFF_LONG, s->le);
+            value  = ff_tget_long(&s->gb, s->le);
+            value2 = ff_tget_long(&s->gb, s->le);
+            if (!value2) {
+                av_log(s->avctx, AV_LOG_WARNING, "Invalid denominator in rational\n");
+                value2 = 1;
+            }
+
             break;
         case TIFF_STRING:
             if (count <= 4) {
@@ -816,14 +1295,21 @@ static int tiff_decode_tag(TiffContext *s, AVFrame *frame)
     }
 
     switch (tag) {
+    case TIFF_SUBFILE:
+        s->is_thumbnail = (value != 0);
+        break;
     case TIFF_WIDTH:
+        if (value > INT_MAX)
+            return AVERROR_INVALIDDATA;
         s->width = value;
         break;
     case TIFF_HEIGHT:
+        if (value > INT_MAX)
+            return AVERROR_INVALIDDATA;
         s->height = value;
         break;
     case TIFF_BPP:
-        if (count > 4U) {
+        if (count > 5 || count <= 0) {
             av_log(s->avctx, AV_LOG_ERROR,
                    "This format is not supported (bpp=%d, %d components)\n",
                    value, count);
@@ -854,9 +1340,9 @@ static int tiff_decode_tag(TiffContext *s, AVFrame *frame)
                    "Samples per pixel requires a single value, many provided\n");
             return AVERROR_INVALIDDATA;
         }
-        if (value > 4U) {
+        if (value > 5 || value <= 0) {
             av_log(s->avctx, AV_LOG_ERROR,
-                   "Samples per pixel %d is too large\n", value);
+                   "Invalid samples per pixel %d\n", value);
             return AVERROR_INVALIDDATA;
         }
         if (s->bppcount == 1)
@@ -865,6 +1351,7 @@ static int tiff_decode_tag(TiffContext *s, AVFrame *frame)
         break;
     case TIFF_COMPR:
         s->compr     = value;
+        av_log(s->avctx, AV_LOG_DEBUG, "compression: %d\n", s->compr);
         s->predictor = 0;
         switch (s->compr) {
         case TIFF_RAW:
@@ -886,8 +1373,8 @@ static int tiff_decode_tag(TiffContext *s, AVFrame *frame)
 #endif
         case TIFF_JPEG:
         case TIFF_NEWJPEG:
-            avpriv_report_missing_feature(s->avctx, "JPEG compression");
-            return AVERROR_PATCHWELCOME;
+            s->is_jpeg = 1;
+            break;
         case TIFF_LZMA:
 #if CONFIG_LZMA
             break;
@@ -908,17 +1395,27 @@ static int tiff_decode_tag(TiffContext *s, AVFrame *frame)
         break;
     case TIFF_STRIP_OFFS:
         if (count == 1) {
+            if (value > INT_MAX) {
+                av_log(s->avctx, AV_LOG_ERROR,
+                    "strippos %u too large\n", value);
+                return AVERROR_INVALIDDATA;
+            }
             s->strippos = 0;
             s->stripoff = value;
         } else
             s->strippos = off;
         s->strips = count;
-        if (s->strips == 1)
+        if (s->strips == s->bppcount)
             s->rps = s->height;
         s->sot = type;
         break;
     case TIFF_STRIP_SIZE:
         if (count == 1) {
+            if (value > INT_MAX) {
+                av_log(s->avctx, AV_LOG_ERROR,
+                    "stripsize %u too large\n", value);
+                return AVERROR_INVALIDDATA;
+            }
             s->stripsizesoff = 0;
             s->stripsize     = value;
             s->strips        = 1;
@@ -932,15 +1429,88 @@ static int tiff_decode_tag(TiffContext *s, AVFrame *frame)
     case TIFF_YRES:
         set_sar(s, tag, value, value2);
         break;
-    case TIFF_TILE_BYTE_COUNTS:
-    case TIFF_TILE_LENGTH:
     case TIFF_TILE_OFFSETS:
+        s->tile_offsets_offset = off;
+        s->is_tiled = 1;
+        break;
+    case TIFF_TILE_BYTE_COUNTS:
+        s->tile_byte_counts_offset = off;
+        break;
+    case TIFF_TILE_LENGTH:
+        if (value > INT_MAX)
+            return AVERROR_INVALIDDATA;
+        s->tile_length = value;
+        break;
     case TIFF_TILE_WIDTH:
-        av_log(s->avctx, AV_LOG_ERROR, "Tiled images are not supported\n");
-        return AVERROR_PATCHWELCOME;
+        if (value > INT_MAX)
+            return AVERROR_INVALIDDATA;
+        s->tile_width = value;
         break;
     case TIFF_PREDICTOR:
+        if (value > INT_MAX)
+            return AVERROR_INVALIDDATA;
         s->predictor = value;
+        break;
+    case TIFF_SUB_IFDS:
+        if (count == 1)
+            s->sub_ifd = value;
+        else if (count > 1)
+            s->sub_ifd = ff_tget_long(&s->gb, s->le); /** Only get the first SubIFD */
+        break;
+    case TIFF_GRAY_RESPONSE_CURVE:
+    case DNG_LINEARIZATION_TABLE:
+        if (count < 1 || count > FF_ARRAY_ELEMS(s->dng_lut))
+            return AVERROR_INVALIDDATA;
+        for (int i = 0; i < count; i++)
+            s->dng_lut[i] = ff_tget(&s->gb, type, s->le);
+        s->white_level = s->dng_lut[count-1];
+        break;
+    case DNG_BLACK_LEVEL:
+        if (count > FF_ARRAY_ELEMS(s->black_level))
+            return AVERROR_INVALIDDATA;
+        s->black_level[0] = value / (float)value2;
+        for (int i = 0; i < count && count > 1; i++) {
+            if (type == TIFF_RATIONAL) {
+                value  = ff_tget_long(&s->gb, s->le);
+                value2 = ff_tget_long(&s->gb, s->le);
+                if (!value2) {
+                    av_log(s->avctx, AV_LOG_WARNING, "Invalid denominator\n");
+                    value2 = 1;
+                }
+
+                s->black_level[i] = value / (float)value2;
+            } else if (type == TIFF_SRATIONAL) {
+                int value  = ff_tget_long(&s->gb, s->le);
+                int value2 = ff_tget_long(&s->gb, s->le);
+                if (!value2) {
+                    av_log(s->avctx, AV_LOG_WARNING, "Invalid denominator\n");
+                    value2 = 1;
+                }
+
+                s->black_level[i] = value / (float)value2;
+            } else {
+                s->black_level[i] = ff_tget(&s->gb, type, s->le);
+            }
+        }
+        for (int i = count; i < 4 && count > 0; i++)
+            s->black_level[i] = s->black_level[count - 1];
+        break;
+    case DNG_WHITE_LEVEL:
+        s->white_level = value;
+        break;
+    case TIFF_CFA_PATTERN_DIM:
+        if (count != 2 || (ff_tget(&s->gb, type, s->le) != 2 &&
+                           ff_tget(&s->gb, type, s->le) != 2)) {
+            av_log(s->avctx, AV_LOG_ERROR, "CFA Pattern dimensions are not 2x2\n");
+            return AVERROR_INVALIDDATA;
+        }
+        break;
+    case TIFF_CFA_PATTERN:
+        s->is_bayer = 1;
+        s->pattern[0] = ff_tget(&s->gb, type, s->le);
+        s->pattern[1] = ff_tget(&s->gb, type, s->le);
+        s->pattern[2] = ff_tget(&s->gb, type, s->le);
+        s->pattern[3] = ff_tget(&s->gb, type, s->le);
         break;
     case TIFF_PHOTOMETRIC:
         switch (value) {
@@ -948,18 +1518,18 @@ static int tiff_decode_tag(TiffContext *s, AVFrame *frame)
         case TIFF_PHOTOMETRIC_BLACK_IS_ZERO:
         case TIFF_PHOTOMETRIC_RGB:
         case TIFF_PHOTOMETRIC_PALETTE:
+        case TIFF_PHOTOMETRIC_SEPARATED:
         case TIFF_PHOTOMETRIC_YCBCR:
+        case TIFF_PHOTOMETRIC_CFA:
+        case TIFF_PHOTOMETRIC_LINEAR_RAW: // Used by DNG images
             s->photometric = value;
             break;
         case TIFF_PHOTOMETRIC_ALPHA_MASK:
-        case TIFF_PHOTOMETRIC_SEPARATED:
         case TIFF_PHOTOMETRIC_CIE_LAB:
         case TIFF_PHOTOMETRIC_ICC_LAB:
         case TIFF_PHOTOMETRIC_ITU_LAB:
-        case TIFF_PHOTOMETRIC_CFA:
         case TIFF_PHOTOMETRIC_LOG_L:
         case TIFF_PHOTOMETRIC_LOG_LUV:
-        case TIFF_PHOTOMETRIC_LINEAR_RAW:
             avpriv_report_missing_feature(s->avctx,
                                           "PhotometricInterpretation 0x%04X",
                                           value);
@@ -990,6 +1560,11 @@ static int tiff_decode_tag(TiffContext *s, AVFrame *frame)
         bytestream2_skip(&pal_gb[2], count / 3 * off * 2);
 
         off = (type_sizes[type] - 1) << 3;
+        if (off > 31U) {
+            av_log(s->avctx, AV_LOG_ERROR, "palette shift %d is out of range\n", off);
+            return AVERROR_INVALIDDATA;
+        }
+
         for (i = 0; i < count / 3; i++) {
             uint32_t p = 0xFF000000;
             p |= (ff_tget(&pal_gb[0], type, s->le) >> off) << 16;
@@ -1008,16 +1583,28 @@ static int tiff_decode_tag(TiffContext *s, AVFrame *frame)
             av_log(s->avctx, AV_LOG_ERROR, "subsample count invalid\n");
             return AVERROR_INVALIDDATA;
         }
-        for (i = 0; i < count; i++)
+        for (i = 0; i < count; i++) {
             s->subsampling[i] = ff_tget(&s->gb, type, s->le);
+            if (s->subsampling[i] <= 0) {
+                av_log(s->avctx, AV_LOG_ERROR, "subsampling %d is invalid\n", s->subsampling[i]);
+                s->subsampling[i] = 1;
+                return AVERROR_INVALIDDATA;
+            }
+        }
         break;
     case TIFF_T4OPTIONS:
-        if (s->compr == TIFF_G3)
+        if (s->compr == TIFF_G3) {
+            if (value > INT_MAX)
+                return AVERROR_INVALIDDATA;
             s->fax_opts = value;
+        }
         break;
     case TIFF_T6OPTIONS:
-        if (s->compr == TIFF_G4)
+        if (s->compr == TIFF_G4) {
+            if (value > INT_MAX)
+                return AVERROR_INVALIDDATA;
             s->fax_opts = value;
+        }
         break;
 #define ADD_METADATA(count, name, sep)\
     if ((ret = add_metadata(count, type, name, sep, s, frame)) < 0) {\
@@ -1034,6 +1621,10 @@ static int tiff_decode_tag(TiffContext *s, AVFrame *frame)
         ADD_METADATA(count, "ModelTiepointTag", NULL);
         break;
     case TIFF_GEO_KEY_DIRECTORY:
+        if (s->geotag_count) {
+            avpriv_request_sample(s->avctx, "Multiple geo key directories");
+            return AVERROR_INVALIDDATA;
+        }
         ADD_METADATA(1, "GeoTIFF_Version", NULL);
         ADD_METADATA(2, "GeoTIFF_Key_Revision", ".");
         s->geotag_count   = ff_tget_short(&s->gb, s->le);
@@ -1041,25 +1632,32 @@ static int tiff_decode_tag(TiffContext *s, AVFrame *frame)
             s->geotag_count = count / 4 - 1;
             av_log(s->avctx, AV_LOG_WARNING, "GeoTIFF key directory buffer shorter than specified\n");
         }
-        if (bytestream2_get_bytes_left(&s->gb) < s->geotag_count * sizeof(int16_t) * 4) {
+        if (   bytestream2_get_bytes_left(&s->gb) < s->geotag_count * sizeof(int16_t) * 4
+            || s->geotag_count == 0) {
             s->geotag_count = 0;
             return -1;
         }
-        s->geotags = av_mallocz_array(s->geotag_count, sizeof(TiffGeoTag));
+        s->geotags = av_calloc(s->geotag_count, sizeof(*s->geotags));
         if (!s->geotags) {
             av_log(s->avctx, AV_LOG_ERROR, "Error allocating temporary buffer\n");
             s->geotag_count = 0;
             goto end;
         }
         for (i = 0; i < s->geotag_count; i++) {
+            unsigned val;
             s->geotags[i].key    = ff_tget_short(&s->gb, s->le);
             s->geotags[i].type   = ff_tget_short(&s->gb, s->le);
             s->geotags[i].count  = ff_tget_short(&s->gb, s->le);
+            val                  = ff_tget_short(&s->gb, s->le);
 
-            if (!s->geotags[i].type)
-                s->geotags[i].val  = get_geokey_val(s->geotags[i].key, ff_tget_short(&s->gb, s->le));
-            else
-                s->geotags[i].offset = ff_tget_short(&s->gb, s->le);
+            if (!s->geotags[i].type) {
+                const char *str = get_geokey_val(s->geotags[i].key, val);
+
+                s->geotags[i].val = str ? av_strdup(str) : av_asprintf("Unknown-%u", val);
+                if (!s->geotags[i].val)
+                    return AVERROR(ENOMEM);
+            } else
+                s->geotags[i].offset = val;
         }
         break;
     case TIFF_GEO_DOUBLE_PARAMS:
@@ -1079,6 +1677,8 @@ static int tiff_decode_tag(TiffContext *s, AVFrame *frame)
                 if (s->geotags[i].count == 0
                     || s->geotags[i].offset + s->geotags[i].count > count) {
                     av_log(s->avctx, AV_LOG_WARNING, "Invalid GeoTIFF key %d\n", s->geotags[i].key);
+                } else if (s->geotags[i].val) {
+                    av_log(s->avctx, AV_LOG_WARNING, "Duplicate GeoTIFF key %d\n", s->geotags[i].key);
                 } else {
                     char *ap = doubles2str(&dp[s->geotags[i].offset], s->geotags[i].count, ", ");
                     if (!ap) {
@@ -1105,6 +1705,8 @@ static int tiff_decode_tag(TiffContext *s, AVFrame *frame)
                     bytestream2_seek(&s->gb, pos + s->geotags[i].offset, SEEK_SET);
                     if (bytestream2_get_bytes_left(&s->gb) < s->geotags[i].count)
                         return AVERROR_INVALIDDATA;
+                    if (s->geotags[i].val)
+                        return AVERROR_INVALIDDATA;
                     ap = av_malloc(s->geotags[i].count);
                     if (!ap) {
                         av_log(s->avctx, AV_LOG_ERROR, "Error allocating temporary buffer\n");
@@ -1116,6 +1718,19 @@ static int tiff_decode_tag(TiffContext *s, AVFrame *frame)
                 }
             }
         }
+        break;
+    case TIFF_ICC_PROFILE:
+        gb_temp = s->gb;
+        bytestream2_seek(&gb_temp, off, SEEK_SET);
+
+        if (bytestream2_get_bytes_left(&gb_temp) < count)
+            return AVERROR_INVALIDDATA;
+
+        ret = ff_frame_new_side_data(s->avctx, frame, AV_FRAME_DATA_ICC_PROFILE, count, &sd);
+        if (ret < 0)
+            return ret;
+        if (sd)
+            bytestream2_get_bufferu(&gb_temp, sd->data, count);
         break;
     case TIFF_ARTIST:
         ADD_METADATA(count, "artist", NULL);
@@ -1146,20 +1761,125 @@ static int tiff_decode_tag(TiffContext *s, AVFrame *frame)
         break;
     case TIFF_PAGE_NUMBER:
         ADD_METADATA(count, "page_number", " / ");
+        // need to seek back to re-read the page number
+        bytestream2_seek(&s->gb, -count * sizeof(uint16_t), SEEK_CUR);
+        // read the page number
+        s->cur_page = ff_tget_short(&s->gb, s->le);
+        // get back to where we were before the previous seek
+        bytestream2_seek(&s->gb, count * sizeof(uint16_t) - sizeof(uint16_t), SEEK_CUR);
         break;
     case TIFF_SOFTWARE_NAME:
         ADD_METADATA(count, "software", NULL);
         break;
+    case DNG_VERSION:
+        if (count == 4) {
+            unsigned int ver[4];
+            ver[0] = ff_tget(&s->gb, type, s->le);
+            ver[1] = ff_tget(&s->gb, type, s->le);
+            ver[2] = ff_tget(&s->gb, type, s->le);
+            ver[3] = ff_tget(&s->gb, type, s->le);
+
+            av_log(s->avctx, AV_LOG_DEBUG, "DNG file, version %u.%u.%u.%u\n",
+                ver[0], ver[1], ver[2], ver[3]);
+
+            tiff_set_type(s, TIFF_TYPE_DNG);
+        }
+        break;
+    case DNG_ANALOG_BALANCE:
+        if (type != TIFF_RATIONAL)
+            break;
+
+        for (int i = 0; i < 3; i++) {
+            value  = ff_tget_long(&s->gb, s->le);
+            value2 = ff_tget_long(&s->gb, s->le);
+            if (!value2) {
+                av_log(s->avctx, AV_LOG_WARNING, "Invalid denominator\n");
+                value2 = 1;
+            }
+
+            s->analog_balance[i] = value / (float)value2;
+        }
+        break;
+    case DNG_AS_SHOT_NEUTRAL:
+        if (type != TIFF_RATIONAL)
+            break;
+
+        for (int i = 0; i < 3; i++) {
+            value  = ff_tget_long(&s->gb, s->le);
+            value2 = ff_tget_long(&s->gb, s->le);
+            if (!value2) {
+                av_log(s->avctx, AV_LOG_WARNING, "Invalid denominator\n");
+                value2 = 1;
+            }
+
+            s->as_shot_neutral[i] = value / (float)value2;
+        }
+        break;
+    case DNG_AS_SHOT_WHITE_XY:
+        if (type != TIFF_RATIONAL)
+            break;
+
+        for (int i = 0; i < 2; i++) {
+            value  = ff_tget_long(&s->gb, s->le);
+            value2 = ff_tget_long(&s->gb, s->le);
+            if (!value2) {
+                av_log(s->avctx, AV_LOG_WARNING, "Invalid denominator\n");
+                value2 = 1;
+            }
+
+            s->as_shot_white[i] = value / (float)value2;
+        }
+        s->as_shot_white[2] = 1.f - s->as_shot_white[0] - s->as_shot_white[1];
+        for (int i = 0; i < 3; i++) {
+            s->as_shot_white[i] /= d65_white[i];
+        }
+        break;
+    case DNG_COLOR_MATRIX1:
+    case DNG_COLOR_MATRIX2:
+        for (int i = 0; i < 3; i++) {
+            for (int j = 0; j < 3; j++) {
+                int value  = ff_tget_long(&s->gb, s->le);
+                int value2 = ff_tget_long(&s->gb, s->le);
+                if (!value2) {
+                    av_log(s->avctx, AV_LOG_WARNING, "Invalid denominator\n");
+                    value2 = 1;
+                }
+                s->color_matrix[i][j] = value / (float)value2;
+            }
+            s->use_color_matrix = 1;
+        }
+        break;
+    case DNG_CAMERA_CALIBRATION1:
+    case DNG_CAMERA_CALIBRATION2:
+        for (int i = 0; i < 3; i++) {
+            for (int j = 0; j < 3; j++) {
+                int value  = ff_tget_long(&s->gb, s->le);
+                int value2 = ff_tget_long(&s->gb, s->le);
+                if (!value2) {
+                    av_log(s->avctx, AV_LOG_WARNING, "Invalid denominator\n");
+                    value2 = 1;
+                }
+                s->camera_calibration[i][j] = value / (float)value2;
+            }
+        }
+        break;
+    case CINEMADNG_TIME_CODES:
+    case CINEMADNG_FRAME_RATE:
+    case CINEMADNG_T_STOP:
+    case CINEMADNG_REEL_NAME:
+    case CINEMADNG_CAMERA_LABEL:
+        tiff_set_type(s, TIFF_TYPE_CINEMADNG);
+        break;
     default:
         if (s->avctx->err_recognition & AV_EF_EXPLODE) {
             av_log(s->avctx, AV_LOG_ERROR,
-                   "Unknown or unsupported tag %d/0X%0X\n",
+                   "Unknown or unsupported tag %d/0x%0X\n",
                    tag, tag);
             return AVERROR_INVALIDDATA;
         }
     }
 end:
-    if (s->bpp > 64U) {
+    if (s->bpp > 128U) {
         av_log(s->avctx, AV_LOG_ERROR,
                 "This format is not supported (bpp=%d, %d components)\n",
                 s->bpp, count);
@@ -1170,19 +1890,52 @@ end:
     return 0;
 }
 
-static int decode_frame(AVCodecContext *avctx,
-                        void *data, int *got_frame, AVPacket *avpkt)
+static const float xyz2rgb[3][3] = {
+    { 0.412453f, 0.357580f, 0.180423f },
+    { 0.212671f, 0.715160f, 0.072169f },
+    { 0.019334f, 0.119193f, 0.950227f },
+};
+
+static void camera_xyz_coeff(TiffContext *s,
+                             float rgb2cam[3][4],
+                             double cam2xyz[4][3])
+{
+    double cam2rgb[4][3], num;
+    int i, j, k;
+
+    for (i = 0; i < 3; i++) {
+        for (j = 0; j < 3; j++) {
+            cam2rgb[i][j] = 0.;
+            for (k = 0; k < 3; k++)
+                cam2rgb[i][j] += cam2xyz[i][k] * xyz2rgb[k][j];
+        }
+    }
+
+    for (i = 0; i < 3; i++) {
+        for (num = j = 0; j < 3; j++)
+            num += cam2rgb[i][j];
+        if (!num)
+            num = 1;
+        for (j = 0; j < 3; j++)
+            cam2rgb[i][j] /= num;
+        s->premultiply[i] = 1.f / num;
+    }
+}
+
+static int decode_frame(AVCodecContext *avctx, AVFrame *p,
+                        int *got_frame, AVPacket *avpkt)
 {
     TiffContext *const s = avctx->priv_data;
-    AVFrame *const p = data;
-    ThreadFrame frame = { .f = data };
-    unsigned off;
+    unsigned off, last_off = 0;
     int le, ret, plane, planes;
     int i, j, entries, stride;
     unsigned soff, ssize;
     uint8_t *dst;
     GetByteContext stripsizes;
     GetByteContext stripdata;
+    int retry_for_subifd, retry_for_page;
+    int is_dng;
+    int has_tile_bits, has_strip_bits;
 
     bytestream2_init(&s->gb, avpkt->data, avpkt->size);
 
@@ -1196,10 +1949,44 @@ static int decode_frame(AVCodecContext *avctx,
     }
     s->le          = le;
     // TIFF_BPP is not a required tag and defaults to 1
+
+    s->tiff_type   = TIFF_TYPE_TIFF;
+    s->use_color_matrix = 0;
+again:
+    s->is_thumbnail = 0;
     s->bppcount    = s->bpp = 1;
     s->photometric = TIFF_PHOTOMETRIC_NONE;
     s->compr       = TIFF_RAW;
     s->fill_order  = 0;
+    s->white_level = 0;
+    s->is_bayer    = 0;
+    s->is_tiled    = 0;
+    s->is_jpeg     = 0;
+    s->cur_page    = 0;
+    s->last_tag    = 0;
+
+    for (i = 0; i < 65536; i++)
+        s->dng_lut[i] = i;
+
+    for (i = 0; i < FF_ARRAY_ELEMS(s->black_level); i++)
+        s->black_level[i] = 0.f;
+
+    for (i = 0; i < FF_ARRAY_ELEMS(s->as_shot_neutral); i++)
+        s->as_shot_neutral[i] = 0.f;
+
+    for (i = 0; i < FF_ARRAY_ELEMS(s->as_shot_white); i++)
+        s->as_shot_white[i] = 1.f;
+
+    for (i = 0; i < FF_ARRAY_ELEMS(s->analog_balance); i++)
+        s->analog_balance[i] = 1.f;
+
+    for (i = 0; i < FF_ARRAY_ELEMS(s->premultiply); i++)
+        s->premultiply[i] = 1.f;
+
+    for (i = 0; i < 4; i++)
+        for (j = 0; j < 4; j++)
+            s->camera_calibration[i][j] = i == j;
+
     free_geotags(s);
 
     // Reset these offsets so we can tell if they were set this frame
@@ -1214,6 +2001,46 @@ static int decode_frame(AVCodecContext *avctx,
             return ret;
     }
 
+    if (s->get_thumbnail && !s->is_thumbnail) {
+        av_log(avctx, AV_LOG_INFO, "No embedded thumbnail present\n");
+        return AVERROR_EOF;
+    }
+
+    /** whether we should process this IFD's SubIFD */
+    retry_for_subifd = s->sub_ifd && (s->get_subimage || (!s->get_thumbnail && s->is_thumbnail));
+    /** whether we should process this multi-page IFD's next page */
+    retry_for_page = s->get_page && s->cur_page + 1 < s->get_page;  // get_page is 1-indexed
+
+    if (retry_for_page) {
+        // set offset to the next IFD
+        off = ff_tget_long(&s->gb, le);
+    } else if (retry_for_subifd) {
+        // set offset to the SubIFD
+        off = s->sub_ifd;
+    }
+
+    if (retry_for_subifd || retry_for_page) {
+        if (!off) {
+            av_log(avctx, AV_LOG_ERROR, "Requested entry not found\n");
+            return AVERROR_INVALIDDATA;
+        }
+        if (off <= last_off) {
+            avpriv_request_sample(s->avctx, "non increasing IFD offset");
+            return AVERROR_INVALIDDATA;
+        }
+        last_off = off;
+        if (off >= UINT_MAX - 14 || avpkt->size < off + 14) {
+            av_log(avctx, AV_LOG_ERROR, "IFD offset is greater than image size\n");
+            return AVERROR_INVALIDDATA;
+        }
+        s->sub_ifd = 0;
+        goto again;
+    }
+
+    /* At this point we've decided on which (Sub)IFD to process */
+
+    is_dng = (s->tiff_type == TIFF_TYPE_DNG || s->tiff_type == TIFF_TYPE_CINEMADNG);
+
     for (i = 0; i<s->geotag_count; i++) {
         const char *keyname = get_geokey_name(s->geotags[i].key);
         if (!keyname) {
@@ -1224,49 +2051,154 @@ static int decode_frame(AVCodecContext *avctx,
             av_log(avctx, AV_LOG_WARNING, "Type of GeoTIFF key %d is wrong\n", s->geotags[i].key);
             continue;
         }
-        ret = av_dict_set(avpriv_frame_get_metadatap(p), keyname, s->geotags[i].val, 0);
+        ret = av_dict_set(&p->metadata, keyname, s->geotags[i].val, AV_DICT_DONT_STRDUP_VAL);
+        s->geotags[i].val = NULL;
         if (ret<0) {
             av_log(avctx, AV_LOG_ERROR, "Writing metadata with key '%s' failed\n", keyname);
             return ret;
         }
     }
 
-    if (!s->strippos && !s->stripoff) {
+    if (is_dng) {
+        double cam2xyz[4][3];
+        float cmatrix[3][4];
+        float pmin = FLT_MAX;
+        int bps;
+
+        for (i = 0; i < 3; i++) {
+            for (j = 0; j < 3; j++)
+                s->camera_calibration[i][j] *= s->analog_balance[i];
+        }
+
+        if (!s->use_color_matrix) {
+            for (i = 0; i < 3; i++) {
+                if (s->camera_calibration[i][i])
+                    s->premultiply[i] /= s->camera_calibration[i][i];
+            }
+        } else {
+            for (int c = 0; c < 3; c++) {
+                for (i = 0; i < 3; i++) {
+                    cam2xyz[c][i] = 0.;
+                    for (j = 0; j < 3; j++)
+                        cam2xyz[c][i] += s->camera_calibration[c][j] * s->color_matrix[j][i] * s->as_shot_white[i];
+                }
+            }
+
+            camera_xyz_coeff(s, cmatrix, cam2xyz);
+        }
+
+        for (int c = 0; c < 3; c++)
+            pmin = fminf(pmin, s->premultiply[c]);
+
+        for (int c = 0; c < 3; c++)
+            s->premultiply[c] /= pmin;
+
+        if (s->bpp % s->bppcount)
+            return AVERROR_INVALIDDATA;
+        bps = s->bpp / s->bppcount;
+        if (bps < 8 || bps > 32)
+            return AVERROR_INVALIDDATA;
+
+        if (s->white_level == 0)
+            s->white_level = (1LL << bps) - 1; /* Default value as per the spec */
+
+        if (s->white_level <= s->black_level[0]) {
+            av_log(avctx, AV_LOG_ERROR, "BlackLevel (%g) must be less than WhiteLevel (%"PRId32")\n",
+                s->black_level[0], s->white_level);
+            return AVERROR_INVALIDDATA;
+        }
+
+        if (s->planar)
+            return AVERROR_PATCHWELCOME;
+    }
+
+    if (!s->is_tiled && !s->strippos && !s->stripoff) {
         av_log(avctx, AV_LOG_ERROR, "Image data is missing\n");
         return AVERROR_INVALIDDATA;
     }
+
+    has_tile_bits  = s->is_tiled || s->tile_byte_counts_offset || s->tile_offsets_offset || s->tile_width || s->tile_length;
+    has_strip_bits = s->strippos || s->strips || s->stripoff || s->rps || s->sot || s->sstype || s->stripsize || s->stripsizesoff;
+
+    if (has_tile_bits && has_strip_bits) {
+        int tiled_dng = s->is_tiled && is_dng;
+        av_log(avctx, tiled_dng ? AV_LOG_WARNING : AV_LOG_ERROR, "Tiled TIFF is not allowed to strip\n");
+        if (!tiled_dng)
+            return AVERROR_INVALIDDATA;
+    }
+
     /* now we have the data and may start decoding */
-    if ((ret = init_image(s, &frame)) < 0)
+    if ((ret = init_image(s, p)) <= 0)
         return ret;
 
-    if (s->strips == 1 && !s->stripsize) {
-        av_log(avctx, AV_LOG_WARNING, "Image data size missing\n");
-        s->stripsize = avpkt->size - s->stripoff;
+    if (!s->is_tiled || has_strip_bits) {
+        if (s->strips == 1 && !s->stripsize) {
+            av_log(avctx, AV_LOG_WARNING, "Image data size missing\n");
+            s->stripsize = avpkt->size - s->stripoff;
+        }
+
+        if (s->stripsizesoff) {
+            if (s->stripsizesoff >= (unsigned)avpkt->size)
+                return AVERROR_INVALIDDATA;
+            bytestream2_init(&stripsizes, avpkt->data + s->stripsizesoff,
+                            avpkt->size - s->stripsizesoff);
+        }
+        if (s->strippos) {
+            if (s->strippos >= (unsigned)avpkt->size)
+                return AVERROR_INVALIDDATA;
+            bytestream2_init(&stripdata, avpkt->data + s->strippos,
+                            avpkt->size - s->strippos);
+        }
+
+        if (s->rps <= 0 || s->rps % s->subsampling[1]) {
+            av_log(avctx, AV_LOG_ERROR, "rps %d invalid\n", s->rps);
+            return AVERROR_INVALIDDATA;
+        }
     }
 
-    if (s->stripsizesoff) {
-        if (s->stripsizesoff >= (unsigned)avpkt->size)
-            return AVERROR_INVALIDDATA;
-        bytestream2_init(&stripsizes, avpkt->data + s->stripsizesoff,
-                         avpkt->size - s->stripsizesoff);
-    }
-    if (s->strippos) {
-        if (s->strippos >= (unsigned)avpkt->size)
-            return AVERROR_INVALIDDATA;
-        bytestream2_init(&stripdata, avpkt->data + s->strippos,
-                         avpkt->size - s->strippos);
+    if (s->photometric == TIFF_PHOTOMETRIC_LINEAR_RAW ||
+        s->photometric == TIFF_PHOTOMETRIC_CFA) {
+        p->color_trc = AVCOL_TRC_LINEAR;
+    } else if (s->photometric == TIFF_PHOTOMETRIC_BLACK_IS_ZERO) {
+        p->color_trc = AVCOL_TRC_GAMMA22;
     }
 
-    if (s->rps <= 0) {
-        av_log(avctx, AV_LOG_ERROR, "rps %d invalid\n", s->rps);
-        return AVERROR_INVALIDDATA;
+    /* Handle DNG images with JPEG-compressed tiles */
+
+    if (is_dng && s->is_tiled) {
+        if (!s->is_jpeg) {
+            avpriv_report_missing_feature(avctx, "DNG uncompressed tiled images");
+            return AVERROR_PATCHWELCOME;
+        } else if (!s->is_bayer) {
+            avpriv_report_missing_feature(avctx, "DNG JPG-compressed tiled non-bayer-encoded images");
+            return AVERROR_PATCHWELCOME;
+        } else {
+            if ((ret = dng_decode_tiles(avctx, p, avpkt)) > 0)
+                *got_frame = 1;
+            return ret;
+        }
     }
+
+    /* Handle TIFF images and DNG images with uncompressed strips (non-tiled) */
 
     planes = s->planar ? s->bppcount : 1;
     for (plane = 0; plane < planes; plane++) {
+        uint8_t *five_planes = NULL;
+        int remaining = avpkt->size;
+        int decoded_height;
         stride = p->linesize[plane];
         dst = p->data[plane];
+        if (s->photometric == TIFF_PHOTOMETRIC_SEPARATED &&
+            s->avctx->pix_fmt == AV_PIX_FMT_RGBA) {
+            stride = stride * 5 / 4;
+            five_planes =
+            dst = av_malloc(stride * s->height);
+            if (!dst)
+                return AVERROR(ENOMEM);
+        }
         for (i = 0; i < s->height; i += s->rps) {
+            if (i)
+                dst += s->rps * stride;
             if (s->stripsizesoff)
                 ssize = ff_tget(&stripsizes, s->sstype, le);
             else
@@ -1277,24 +2209,29 @@ static int decode_frame(AVCodecContext *avctx,
             else
                 soff = s->stripoff;
 
-            if (soff > avpkt->size || ssize > avpkt->size - soff) {
+            if (soff > avpkt->size || ssize > avpkt->size - soff || ssize > remaining) {
                 av_log(avctx, AV_LOG_ERROR, "Invalid strip size/offset\n");
+                av_freep(&five_planes);
                 return AVERROR_INVALIDDATA;
             }
+            remaining -= ssize;
             if ((ret = tiff_unpack_strip(s, p, dst, stride, avpkt->data + soff, ssize, i,
                                          FFMIN(s->rps, s->height - i))) < 0) {
-                if (avctx->err_recognition & AV_EF_EXPLODE)
+                if (avctx->err_recognition & AV_EF_EXPLODE) {
+                    av_freep(&five_planes);
                     return ret;
+                }
                 break;
             }
-            dst += s->rps * stride;
         }
+        decoded_height = FFMIN(i, s->height);
+
         if (s->predictor == 2) {
             if (s->photometric == TIFF_PHOTOMETRIC_YCBCR) {
                 av_log(s->avctx, AV_LOG_ERROR, "predictor == 2 with YUV is unsupported");
                 return AVERROR_PATCHWELCOME;
             }
-            dst   = p->data[plane];
+            dst   = five_planes ? five_planes : p->data[plane];
             soff  = s->bpp >> 3;
             if (s->planar)
                 soff  = FFMAX(soff / s->bppcount, 1);
@@ -1305,7 +2242,7 @@ static int decode_frame(AVCodecContext *avctx,
                 s->avctx->pix_fmt == AV_PIX_FMT_YA16LE ||
                 s->avctx->pix_fmt == AV_PIX_FMT_GBRP16LE ||
                 s->avctx->pix_fmt == AV_PIX_FMT_GBRAP16LE) {
-                for (i = 0; i < s->height; i++) {
+                for (i = 0; i < decoded_height; i++) {
                     for (j = soff; j < ssize; j += 2)
                         AV_WL16(dst + j, AV_RL16(dst + j) + AV_RL16(dst + j - soff));
                     dst += stride;
@@ -1316,13 +2253,13 @@ static int decode_frame(AVCodecContext *avctx,
                        s->avctx->pix_fmt == AV_PIX_FMT_YA16BE ||
                        s->avctx->pix_fmt == AV_PIX_FMT_GBRP16BE ||
                        s->avctx->pix_fmt == AV_PIX_FMT_GBRAP16BE) {
-                for (i = 0; i < s->height; i++) {
+                for (i = 0; i < decoded_height; i++) {
                     for (j = soff; j < ssize; j += 2)
                         AV_WB16(dst + j, AV_RB16(dst + j) + AV_RB16(dst + j - soff));
                     dst += stride;
                 }
             } else {
-                for (i = 0; i < s->height; i++) {
+                for (i = 0; i < decoded_height; i++) {
                     for (j = soff; j < ssize; j++)
                         dst[j] += dst[j - soff];
                     dst += stride;
@@ -1330,12 +2267,121 @@ static int decode_frame(AVCodecContext *avctx,
             }
         }
 
+        /* Floating point predictor
+           TIFF Technical Note 3 http://chriscox.org/TIFFTN3d1.pdf */
+        if (s->predictor == 3) {
+            int channels = s->bppcount;
+            int group_size;
+            uint8_t *tmpbuf;
+            int bpc;
+
+            dst   = five_planes ? five_planes : p->data[plane];
+            soff  = s->bpp >> 3;
+            if (s->planar) {
+                soff  = FFMAX(soff / s->bppcount, 1);
+                channels = 1;
+            }
+            ssize = s->width * soff;
+            bpc = FFMAX(soff / s->bppcount, 1); /* Bytes per component */
+            group_size = s->width * channels;
+
+            tmpbuf = av_malloc(ssize);
+            if (!tmpbuf) {
+                av_free(five_planes);
+                return AVERROR(ENOMEM);
+            }
+
+            if (s->avctx->pix_fmt == AV_PIX_FMT_RGBF32LE ||
+                s->avctx->pix_fmt == AV_PIX_FMT_RGBAF32LE) {
+                for (i = 0; i < decoded_height; i++) {
+                    /* Copy first sample byte for each channel */
+                    for (j = 0; j < channels; j++)
+                        tmpbuf[j] = dst[j];
+
+                    /* Decode horizontal differences */
+                    for (j = channels; j < ssize; j++)
+                        tmpbuf[j] = dst[j] + tmpbuf[j-channels];
+
+                    /* Combine shuffled bytes from their separate groups. Each
+                       byte of every floating point value in a row of pixels is
+                       split and combined into separate groups. A group of all
+                       the sign/exponents bytes in the row and groups for each
+                       of the upper, mid, and lower mantissa bytes in the row. */
+                    for (j = 0; j < group_size; j++) {
+                        for (int k = 0; k < bpc; k++) {
+                            dst[bpc * j + k] = tmpbuf[(bpc - k - 1) * group_size + j];
+                        }
+                    }
+                    dst += stride;
+                }
+            } else if (s->avctx->pix_fmt == AV_PIX_FMT_RGBF32BE ||
+                       s->avctx->pix_fmt == AV_PIX_FMT_RGBAF32BE) {
+                /* Same as LE only the shuffle at the end is reversed */
+                for (i = 0; i < decoded_height; i++) {
+                    for (j = 0; j < channels; j++)
+                        tmpbuf[j] = dst[j];
+
+                    for (j = channels; j < ssize; j++)
+                        tmpbuf[j] = dst[j] + tmpbuf[j-channels];
+
+                    for (j = 0; j < group_size; j++) {
+                        for (int k = 0; k < bpc; k++) {
+                            dst[bpc * j + k] = tmpbuf[k * group_size + j];
+                        }
+                    }
+                    dst += stride;
+                }
+            } else {
+                av_log(s->avctx, AV_LOG_ERROR, "unsupported floating point pixel format\n");
+            }
+            av_free(tmpbuf);
+        }
+
         if (s->photometric == TIFF_PHOTOMETRIC_WHITE_IS_ZERO) {
+            int c = (s->avctx->pix_fmt == AV_PIX_FMT_PAL8 ? (1<<s->bpp) - 1 : 255);
             dst = p->data[plane];
             for (i = 0; i < s->height; i++) {
                 for (j = 0; j < stride; j++)
-                    dst[j] = (s->avctx->pix_fmt == AV_PIX_FMT_PAL8 ? (1<<s->bpp) - 1 : 255) - dst[j];
+                    dst[j] = c - dst[j];
                 dst += stride;
+            }
+        }
+
+        if (s->photometric == TIFF_PHOTOMETRIC_SEPARATED &&
+            (s->avctx->pix_fmt == AV_PIX_FMT_RGB0 || s->avctx->pix_fmt == AV_PIX_FMT_RGBA)) {
+            int x = s->avctx->pix_fmt == AV_PIX_FMT_RGB0 ? 4 : 5;
+            uint8_t *src = five_planes ? five_planes : p->data[plane];
+            dst = p->data[plane];
+            for (i = 0; i < s->height; i++) {
+                for (j = 0; j < s->width; j++) {
+                    int k =  255 - src[x * j + 3];
+                    int r = (255 - src[x * j    ]) * k;
+                    int g = (255 - src[x * j + 1]) * k;
+                    int b = (255 - src[x * j + 2]) * k;
+                    dst[4 * j    ] = r * 257 >> 16;
+                    dst[4 * j + 1] = g * 257 >> 16;
+                    dst[4 * j + 2] = b * 257 >> 16;
+                    dst[4 * j + 3] = s->avctx->pix_fmt == AV_PIX_FMT_RGBA ? src[x * j + 4] : 255;
+                }
+                src += stride;
+                dst += p->linesize[plane];
+            }
+            av_freep(&five_planes);
+        } else if (s->photometric == TIFF_PHOTOMETRIC_SEPARATED &&
+            s->avctx->pix_fmt == AV_PIX_FMT_RGBA64BE) {
+            dst = p->data[plane];
+            for (i = 0; i < s->height; i++) {
+                for (j = 0; j < s->width; j++) {
+                    uint64_t k =  65535 - AV_RB16(dst + 8 * j + 6);
+                    uint64_t r = (65535 - AV_RB16(dst + 8 * j    )) * k;
+                    uint64_t g = (65535 - AV_RB16(dst + 8 * j + 2)) * k;
+                    uint64_t b = (65535 - AV_RB16(dst + 8 * j + 4)) * k;
+                    AV_WB16(dst + 8 * j    , r * 65537 >> 32);
+                    AV_WB16(dst + 8 * j + 2, g * 65537 >> 32);
+                    AV_WB16(dst + 8 * j + 4, b * 65537 >> 32);
+                    AV_WB16(dst + 8 * j + 6, 65535);
+                }
+                dst += p->linesize[plane];
             }
         }
     }
@@ -1347,6 +2393,15 @@ static int decode_frame(AVCodecContext *avctx,
         FFSWAP(int,      p->linesize[0], p->linesize[1]);
     }
 
+    if (s->is_bayer && s->white_level && s->bpp == 16 && !is_dng) {
+        uint16_t *dst = (uint16_t *)p->data[0];
+        for (i = 0; i < s->height; i++) {
+            for (j = 0; j < s->width; j++)
+                dst[j] = FFMIN((dst[j] / (float)s->white_level) * 65535, 65535);
+            dst += stride / 2;
+        }
+    }
+
     *got_frame = 1;
 
     return avpkt->size;
@@ -1355,6 +2410,7 @@ static int decode_frame(AVCodecContext *avctx,
 static av_cold int tiff_init(AVCodecContext *avctx)
 {
     TiffContext *s = avctx->priv_data;
+    int ret;
 
     s->width  = 0;
     s->height = 0;
@@ -1362,7 +2418,29 @@ static av_cold int tiff_init(AVCodecContext *avctx)
     s->subsampling[1] = 1;
     s->avctx  = avctx;
     ff_lzw_decode_open(&s->lzw);
+    if (!s->lzw)
+        return AVERROR(ENOMEM);
     ff_ccitt_unpack_init();
+
+    /* Allocate JPEG frame */
+    s->jpgframe = av_frame_alloc();
+    s->jpkt     = av_packet_alloc();
+    if (!s->jpgframe || !s->jpkt)
+        return AVERROR(ENOMEM);
+
+    /* Prepare everything needed for JPEG decoding */
+    EXTERN const FFCodec ff_mjpeg_decoder;
+    s->avctx_mjpeg = avcodec_alloc_context3(&ff_mjpeg_decoder.p);
+    if (!s->avctx_mjpeg)
+        return AVERROR(ENOMEM);
+    s->avctx_mjpeg->flags = avctx->flags;
+    s->avctx_mjpeg->flags2 = avctx->flags2;
+    s->avctx_mjpeg->idct_algo = avctx->idct_algo;
+    s->avctx_mjpeg->max_pixels = avctx->max_pixels;
+    ret = avcodec_open2(s->avctx_mjpeg, NULL, NULL);
+    if (ret < 0) {
+        return ret;
+    }
 
     return 0;
 }
@@ -1375,18 +2453,41 @@ static av_cold int tiff_end(AVCodecContext *avctx)
 
     ff_lzw_decode_close(&s->lzw);
     av_freep(&s->deinvert_buf);
+    s->deinvert_buf_size = 0;
+    av_freep(&s->yuv_line);
+    s->yuv_line_size = 0;
+    av_frame_free(&s->jpgframe);
+    av_packet_free(&s->jpkt);
+    avcodec_free_context(&s->avctx_mjpeg);
     return 0;
 }
 
-AVCodec ff_tiff_decoder = {
-    .name           = "tiff",
-    .long_name      = NULL_IF_CONFIG_SMALL("TIFF image"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_TIFF,
+#define OFFSET(x) offsetof(TiffContext, x)
+static const AVOption tiff_options[] = {
+    { "subimage", "decode subimage instead if available", OFFSET(get_subimage), AV_OPT_TYPE_BOOL, {.i64=0},  0, 1, AV_OPT_FLAG_DECODING_PARAM | AV_OPT_FLAG_VIDEO_PARAM },
+    { "thumbnail", "decode embedded thumbnail subimage instead if available", OFFSET(get_thumbnail), AV_OPT_TYPE_BOOL, {.i64=0},  0, 1, AV_OPT_FLAG_DECODING_PARAM | AV_OPT_FLAG_VIDEO_PARAM },
+    { "page", "page number of multi-page image to decode (starting from 1)", OFFSET(get_page), AV_OPT_TYPE_INT, {.i64=0}, 0, UINT16_MAX, AV_OPT_FLAG_DECODING_PARAM | AV_OPT_FLAG_VIDEO_PARAM },
+    { NULL },
+};
+
+static const AVClass tiff_decoder_class = {
+    .class_name = "TIFF decoder",
+    .item_name  = av_default_item_name,
+    .option     = tiff_options,
+    .version    = LIBAVUTIL_VERSION_INT,
+};
+
+const FFCodec ff_tiff_decoder = {
+    .p.name         = "tiff",
+    CODEC_LONG_NAME("TIFF image"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_TIFF,
     .priv_data_size = sizeof(TiffContext),
     .init           = tiff_init,
     .close          = tiff_end,
-    .decode         = decode_frame,
-    .init_thread_copy = ONLY_IF_THREADS_ENABLED(tiff_init),
-    .capabilities   = CODEC_CAP_DR1 | CODEC_CAP_FRAME_THREADS,
+    FF_CODEC_DECODE_CB(decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_FRAME_THREADS,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP | FF_CODEC_CAP_ICC_PROFILES |
+                      FF_CODEC_CAP_SKIP_FRAME_FILL_PARAM,
+    .p.priv_class   = &tiff_decoder_class,
 };

@@ -35,12 +35,17 @@
  * project, and ported by Arwa Arif for FFmpeg.
  */
 
-#include "libavutil/avassert.h"
+#include "libavutil/emms.h"
 #include "libavutil/imgutils.h"
+#include "libavutil/mem.h"
+#include "libavutil/mem_internal.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
-#include "internal.h"
+
+#include "filters.h"
+#include "qp_table.h"
 #include "vf_fspp.h"
+#include "video.h"
 
 #define OFFSET(x) offsetof(FSPPContext, x)
 #define FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM
@@ -48,7 +53,7 @@ static const AVOption fspp_options[] = {
     { "quality",       "set quality",                          OFFSET(log2_count),    AV_OPT_TYPE_INT, {.i64 = 4},   4, MAX_LEVEL, FLAGS },
     { "qp",            "force a constant quantizer parameter", OFFSET(qp),            AV_OPT_TYPE_INT, {.i64 = 0},   0, 64,        FLAGS },
     { "strength",      "set filter strength",                  OFFSET(strength),      AV_OPT_TYPE_INT, {.i64 = 0}, -15, 32,        FLAGS },
-    { "use_bframe_qp", "use B-frames' QP",                     OFFSET(use_bframe_qp), AV_OPT_TYPE_INT, {.i64 = 0},   0, 1,         FLAGS },
+    { "use_bframe_qp", "use B-frames' QP",                     OFFSET(use_bframe_qp), AV_OPT_TYPE_BOOL,{.i64 = 0},   0, 1,         FLAGS },
     { NULL }
 };
 
@@ -458,7 +463,7 @@ static void row_fdct_c(int16_t *data, const uint8_t *pixels, ptrdiff_t line_size
         tmp12 = tmp1 - tmp2;
         //Even columns are written first, this leads to different order of columns
         //in column_fidct(), but they are processed independently, so all ok.
-        //Later in the row_idct() columns readed at the same order.
+        //Later in the row_idct() columns are read in the same order.
         dataptr[2] = tmp10 + tmp11;
         dataptr[3] = tmp10 - tmp11;
 
@@ -490,23 +495,15 @@ static void row_fdct_c(int16_t *data, const uint8_t *pixels, ptrdiff_t line_size
     }
 }
 
-static int query_formats(AVFilterContext *ctx)
-{
-    static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_YUV444P,  AV_PIX_FMT_YUV422P,
-        AV_PIX_FMT_YUV420P,  AV_PIX_FMT_YUV411P,
-        AV_PIX_FMT_YUV410P,  AV_PIX_FMT_YUV440P,
-        AV_PIX_FMT_YUVJ444P, AV_PIX_FMT_YUVJ422P,
-        AV_PIX_FMT_YUVJ420P, AV_PIX_FMT_YUVJ440P,
-        AV_PIX_FMT_GBRP, AV_PIX_FMT_GRAY8,
-        AV_PIX_FMT_NONE
-    };
-
-    AVFilterFormats *fmts_list = ff_make_format_list(pix_fmts);
-    if (!fmts_list)
-        return AVERROR(ENOMEM);
-    return ff_set_common_formats(ctx, fmts_list);
-}
+static const enum AVPixelFormat pix_fmts[] = {
+    AV_PIX_FMT_YUV444P,  AV_PIX_FMT_YUV422P,
+    AV_PIX_FMT_YUV420P,  AV_PIX_FMT_YUV411P,
+    AV_PIX_FMT_YUV410P,  AV_PIX_FMT_YUV440P,
+    AV_PIX_FMT_YUVJ444P, AV_PIX_FMT_YUVJ422P,
+    AV_PIX_FMT_YUVJ420P, AV_PIX_FMT_YUVJ440P,
+    AV_PIX_FMT_GBRP, AV_PIX_FMT_GRAY8,
+    AV_PIX_FMT_NONE
+};
 
 static int config_input(AVFilterLink *inlink)
 {
@@ -525,13 +522,6 @@ static int config_input(AVFilterLink *inlink)
     if (!fspp->temp || !fspp->src)
         return AVERROR(ENOMEM);
 
-    if (!fspp->use_bframe_qp && !fspp->qp) {
-        fspp->non_b_qp_alloc_size = FF_CEIL_RSHIFT(inlink->w, 4) * FF_CEIL_RSHIFT(inlink->h, 4);
-        fspp->non_b_qp_table = av_calloc(fspp->non_b_qp_alloc_size, sizeof(*fspp->non_b_qp_table));
-        if (!fspp->non_b_qp_table)
-            return AVERROR(ENOMEM);
-    }
-
     fspp->store_slice  = store_slice_c;
     fspp->store_slice2 = store_slice2_c;
     fspp->mul_thrmat   = mul_thrmat_c;
@@ -539,8 +529,9 @@ static int config_input(AVFilterLink *inlink)
     fspp->row_idct     = row_idct_c;
     fspp->row_fdct     = row_fdct_c;
 
-    if (ARCH_X86)
-        ff_fspp_init_x86(fspp);
+#if ARCH_X86
+    ff_fspp_init_x86(fspp);
+#endif
 
     return 0;
 }
@@ -553,8 +544,9 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     AVFrame *out = in;
 
     int qp_stride = 0;
-    uint8_t *qp_table = NULL;
+    int8_t *qp_table = NULL;
     int i, bias;
+    int ret = 0;
     int custom_threshold_m[64];
 
     bias = (1 << 4) + fspp->strength;
@@ -581,42 +573,29 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
      * the quantizers from the B-frames (B-frames often have a higher QP), we
      * need to save the qp table from the last non B-frame; this is what the
      * following code block does */
-    if (!fspp->qp) {
-        qp_table = av_frame_get_qp_table(in, &qp_stride, &fspp->qscale_type);
+    if (!fspp->qp && (fspp->use_bframe_qp || in->pict_type != AV_PICTURE_TYPE_B)) {
+        ret = ff_qp_table_extract(in, &qp_table, &qp_stride, NULL, &fspp->qscale_type);
+        if (ret < 0) {
+            av_frame_free(&in);
+            return ret;
+        }
 
-        if (qp_table && !fspp->use_bframe_qp && in->pict_type != AV_PICTURE_TYPE_B) {
-            int w, h;
-
-            /* if the qp stride is not set, it means the QP are only defined on
-             * a line basis */
-           if (!qp_stride) {
-                w = FF_CEIL_RSHIFT(inlink->w, 4);
-                h = 1;
-            } else {
-                w = qp_stride;
-                h = FF_CEIL_RSHIFT(inlink->h, 4);
-            }
-            if (w * h > fspp->non_b_qp_alloc_size) {
-                int ret = av_reallocp_array(&fspp->non_b_qp_table, w, h);
-                if (ret < 0) {
-                    fspp->non_b_qp_alloc_size = 0;
-                    return ret;
-                }
-                fspp->non_b_qp_alloc_size = w * h;
-            }
-
-            av_assert0(w * h <= fspp->non_b_qp_alloc_size);
-            memcpy(fspp->non_b_qp_table, qp_table, w * h);
+        if (!fspp->use_bframe_qp && in->pict_type != AV_PICTURE_TYPE_B) {
+            av_freep(&fspp->non_b_qp_table);
+            fspp->non_b_qp_table  = qp_table;
+            fspp->non_b_qp_stride = qp_stride;
         }
     }
 
     if (fspp->log2_count && !ctx->is_disabled) {
-        if (!fspp->use_bframe_qp && fspp->non_b_qp_table)
+        if (!fspp->use_bframe_qp && fspp->non_b_qp_table) {
             qp_table = fspp->non_b_qp_table;
+            qp_stride = fspp->non_b_qp_stride;
+        }
 
         if (qp_table || fspp->qp) {
-            const int cw = FF_CEIL_RSHIFT(inlink->w, fspp->hsub);
-            const int ch = FF_CEIL_RSHIFT(inlink->h, fspp->vsub);
+            const int cw = AV_CEIL_RSHIFT(inlink->w, fspp->hsub);
+            const int ch = AV_CEIL_RSHIFT(inlink->h, fspp->vsub);
 
             /* get a new frame if in-place is not possible or if the dimensions
              * are not multiple of 8 */
@@ -627,7 +606,8 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
                 out = ff_get_video_buffer(outlink, aligned_w, aligned_h);
                 if (!out) {
                     av_frame_free(&in);
-                    return AVERROR(ENOMEM);
+                    ret = AVERROR(ENOMEM);
+                    goto finish;
                 }
                 av_frame_copy_props(out, in);
                 out->width = in->width;
@@ -651,7 +631,11 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
                                 inlink->w, inlink->h);
         av_frame_free(&in);
     }
-    return ff_filter_frame(outlink, out);
+    ret = ff_filter_frame(outlink, out);
+finish:
+    if (qp_table != fspp->non_b_qp_table)
+        av_freep(&qp_table);
+    return ret;
 }
 
 static av_cold void uninit(AVFilterContext *ctx)
@@ -669,25 +653,16 @@ static const AVFilterPad fspp_inputs[] = {
         .config_props = config_input,
         .filter_frame = filter_frame,
     },
-    { NULL }
 };
 
-static const AVFilterPad fspp_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-    { NULL }
-};
-
-AVFilter ff_vf_fspp = {
-    .name            = "fspp",
-    .description     = NULL_IF_CONFIG_SMALL("Apply Fast Simple Post-processing filter."),
+const FFFilter ff_vf_fspp = {
+    .p.name          = "fspp",
+    .p.description   = NULL_IF_CONFIG_SMALL("Apply Fast Simple Post-processing filter."),
+    .p.priv_class    = &fspp_class,
+    .p.flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL,
     .priv_size       = sizeof(FSPPContext),
     .uninit          = uninit,
-    .query_formats   = query_formats,
-    .inputs          = fspp_inputs,
-    .outputs         = fspp_outputs,
-    .priv_class      = &fspp_class,
-    .flags           = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL,
+    FILTER_INPUTS(fspp_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_PIXFMTS_ARRAY(pix_fmts),
 };

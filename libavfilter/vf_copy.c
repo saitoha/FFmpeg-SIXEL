@@ -24,22 +24,41 @@
 #include "libavutil/imgutils.h"
 #include "libavutil/internal.h"
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
+#include "formats.h"
 #include "video.h"
+
+static int query_formats(const AVFilterContext *ctx,
+                         AVFilterFormatsConfig **cfg_in,
+                         AVFilterFormatsConfig **cfg_out)
+{
+    return ff_set_common_formats2(ctx, cfg_in, cfg_out,
+                                  ff_formats_pixdesc_filter(0, AV_PIX_FMT_FLAG_HWACCEL));
+}
 
 static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 {
     AVFilterLink *outlink = inlink->dst->outputs[0];
     AVFrame *out = ff_get_video_buffer(outlink, in->width, in->height);
+    int ret;
 
     if (!out) {
-        av_frame_free(&in);
-        return AVERROR(ENOMEM);
+        ret = AVERROR(ENOMEM);
+        goto fail;
     }
-    av_frame_copy_props(out, in);
-    av_frame_copy(out, in);
+
+    ret = av_frame_copy_props(out, in);
+    if (ret < 0)
+        goto fail;
+    ret = av_frame_copy(out, in);
+    if (ret < 0)
+        goto fail;
     av_frame_free(&in);
     return ff_filter_frame(outlink, out);
+fail:
+    av_frame_free(&in);
+    av_frame_free(&out);
+    return ret;
 }
 
 static const AVFilterPad avfilter_vf_copy_inputs[] = {
@@ -48,20 +67,13 @@ static const AVFilterPad avfilter_vf_copy_inputs[] = {
         .type         = AVMEDIA_TYPE_VIDEO,
         .filter_frame = filter_frame,
     },
-    { NULL }
 };
 
-static const AVFilterPad avfilter_vf_copy_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-    { NULL }
-};
-
-AVFilter ff_vf_copy = {
-    .name        = "copy",
-    .description = NULL_IF_CONFIG_SMALL("Copy the input video unchanged to the output."),
-    .inputs      = avfilter_vf_copy_inputs,
-    .outputs     = avfilter_vf_copy_outputs,
+const FFFilter ff_vf_copy = {
+    .p.name        = "copy",
+    .p.description = NULL_IF_CONFIG_SMALL("Copy the input video unchanged to the output."),
+    .p.flags       = AVFILTER_FLAG_METADATA_ONLY,
+    FILTER_INPUTS(avfilter_vf_copy_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_QUERY_FUNC2(query_formats),
 };

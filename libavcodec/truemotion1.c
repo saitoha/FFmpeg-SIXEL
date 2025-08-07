@@ -34,7 +34,8 @@
 #include <string.h>
 
 #include "avcodec.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/internal.h"
 #include "libavutil/intreadwrite.h"
@@ -177,10 +178,10 @@ static int make_ydt15_entry(int p1, int p2, int16_t *ydt)
     int lo, hi;
 
     lo = ydt[p1];
-    lo += (lo << 5) + (lo << 10);
+    lo += (lo * 32) + (lo * 1024);
     hi = ydt[p2];
-    hi += (hi << 5) + (hi << 10);
-    return (lo + (hi << 16)) << 1;
+    hi += (hi * 32) + (hi * 1024);
+    return (lo + (hi * (1U << 16))) * 2;
 }
 
 static int make_cdt15_entry(int p1, int p2, int16_t *cdt)
@@ -188,9 +189,9 @@ static int make_cdt15_entry(int p1, int p2, int16_t *cdt)
     int r, b, lo;
 
     b = cdt[p2];
-    r = cdt[p1] << 10;
+    r = cdt[p1] * 1024;
     lo = b + r;
-    return (lo + (lo << 16)) << 1;
+    return (lo + (lo * (1U << 16))) * 2;
 }
 
 #if HAVE_BIGENDIAN
@@ -215,7 +216,7 @@ static int make_cdt16_entry(int p1, int p2, int16_t *cdt)
     b = cdt[p2];
     r = cdt[p1] << 11;
     lo = b + r;
-    return (lo + (lo << 16)) << 1;
+    return (lo + (lo * (1 << 16))) * 2;
 }
 
 static int make_ydt24_entry(int p1, int p2, int16_t *ydt)
@@ -224,7 +225,7 @@ static int make_ydt24_entry(int p1, int p2, int16_t *ydt)
 
     lo = ydt[p1];
     hi = ydt[p2];
-    return (lo + (hi << 8) + (hi << 16)) << 1;
+    return (lo + (hi * (1 << 8)) + (hi * (1 << 16))) * 2;
 }
 
 static int make_cdt24_entry(int p1, int p2, int16_t *cdt)
@@ -232,8 +233,8 @@ static int make_cdt24_entry(int p1, int p2, int16_t *cdt)
     int r, b;
 
     b = cdt[p2];
-    r = cdt[p1]<<16;
-    return (b+r) << 1;
+    r = cdt[p1] * (1 << 16);
+    return (b+r) * 2;
 }
 
 static void gen_vector_table15(TrueMotion1Context *s, const uint8_t *sel_vector_table)
@@ -396,12 +397,21 @@ static int truemotion1_decode_header(TrueMotion1Context *s)
     }
 
     if (compression_types[header.compression].algorithm == ALGO_RGB24H) {
-        new_pix_fmt = AV_PIX_FMT_RGB32;
+        new_pix_fmt = AV_PIX_FMT_0RGB32;
         width_shift = 1;
     } else
         new_pix_fmt = AV_PIX_FMT_RGB555; // RGB565 is supported as well
 
     s->w >>= width_shift;
+    if (s->w & 1) {
+        avpriv_request_sample(s->avctx, "Frame with odd width");
+        return AVERROR_PATCHWELCOME;
+    }
+
+    if (s->h & 3) {
+        avpriv_request_sample(s->avctx, "Frame with height not being a multiple of 4");
+        return AVERROR_PATCHWELCOME;
+    }
 
     if (s->w != s->avctx->width || s->h != s->avctx->height ||
         new_pix_fmt != s->avctx->pix_fmt) {
@@ -440,6 +450,8 @@ static int truemotion1_decode_header(TrueMotion1Context *s)
     if (s->flags & FLAG_KEYFRAME) {
         /* no change bits specified for a keyframe; only index bytes */
         s->index_stream = s->mb_change_bits;
+        if (s->avctx->width * s->avctx->height / 2048 + header.header_size > s->size)
+            return AVERROR_INVALIDDATA;
     } else {
         /* one change bit per 4x4 block */
         s->index_stream = s->mb_change_bits +
@@ -641,7 +653,8 @@ static void truemotion1_decode_16bit(TrueMotion1Context *s)
         current_pixel_pair = (unsigned int *)current_line;
         vert_pred = s->vert_pred;
         mb_change_index = 0;
-        mb_change_byte = mb_change_bits[mb_change_index++];
+        if (!keyframe)
+            mb_change_byte = mb_change_bits[mb_change_index++];
         mb_change_byte_mask = 0x01;
         pixels_left = s->avctx->width;
 
@@ -861,9 +874,8 @@ static void truemotion1_decode_24bit(TrueMotion1Context *s)
 }
 
 
-static int truemotion1_decode_frame(AVCodecContext *avctx,
-                                    void *data, int *got_frame,
-                                    AVPacket *avpkt)
+static int truemotion1_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
+                                    int *got_frame, AVPacket *avpkt)
 {
     const uint8_t *buf = avpkt->data;
     int ret, buf_size = avpkt->size;
@@ -875,7 +887,7 @@ static int truemotion1_decode_frame(AVCodecContext *avctx,
     if ((ret = truemotion1_decode_header(s)) < 0)
         return ret;
 
-    if ((ret = ff_reget_buffer(avctx, s->frame)) < 0)
+    if ((ret = ff_reget_buffer(avctx, s->frame, 0)) < 0)
         return ret;
 
     if (compression_types[s->compression].algorithm == ALGO_RGB24H) {
@@ -884,7 +896,7 @@ static int truemotion1_decode_frame(AVCodecContext *avctx,
         truemotion1_decode_16bit(s);
     }
 
-    if ((ret = av_frame_ref(data, s->frame)) < 0)
+    if ((ret = av_frame_ref(rframe, s->frame)) < 0)
         return ret;
 
     *got_frame      = 1;
@@ -903,14 +915,15 @@ static av_cold int truemotion1_decode_end(AVCodecContext *avctx)
     return 0;
 }
 
-AVCodec ff_truemotion1_decoder = {
-    .name           = "truemotion1",
-    .long_name      = NULL_IF_CONFIG_SMALL("Duck TrueMotion 1.0"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_TRUEMOTION1,
+const FFCodec ff_truemotion1_decoder = {
+    .p.name         = "truemotion1",
+    CODEC_LONG_NAME("Duck TrueMotion 1.0"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_TRUEMOTION1,
     .priv_data_size = sizeof(TrueMotion1Context),
     .init           = truemotion1_decode_init,
     .close          = truemotion1_decode_end,
-    .decode         = truemotion1_decode_frame,
-    .capabilities   = CODEC_CAP_DR1,
+    FF_CODEC_DECODE_CB(truemotion1_decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };

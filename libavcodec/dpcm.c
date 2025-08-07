@@ -1,6 +1,6 @@
 /*
  * Assorted DPCM codecs
- * Copyright (c) 2003 The FFmpeg Project
+ * Copyright (c) 2003 The FFmpeg project
  *
  * This file is part of FFmpeg.
  *
@@ -37,17 +37,33 @@
  * the fourcc 'Axan' in the 'auds' chunk of the AVI header.
  */
 
-#include "libavutil/intreadwrite.h"
 #include "avcodec.h"
 #include "bytestream.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include "mathops.h"
 
 typedef struct DPCMContext {
-    int16_t roq_square_array[256];
-    int sample[2];                  ///< previous sample (for SOL_DPCM)
+    int16_t array[256];
+    int sample[2];                  ///< previous sample (for SOL_DPCM and WADY_DPCM)
+    int scale;                      ///< scale for WADY_DPCM
     const int8_t *sol_table;        ///< delta table for SOL_DPCM
 } DPCMContext;
+
+static const int32_t derf_steps[96] = {
+    0, 1, 2, 3, 4, 5, 6, 7,
+    8, 9, 10, 11, 12, 13, 14, 16,
+    17, 19, 21, 23, 25, 28, 31, 34,
+    37, 41, 45, 50, 55, 60, 66, 73,
+    80, 88, 97, 107, 118, 130, 143, 157,
+    173, 190, 209, 230, 253, 279, 307, 337,
+    371, 408, 449, 494, 544, 598, 658, 724,
+    796, 876, 963, 1060, 1166, 1282, 1411, 1552,
+    1707, 1878, 2066, 2272, 2499, 2749, 3024, 3327,
+    3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132,
+    7845, 8630, 9493, 10442, 11487, 12635, 13899, 15289,
+    16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767,
+};
 
 static const int16_t interplay_delta_table[] = {
          0,      1,      2,      3,      4,      5,      6,      7,
@@ -111,27 +127,45 @@ static const int16_t sol_table_16[128] = {
     0xF00, 0x1000, 0x1400, 0x1800, 0x1C00, 0x2000, 0x3000, 0x4000
 };
 
+static const int16_t wady_table[128] = {
+    0,   2,   4,   6,   8,   10,  12,  15,
+    18,  21,  24,  28,  32,  36,  40,  44,
+    49,  54,  59,  64,  70,  76,  82,  88,
+    95,  102, 109, 116, 124, 132, 140, 148,
+    160, 170, 180, 190, 200, 210, 220, 230,
+    240, 255, 270, 285, 300, 320, 340, 360,
+    380, 400, 425, 450, 475, 500, 525, 550,
+    580, 610, 650, 700, 750, 800, 900, 1000,
+    -0,  -2,  -4,  -6,  -8,  -10, -12, -15,
+    -18, -21, -24, -28, -32, -36, -40, -44,
+    -49, -54, -59, -64, -70, -76, -82, -88,
+    -95, -102,-109,-116,-124,-132,-140,-148,
+    -160,-170,-180,-190,-200,-210,-220,-230,
+    -240,-255,-270,-285,-300,-320,-340,-360,
+    -380,-400,-425,-450,-475,-500,-525,-550,
+    -580,-610,-650,-700,-750,-800,-900,-1000,
+};
 
 static av_cold int dpcm_decode_init(AVCodecContext *avctx)
 {
     DPCMContext *s = avctx->priv_data;
     int i;
 
-    if (avctx->channels < 1 || avctx->channels > 2) {
+    if (avctx->ch_layout.nb_channels < 1 || avctx->ch_layout.nb_channels > 2) {
         av_log(avctx, AV_LOG_ERROR, "invalid number of channels\n");
         return AVERROR(EINVAL);
     }
 
     s->sample[0] = s->sample[1] = 0;
 
-    switch(avctx->codec->id) {
+    switch (avctx->codec->id) {
 
     case AV_CODEC_ID_ROQ_DPCM:
         /* initialize square table */
         for (i = 0; i < 128; i++) {
             int16_t square = i * i;
-            s->roq_square_array[i      ] =  square;
-            s->roq_square_array[i + 128] = -square;
+            s->array[i      ] =  square;
+            s->array[i + 128] = -square;
         }
         break;
 
@@ -153,6 +187,42 @@ static av_cold int dpcm_decode_init(AVCodecContext *avctx)
         }
         break;
 
+    case AV_CODEC_ID_SDX2_DPCM:
+        for (i = -128; i < 128; i++) {
+            int16_t square = i * i * 2;
+            s->array[i+128] = i < 0 ? -square: square;
+        }
+        break;
+
+    case AV_CODEC_ID_CBD2_DPCM:
+        for (i = -128; i < 128; i++) {
+            int16_t cube = (i * i * i) / 64;
+            s->array[i+128] = cube;
+        }
+        break;
+
+    case AV_CODEC_ID_GREMLIN_DPCM: {
+        int delta = 0;
+        int code = 64;
+        int step = 45;
+
+        s->array[0] = 0;
+        for (i = 0; i < 127; i++) {
+            delta += (code >> 5);
+            code  += step;
+            step  += 2;
+
+            s->array[i*2 + 1] =  delta;
+            s->array[i*2 + 2] = -delta;
+        }
+        s->array[255] = delta + (code >> 5);
+        }
+        break;
+
+    case AV_CODEC_ID_WADY_DPCM:
+        s->scale = (avctx->extradata && avctx->extradata_size > 0) ? avctx->extradata[0] : 1;
+        break;
+
     default:
         break;
     }
@@ -166,16 +236,15 @@ static av_cold int dpcm_decode_init(AVCodecContext *avctx)
 }
 
 
-static int dpcm_decode_frame(AVCodecContext *avctx, void *data,
+static int dpcm_decode_frame(AVCodecContext *avctx, AVFrame *frame,
                              int *got_frame_ptr, AVPacket *avpkt)
 {
     int buf_size = avpkt->size;
     DPCMContext *s = avctx->priv_data;
-    AVFrame *frame = data;
     int out = 0, ret;
     int predictor[2];
     int ch = 0;
-    int stereo = avctx->channels - 1;
+    int stereo = avctx->ch_layout.nb_channels - 1;
     int16_t *output_samples, *samples_end;
     GetByteContext gb;
 
@@ -189,10 +258,10 @@ static int dpcm_decode_frame(AVCodecContext *avctx, void *data,
         out = buf_size - 8;
         break;
     case AV_CODEC_ID_INTERPLAY_DPCM:
-        out = buf_size - 6 - avctx->channels;
+        out = buf_size - 6 - avctx->ch_layout.nb_channels;
         break;
     case AV_CODEC_ID_XAN_DPCM:
-        out = buf_size - 2 * avctx->channels;
+        out = buf_size - 2 * avctx->ch_layout.nb_channels;
         break;
     case AV_CODEC_ID_SOL_DPCM:
         if (avctx->codec_tag != 3)
@@ -200,17 +269,24 @@ static int dpcm_decode_frame(AVCodecContext *avctx, void *data,
         else
             out = buf_size;
         break;
+    case AV_CODEC_ID_WADY_DPCM:
+    case AV_CODEC_ID_DERF_DPCM:
+    case AV_CODEC_ID_GREMLIN_DPCM:
+    case AV_CODEC_ID_CBD2_DPCM:
+    case AV_CODEC_ID_SDX2_DPCM:
+        out = buf_size;
+        break;
     }
     if (out <= 0) {
         av_log(avctx, AV_LOG_ERROR, "packet is too small\n");
         return AVERROR(EINVAL);
     }
-    if (out % avctx->channels) {
+    if (out % avctx->ch_layout.nb_channels) {
         av_log(avctx, AV_LOG_WARNING, "channels have differing number of samples\n");
     }
 
     /* get output buffer */
-    frame->nb_samples = (out + avctx->channels - 1) / avctx->channels;
+    frame->nb_samples = (out + avctx->ch_layout.nb_channels - 1) / avctx->ch_layout.nb_channels;
     if ((ret = ff_get_buffer(avctx, frame, 0)) < 0)
         return ret;
     output_samples = (int16_t *)frame->data[0];
@@ -230,7 +306,7 @@ static int dpcm_decode_frame(AVCodecContext *avctx, void *data,
 
         /* decode the samples */
         while (output_samples < samples_end) {
-            predictor[ch] += s->roq_square_array[bytestream2_get_byteu(&gb)];
+            predictor[ch] += s->array[bytestream2_get_byteu(&gb)];
             predictor[ch]  = av_clip_int16(predictor[ch]);
             *output_samples++ = predictor[ch];
 
@@ -242,7 +318,7 @@ static int dpcm_decode_frame(AVCodecContext *avctx, void *data,
     case AV_CODEC_ID_INTERPLAY_DPCM:
         bytestream2_skipu(&gb, 6);  /* skip over the stream mask and stream length */
 
-        for (ch = 0; ch < avctx->channels; ch++) {
+        for (ch = 0; ch < avctx->ch_layout.nb_channels; ch++) {
             predictor[ch] = sign_extend(bytestream2_get_le16u(&gb), 16);
             *output_samples++ = predictor[ch];
         }
@@ -262,7 +338,7 @@ static int dpcm_decode_frame(AVCodecContext *avctx, void *data,
     {
         int shift[2] = { 4, 4 };
 
-        for (ch = 0; ch < avctx->channels; ch++)
+        for (ch = 0; ch < avctx->ch_layout.nb_channels; ch++)
             predictor[ch] = sign_extend(bytestream2_get_le16u(&gb), 16);
 
         ch = 0;
@@ -276,9 +352,8 @@ static int dpcm_decode_frame(AVCodecContext *avctx, void *data,
                 shift[ch] -= (2 * n);
             diff = sign_extend((diff &~ 3) << 8, 16);
 
-            /* saturate the shifter to a lower limit of 0 */
-            if (shift[ch] < 0)
-                shift[ch] = 0;
+            /* saturate the shifter to 0..31 */
+            shift[ch] = av_clip_uintp2(shift[ch], 5);
 
             diff >>= shift[ch];
             predictor[ch] += diff;
@@ -318,6 +393,63 @@ static int dpcm_decode_frame(AVCodecContext *avctx, void *data,
             }
         }
         break;
+
+    case AV_CODEC_ID_CBD2_DPCM:
+    case AV_CODEC_ID_SDX2_DPCM:
+        while (output_samples < samples_end) {
+            int8_t n = bytestream2_get_byteu(&gb);
+
+            if (!(n & 1))
+                s->sample[ch] = 0;
+            s->sample[ch] += s->array[n + 128];
+            s->sample[ch]  = av_clip_int16(s->sample[ch]);
+            *output_samples++ = s->sample[ch];
+            ch ^= stereo;
+        }
+        break;
+
+    case AV_CODEC_ID_GREMLIN_DPCM: {
+        int idx = 0;
+
+        while (output_samples < samples_end) {
+            uint8_t n = bytestream2_get_byteu(&gb);
+
+            *output_samples++ = s->sample[idx] += (unsigned)s->array[n];
+            idx ^= 1;
+        }
+        }
+        break;
+
+    case AV_CODEC_ID_DERF_DPCM: {
+        int idx = 0;
+
+        while (output_samples < samples_end) {
+            uint8_t n = bytestream2_get_byteu(&gb);
+            int index = FFMIN(n & 0x7f, 95);
+
+            s->sample[idx] += (n & 0x80 ? -1: 1) * derf_steps[index];
+            s->sample[idx]  = av_clip_int16(s->sample[idx]);
+            *output_samples++ = s->sample[idx];
+            idx ^= stereo;
+        }
+        }
+        break;
+
+    case AV_CODEC_ID_WADY_DPCM: {
+        int idx = 0;
+
+        while (output_samples < samples_end) {
+            const uint8_t n = bytestream2_get_byteu(&gb);
+
+            if (n & 0x80)
+                s->sample[idx] = sign_extend((n & 0x7f) << 9, 16);
+            else
+                s->sample[idx] += s->scale * (unsigned)wady_table[n & 0x7f];
+            *output_samples++ = av_clip_int16(s->sample[idx]);
+            idx ^= stereo;
+        }
+        }
+        break;
     }
 
     *got_frame_ptr = 1;
@@ -325,19 +457,32 @@ static int dpcm_decode_frame(AVCodecContext *avctx, void *data,
     return avpkt->size;
 }
 
-#define DPCM_DECODER(id_, name_, long_name_)                \
-AVCodec ff_ ## name_ ## _decoder = {                        \
-    .name           = #name_,                               \
-    .long_name      = NULL_IF_CONFIG_SMALL(long_name_),     \
-    .type           = AVMEDIA_TYPE_AUDIO,                   \
-    .id             = id_,                                  \
-    .priv_data_size = sizeof(DPCMContext),                  \
-    .init           = dpcm_decode_init,                     \
-    .decode         = dpcm_decode_frame,                    \
-    .capabilities   = CODEC_CAP_DR1,                        \
+static void dpcm_flush(AVCodecContext *avctx)
+{
+    DPCMContext *s = avctx->priv_data;
+
+    s->sample[0] = s->sample[1] = 0;
 }
 
+#define DPCM_DECODER(id_, name_, long_name_)                \
+const FFCodec ff_ ## name_ ## _decoder = {                  \
+    .p.name         = #name_,                               \
+    CODEC_LONG_NAME(long_name_),                            \
+    .p.type         = AVMEDIA_TYPE_AUDIO,                   \
+    .p.id           = id_,                                  \
+    .p.capabilities = AV_CODEC_CAP_DR1,                     \
+    .priv_data_size = sizeof(DPCMContext),                  \
+    .init           = dpcm_decode_init,                     \
+    .flush          = dpcm_flush,                           \
+    FF_CODEC_DECODE_CB(dpcm_decode_frame),                  \
+}
+
+DPCM_DECODER(AV_CODEC_ID_CBD2_DPCM,      cbd2_dpcm,      "DPCM Cuberoot-Delta-Exact");
+DPCM_DECODER(AV_CODEC_ID_DERF_DPCM,      derf_dpcm,      "DPCM Xilam DERF");
+DPCM_DECODER(AV_CODEC_ID_GREMLIN_DPCM,   gremlin_dpcm,   "DPCM Gremlin");
 DPCM_DECODER(AV_CODEC_ID_INTERPLAY_DPCM, interplay_dpcm, "DPCM Interplay");
 DPCM_DECODER(AV_CODEC_ID_ROQ_DPCM,       roq_dpcm,       "DPCM id RoQ");
+DPCM_DECODER(AV_CODEC_ID_SDX2_DPCM,      sdx2_dpcm,      "DPCM Squareroot-Delta-Exact");
 DPCM_DECODER(AV_CODEC_ID_SOL_DPCM,       sol_dpcm,       "DPCM Sol");
 DPCM_DECODER(AV_CODEC_ID_XAN_DPCM,       xan_dpcm,       "DPCM Xan");
+DPCM_DECODER(AV_CODEC_ID_WADY_DPCM,      wady_dpcm,      "DPCM Marble WADY");

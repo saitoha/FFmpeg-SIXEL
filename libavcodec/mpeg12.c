@@ -28,20 +28,14 @@
 #define UNCHECKED_BITSTREAM_READER 1
 
 #include "libavutil/attributes.h"
-#include "libavutil/avassert.h"
-#include "libavutil/timecode.h"
+#include "libavutil/thread.h"
 
-#include "internal.h"
-#include "avcodec.h"
 #include "mpegvideo.h"
-#include "error_resilience.h"
-#include "mpeg12.h"
+#include "mpeg12codecs.h"
 #include "mpeg12data.h"
-#include "bytestream.h"
-#include "vdpau_internal.h"
-#include "thread.h"
-
-uint8_t ff_mpeg12_static_rl_table_store[2][2][2*MAX_RUN + MAX_LEVEL + 3];
+#include "mpeg12dec.h"
+#include "mpegutils.h"
+#include "rl.h"
 
 static const uint8_t table_mb_ptype[7][2] = {
     { 3, 5 }, // 0x01 MB_INTRA
@@ -67,24 +61,41 @@ static const uint8_t table_mb_btype[11][2] = {
     { 2, 5 }, // 0x1E MB_QUANT|MB_FOR|MB_BACK|MB_PAT
 };
 
-#define INIT_2D_VLC_RL(rl, static_size)\
-{\
-    static RL_VLC_ELEM rl_vlc_table[static_size];\
-    rl.rl_vlc[0] = rl_vlc_table;\
-    init_2d_vlc_rl(&rl, static_size);\
-}
+static const int16_t ptype2mb_type[7] = {
+                    MB_TYPE_INTRA,
+                    MB_TYPE_FORWARD_MV | MB_TYPE_CBP | MB_TYPE_ZERO_MV | MB_TYPE_16x16,
+                    MB_TYPE_FORWARD_MV,
+                    MB_TYPE_FORWARD_MV | MB_TYPE_CBP,
+    MB_TYPE_QUANT | MB_TYPE_INTRA,
+    MB_TYPE_QUANT | MB_TYPE_FORWARD_MV | MB_TYPE_CBP | MB_TYPE_ZERO_MV | MB_TYPE_16x16,
+    MB_TYPE_QUANT | MB_TYPE_FORWARD_MV | MB_TYPE_CBP,
+};
 
-static av_cold void init_2d_vlc_rl(RLTable *rl, unsigned static_size)
+static const int16_t btype2mb_type[11] = {
+                    MB_TYPE_INTRA,
+                    MB_TYPE_BACKWARD_MV,
+                    MB_TYPE_BACKWARD_MV | MB_TYPE_CBP,
+                    MB_TYPE_FORWARD_MV,
+                    MB_TYPE_FORWARD_MV  | MB_TYPE_CBP,
+                    MB_TYPE_BIDIR_MV,
+                    MB_TYPE_BIDIR_MV    | MB_TYPE_CBP,
+    MB_TYPE_QUANT | MB_TYPE_INTRA,
+    MB_TYPE_QUANT | MB_TYPE_BACKWARD_MV | MB_TYPE_CBP,
+    MB_TYPE_QUANT | MB_TYPE_FORWARD_MV  | MB_TYPE_CBP,
+    MB_TYPE_QUANT | MB_TYPE_BIDIR_MV    | MB_TYPE_CBP,
+};
+
+av_cold void ff_init_2d_vlc_rl(const uint16_t table_vlc[][2], RL_VLC_ELEM rl_vlc[],
+                               const int8_t table_run[], const uint8_t table_level[],
+                               int n, unsigned static_size, int flags)
 {
-    int i;
-    VLC_TYPE table[680][2] = {{0}};
-    VLC vlc = { .table = table, .table_allocated = static_size };
-    av_assert0(static_size <= FF_ARRAY_ELEMS(table));
-    init_vlc(&vlc, TEX_VLC_BITS, rl->n + 2, &rl->table_vlc[0][1], 4, 2, &rl->table_vlc[0][0], 4, 2, INIT_VLC_USE_NEW_STATIC);
+    ff_vlc_init_table_sparse(rl_vlc, static_size, TEX_VLC_BITS, n + 2,
+                             &table_vlc[0][1], 4, 2, &table_vlc[0][0], 4, 2,
+                             NULL, 0, 0, flags);
 
-    for (i = 0; i < vlc.table_size; i++) {
-        int code = vlc.table[i][0];
-        int len  = vlc.table[i][1];
+    for (unsigned i = 0; i < static_size; i++) {
+        int idx = rl_vlc[i].sym;
+        int len = rl_vlc[i].len;
         int level, run;
 
         if (len == 0) { // illegal code
@@ -92,31 +103,23 @@ static av_cold void init_2d_vlc_rl(RLTable *rl, unsigned static_size)
             level = MAX_LEVEL;
         } else if (len<0) { //more bits needed
             run   = 0;
-            level = code;
+            level = idx;
         } else {
-            if (code == rl->n) { //esc
+            if (idx == n) { //esc
                 run   = 65;
                 level = 0;
-            } else if (code == rl->n+1) { //eob
+            } else if (idx == n + 1) { //eob
                 run   = 0;
                 level = 127;
             } else {
-                run   = rl->table_run  [code] + 1;
-                level = rl->table_level[code];
+                run   = table_run  [idx] + 1;
+                level = table_level[idx];
             }
         }
-        rl->rl_vlc[0][i].len   = len;
-        rl->rl_vlc[0][i].level = level;
-        rl->rl_vlc[0][i].run   = run;
+        rl_vlc[i].len8  = len;
+        rl_vlc[i].level = level;
+        rl_vlc[i].run   = run;
     }
-}
-
-av_cold void ff_mpeg12_common_init(MpegEncContext *s)
-{
-
-    s->y_dc_scale_table =
-    s->c_dc_scale_table = ff_mpeg2_dc_scale_table[s->intra_dc_precision];
-
 }
 
 void ff_mpeg1_clean_buffers(MpegEncContext *s)
@@ -131,114 +134,149 @@ void ff_mpeg1_clean_buffers(MpegEncContext *s)
 /******************************************/
 /* decoding */
 
-VLC ff_mv_vlc;
+VLCElem ff_mv_vlc[266];
 
-VLC ff_dc_lum_vlc;
-VLC ff_dc_chroma_vlc;
+VLCElem ff_dc_lum_vlc[512];
+VLCElem ff_dc_chroma_vlc[514];
 
-VLC ff_mbincr_vlc;
-VLC ff_mb_ptype_vlc;
-VLC ff_mb_btype_vlc;
-VLC ff_mb_pat_vlc;
+VLCElem ff_mbincr_vlc[538];
+VLCElem ff_mb_ptype_vlc[64];
+VLCElem ff_mb_btype_vlc[64];
+VLCElem ff_mb_pat_vlc[512];
+
+RL_VLC_ELEM ff_mpeg1_rl_vlc[680];
+RL_VLC_ELEM ff_mpeg2_rl_vlc[674];
+
+static av_cold void mpeg12_init_vlcs(void)
+{
+    VLC_INIT_STATIC_TABLE(ff_dc_lum_vlc, DC_VLC_BITS, 12,
+                          ff_mpeg12_vlc_dc_lum_bits, 1, 1,
+                          ff_mpeg12_vlc_dc_lum_code, 2, 2, 0);
+    VLC_INIT_STATIC_TABLE(ff_dc_chroma_vlc,  DC_VLC_BITS, 12,
+                          ff_mpeg12_vlc_dc_chroma_bits, 1, 1,
+                          ff_mpeg12_vlc_dc_chroma_code, 2, 2, 0);
+    VLC_INIT_STATIC_TABLE(ff_mv_vlc, MV_VLC_BITS, 17,
+                          &ff_mpeg12_mbMotionVectorTable[0][1], 2, 1,
+                          &ff_mpeg12_mbMotionVectorTable[0][0], 2, 1, 0);
+    VLC_INIT_STATIC_TABLE(ff_mbincr_vlc, MBINCR_VLC_BITS, 36,
+                          &ff_mpeg12_mbAddrIncrTable[0][1], 2, 1,
+                          &ff_mpeg12_mbAddrIncrTable[0][0], 2, 1, 0);
+    VLC_INIT_STATIC_TABLE(ff_mb_pat_vlc, MB_PAT_VLC_BITS, 64,
+                          &ff_mpeg12_mbPatTable[0][1], 2, 1,
+                          &ff_mpeg12_mbPatTable[0][0], 2, 1, 0);
+
+    VLC_INIT_STATIC_SPARSE_TABLE(ff_mb_ptype_vlc, MB_PTYPE_VLC_BITS, 7,
+                                 &table_mb_ptype[0][1], 2, 1,
+                                 &table_mb_ptype[0][0], 2, 1,
+                                 ptype2mb_type, 2, 2, 0);
+    VLC_INIT_STATIC_SPARSE_TABLE(ff_mb_btype_vlc, MB_BTYPE_VLC_BITS, 11,
+                                 &table_mb_btype[0][1], 2, 1,
+                                 &table_mb_btype[0][0], 2, 1,
+                                 btype2mb_type, 2, 2, 0);
+
+    ff_init_2d_vlc_rl(ff_mpeg1_vlc_table, ff_mpeg1_rl_vlc, ff_mpeg12_run,
+                      ff_mpeg12_level, MPEG12_RL_NB_ELEMS,
+                      FF_ARRAY_ELEMS(ff_mpeg1_rl_vlc), 0);
+    ff_init_2d_vlc_rl(ff_mpeg2_vlc_table, ff_mpeg2_rl_vlc, ff_mpeg12_run,
+                      ff_mpeg12_level, MPEG12_RL_NB_ELEMS,
+                      FF_ARRAY_ELEMS(ff_mpeg2_rl_vlc), 0);
+}
 
 av_cold void ff_mpeg12_init_vlcs(void)
 {
-    static int done = 0;
-
-    if (!done) {
-        done = 1;
-
-        INIT_VLC_STATIC(&ff_dc_lum_vlc, DC_VLC_BITS, 12,
-                        ff_mpeg12_vlc_dc_lum_bits, 1, 1,
-                        ff_mpeg12_vlc_dc_lum_code, 2, 2, 512);
-        INIT_VLC_STATIC(&ff_dc_chroma_vlc,  DC_VLC_BITS, 12,
-                        ff_mpeg12_vlc_dc_chroma_bits, 1, 1,
-                        ff_mpeg12_vlc_dc_chroma_code, 2, 2, 514);
-        INIT_VLC_STATIC(&ff_mv_vlc, MV_VLC_BITS, 17,
-                        &ff_mpeg12_mbMotionVectorTable[0][1], 2, 1,
-                        &ff_mpeg12_mbMotionVectorTable[0][0], 2, 1, 518);
-        INIT_VLC_STATIC(&ff_mbincr_vlc, MBINCR_VLC_BITS, 36,
-                        &ff_mpeg12_mbAddrIncrTable[0][1], 2, 1,
-                        &ff_mpeg12_mbAddrIncrTable[0][0], 2, 1, 538);
-        INIT_VLC_STATIC(&ff_mb_pat_vlc, MB_PAT_VLC_BITS, 64,
-                        &ff_mpeg12_mbPatTable[0][1], 2, 1,
-                        &ff_mpeg12_mbPatTable[0][0], 2, 1, 512);
-
-        INIT_VLC_STATIC(&ff_mb_ptype_vlc, MB_PTYPE_VLC_BITS, 7,
-                        &table_mb_ptype[0][1], 2, 1,
-                        &table_mb_ptype[0][0], 2, 1, 64);
-        INIT_VLC_STATIC(&ff_mb_btype_vlc, MB_BTYPE_VLC_BITS, 11,
-                        &table_mb_btype[0][1], 2, 1,
-                        &table_mb_btype[0][0], 2, 1, 64);
-        ff_rl_init(&ff_rl_mpeg1, ff_mpeg12_static_rl_table_store[0]);
-        ff_rl_init(&ff_rl_mpeg2, ff_mpeg12_static_rl_table_store[1]);
-
-        INIT_2D_VLC_RL(ff_rl_mpeg1, 680);
-        INIT_2D_VLC_RL(ff_rl_mpeg2, 674);
-    }
+    static AVOnce init_static_once = AV_ONCE_INIT;
+    ff_thread_once(&init_static_once, mpeg12_init_vlcs);
 }
 
-/**
- * Find the end of the current frame in the bitstream.
- * @return the position of the first byte of the next frame, or -1
- */
-int ff_mpeg1_find_frame_end(ParseContext *pc, const uint8_t *buf, int buf_size, AVCodecParserContext *s)
+#define MAX_INDEX (64 - 1)
+
+int ff_mpeg1_decode_block_intra(GetBitContext *gb,
+                                const uint16_t *quant_matrix,
+                                const uint8_t *scantable, int last_dc[3],
+                                int16_t *block, int index, int qscale)
 {
-    int i;
-    uint32_t state = pc->state;
+    int dc, diff, i = 0, component;
 
-    /* EOF considered as end of frame */
-    if (buf_size == 0)
-        return 0;
+    /* DC coefficient */
+    component = index <= 3 ? 0 : index - 4 + 1;
 
-/*
- 0  frame start         -> 1/4
- 1  first_SEQEXT        -> 0/2
- 2  first field start   -> 3/0
- 3  second_SEQEXT       -> 2/0
- 4  searching end
-*/
+    diff = decode_dc(gb, component);
 
-    for (i = 0; i < buf_size; i++) {
-        av_assert1(pc->frame_start_found >= 0 && pc->frame_start_found <= 4);
-        if (pc->frame_start_found & 1) {
-            if (state == EXT_START_CODE && (buf[i] & 0xF0) != 0x80)
-                pc->frame_start_found--;
-            else if (state == EXT_START_CODE + 2) {
-                if ((buf[i] & 3) == 3)
-                    pc->frame_start_found = 0;
-                else
-                    pc->frame_start_found = (pc->frame_start_found + 1) & 3;
-            }
-            state++;
-        } else {
-            i = avpriv_find_start_code(buf + i, buf + buf_size, &state) - buf - 1;
-            if (pc->frame_start_found == 0 && state >= SLICE_MIN_START_CODE && state <= SLICE_MAX_START_CODE) {
-                i++;
-                pc->frame_start_found = 4;
-            }
-            if (state == SEQ_END_CODE) {
-                pc->frame_start_found = 0;
-                pc->state=-1;
-                return i+1;
-            }
-            if (pc->frame_start_found == 2 && state == SEQ_START_CODE)
-                pc->frame_start_found = 0;
-            if (pc->frame_start_found  < 4 && state == EXT_START_CODE)
-                pc->frame_start_found++;
-            if (pc->frame_start_found == 4 && (state & 0xFFFFFF00) == 0x100) {
-                if (state < SLICE_MIN_START_CODE || state > SLICE_MAX_START_CODE) {
-                    pc->frame_start_found = 0;
-                    pc->state             = -1;
-                    return i - 3;
+    dc  = last_dc[component];
+    dc += diff;
+    last_dc[component] = dc;
+
+    block[0] = dc * quant_matrix[0];
+
+    {
+        OPEN_READER(re, gb);
+        UPDATE_CACHE(re, gb);
+        if (((int32_t)GET_CACHE(re, gb)) <= (int32_t)0xBFFFFFFF)
+            goto end;
+
+        /* now quantify & encode AC coefficients */
+        while (1) {
+            int level, run, j;
+
+            GET_RL_VLC(level, run, re, gb, ff_mpeg1_rl_vlc,
+                       TEX_VLC_BITS, 2, 0);
+
+            if (level != 0) {
+                i += run;
+                if (i > MAX_INDEX)
+                    break;
+
+                j = scantable[i];
+                level = (level * qscale * quant_matrix[j]) >> 4;
+                level = (level - 1) | 1;
+                level = (level ^ SHOW_SBITS(re, gb, 1)) -
+                        SHOW_SBITS(re, gb, 1);
+                SKIP_BITS(re, gb, 1);
+            } else {
+                /* escape */
+                run = SHOW_UBITS(re, gb, 6) + 1;
+                LAST_SKIP_BITS(re, gb, 6);
+                UPDATE_CACHE(re, gb);
+                level = SHOW_SBITS(re, gb, 8);
+                SKIP_BITS(re, gb, 8);
+
+                if (level == -128) {
+                    level = SHOW_UBITS(re, gb, 8) - 256;
+                    SKIP_BITS(re, gb, 8);
+                } else if (level == 0) {
+                    level = SHOW_UBITS(re, gb, 8);
+                    SKIP_BITS(re, gb, 8);
+                }
+
+                i += run;
+                if (i > MAX_INDEX)
+                    break;
+
+                j = scantable[i];
+                if (level < 0) {
+                    level = -level;
+                    level = (level * qscale * quant_matrix[j]) >> 4;
+                    level = (level - 1) | 1;
+                    level = -level;
+                } else {
+                    level = (level * qscale * quant_matrix[j]) >> 4;
+                    level = (level - 1) | 1;
                 }
             }
-            if (pc->frame_start_found == 0 && s && state == PICTURE_START_CODE) {
-                ff_fetch_timestamp(s, i - 3, 1, i > 3);
-            }
-        }
-    }
-    pc->state = state;
-    return END_NOT_FOUND;
-}
 
+            block[j] = level;
+            if (((int32_t)GET_CACHE(re, gb)) <= (int32_t)0xBFFFFFFF)
+               break;
+
+            UPDATE_CACHE(re, gb);
+        }
+end:
+        LAST_SKIP_BITS(re, gb, 2);
+        CLOSE_READER(re, gb);
+    }
+
+    if (i > MAX_INDEX)
+        return AVERROR_INVALIDDATA;
+
+    return 0;
+}

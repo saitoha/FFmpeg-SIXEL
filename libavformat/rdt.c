@@ -27,6 +27,8 @@
 
 #include "avformat.h"
 #include "libavutil/avstring.h"
+#include "libavutil/mem.h"
+#include "demux.h"
 #include "rtpdec.h"
 #include "rdt.h"
 #include "libavutil/base64.h"
@@ -44,7 +46,7 @@ struct RDTDemuxContext {
      * in the AVFormatContext, and this variable points to the offset in
      * that array such that the first is the first stream of this set. */
     AVStream **streams;
-    int n_streams; /**< streams with identifical content in this set */
+    int n_streams; /**< streams with identical content in this set */
     void *dynamic_protocol_context;
     DynamicPayloadPacketHandlerProc parse_packet;
     uint32_t prev_timestamp;
@@ -53,7 +55,7 @@ struct RDTDemuxContext {
 
 RDTDemuxContext *
 ff_rdt_parse_open(AVFormatContext *ic, int first_stream_of_set_idx,
-                  void *priv_data, RTPDynamicProtocolHandler *handler)
+                  void *priv_data, const RTPDynamicProtocolHandler *handler)
 {
     RDTDemuxContext *s = av_mallocz(sizeof(RDTDemuxContext));
     if (!s)
@@ -86,7 +88,7 @@ struct PayloadContext {
     RMStream **rmst;
     uint8_t *mlti_data;
     unsigned int mlti_data_size;
-    char buffer[RTP_MAX_PACKET_LENGTH + FF_INPUT_BUFFER_PADDING_SIZE];
+    char buffer[RTP_MAX_PACKET_LENGTH + AV_INPUT_BUFFER_PADDING_SIZE];
     int audio_pkt_cnt; /**< remaining audio packets in rmdec */
 };
 
@@ -131,7 +133,8 @@ ff_rdt_calc_response_and_checksum(char response[41], char chksum[9],
 static int
 rdt_load_mdpr (PayloadContext *rdt, AVStream *st, int rule_nr)
 {
-    AVIOContext pb;
+    FFIOContext pb0;
+    AVIOContext *const pb = &pb0.pub;
     unsigned int size;
     uint32_t tag;
 
@@ -151,32 +154,31 @@ rdt_load_mdpr (PayloadContext *rdt, AVStream *st, int rule_nr)
      */
     if (!rdt->mlti_data)
         return -1;
-    ffio_init_context(&pb, rdt->mlti_data, rdt->mlti_data_size, 0,
-                  NULL, NULL, NULL, NULL);
-    tag = avio_rl32(&pb);
+    ffio_init_read_context(&pb0, rdt->mlti_data, rdt->mlti_data_size);
+    tag = avio_rl32(pb);
     if (tag == MKTAG('M', 'L', 'T', 'I')) {
         int num, chunk_nr;
 
         /* read index of MDPR chunk numbers */
-        num = avio_rb16(&pb);
+        num = avio_rb16(pb);
         if (rule_nr < 0 || rule_nr >= num)
             return -1;
-        avio_skip(&pb, rule_nr * 2);
-        chunk_nr = avio_rb16(&pb);
-        avio_skip(&pb, (num - 1 - rule_nr) * 2);
+        avio_skip(pb, rule_nr * 2);
+        chunk_nr = avio_rb16(pb);
+        avio_skip(pb, (num - 1 - rule_nr) * 2);
 
         /* read MDPR chunks */
-        num = avio_rb16(&pb);
+        num = avio_rb16(pb);
         if (chunk_nr >= num)
             return -1;
         while (chunk_nr--)
-            avio_skip(&pb, avio_rb32(&pb));
-        size = avio_rb32(&pb);
+            avio_skip(pb, avio_rb32(pb));
+        size = avio_rb32(pb);
     } else {
         size = rdt->mlti_data_size;
-        avio_seek(&pb, 0, SEEK_SET);
+        avio_seek(pb, 0, SEEK_SET);
     }
-    if (ff_rm_read_mdpr_codecdata(rdt->rmctx, &pb, st, rdt->rmst[st->index], size, NULL) < 0)
+    if (ff_rm_read_mdpr_codecdata(rdt->rmctx, pb, st, rdt->rmst[st->index], size, NULL) < 0)
         return -1;
 
     return 0;
@@ -204,6 +206,8 @@ ff_rdt_parse_header(const uint8_t *buf, int len,
             return -1; /* not followed by a data packet */
 
         pkt_len = AV_RB16(buf+3);
+        if (pkt_len > len)
+            return AVERROR_INVALIDDATA;
         buf += pkt_len;
         len -= pkt_len;
         consumed += pkt_len;
@@ -289,27 +293,27 @@ ff_rdt_parse_header(const uint8_t *buf, int len,
     return consumed + (get_bits_count(&gb) >> 3);
 }
 
-/**< return 0 on packet, no more left, 1 on packet, 1 on partial packet... */
+/** return 0 on packet, no more left, 1 on packet, 1 on partial packet... */
 static int
 rdt_parse_packet (AVFormatContext *ctx, PayloadContext *rdt, AVStream *st,
                   AVPacket *pkt, uint32_t *timestamp,
                   const uint8_t *buf, int len, uint16_t rtp_seq, int flags)
 {
     int seq = 1, res;
-    AVIOContext pb;
 
     if (rdt->audio_pkt_cnt == 0) {
+        FFIOContext pb;
         int pos, rmflags;
 
-        ffio_init_context(&pb, (uint8_t *)buf, len, 0, NULL, NULL, NULL, NULL);
+        ffio_init_read_context(&pb, buf, len);
         rmflags = (flags & RTP_FLAG_KEY) ? 2 : 0;
-        res = ff_rm_parse_packet (rdt->rmctx, &pb, st, rdt->rmst[st->index], len, pkt,
-                                  &seq, rmflags, *timestamp);
-        pos = avio_tell(&pb);
+        res = ff_rm_parse_packet(rdt->rmctx, &pb.pub, st, rdt->rmst[st->index],
+                                 len, pkt, &seq, rmflags, *timestamp);
+        pos = avio_tell(&pb.pub);
         if (res < 0)
             return res;
         if (res > 0) {
-            if (st->codec->codec_id == AV_CODEC_ID_AAC) {
+            if (st->codecpar->codec_id == AV_CODEC_ID_AAC) {
                 memcpy (rdt->buffer, buf + pos, len - pos);
                 rdt->rmctx->pb = avio_alloc_context (rdt->buffer, len - pos, 0,
                                                     NULL, NULL, NULL, NULL);
@@ -322,8 +326,8 @@ get_cache:
             ff_rm_retrieve_cache (rdt->rmctx, rdt->rmctx->pb,
                                   st, rdt->rmst[st->index], pkt);
         if (rdt->audio_pkt_cnt == 0 &&
-            st->codec->codec_id == AV_CODEC_ID_AAC)
-            av_freep(&rdt->rmctx->pb);
+            st->codecpar->codec_id == AV_CODEC_ID_AAC)
+            avio_context_free(&rdt->rmctx->pb);
     }
     pkt->stream_index = st->index;
     pkt->pts = *timestamp;
@@ -398,7 +402,7 @@ rdt_parse_b64buf (unsigned int *target_len, const char *p)
         len -= 2; /* skip embracing " at start/end */
     }
     *target_len = len * 3 / 4;
-    target = av_mallocz(*target_len + FF_INPUT_BUFFER_PADDING_SIZE);
+    target = av_mallocz(*target_len + AV_INPUT_BUFFER_PADDING_SIZE);
     if (!target)
         return NULL;
     av_base64_decode(target, p, *target_len);
@@ -415,7 +419,7 @@ rdt_parse_sdp_line (AVFormatContext *s, int st_index,
     if (av_strstart(p, "OpaqueData:buffer;", &p)) {
         rdt->mlti_data = rdt_parse_b64buf(&rdt->mlti_data_size, p);
     } else if (av_strstart(p, "StartTime:integer;", &p))
-        stream->first_dts = atoi(p);
+        ffstream(stream)->first_dts = atoi(p);
     else if (av_strstart(p, "ASMRuleBook:string;", &p)) {
         int n, first = -1;
 
@@ -448,7 +452,7 @@ real_parse_asm_rule(AVStream *st, const char *p, const char *end)
 {
     do {
         /* can be either averagebandwidth= or AverageBandwidth= */
-        if (sscanf(p, " %*1[Aa]verage%*1[Bb]andwidth=%d", &st->codec->bit_rate) == 1)
+        if (sscanf(p, " %*1[Aa]verage%*1[Bb]andwidth=%"SCNd64, &st->codecpar->bit_rate) == 1)
             break;
         if (!(p = strchr(p, ',')) || p > end)
             p = end;
@@ -464,8 +468,8 @@ add_dstream(AVFormatContext *s, AVStream *orig_st)
     if (!(st = avformat_new_stream(s, NULL)))
         return NULL;
     st->id = orig_st->id;
-    st->codec->codec_type = orig_st->codec->codec_type;
-    st->first_dts         = orig_st->first_dts;
+    st->codecpar->codec_type = orig_st->codecpar->codec_type;
+    ffstream(st)->first_dts  = ffstream(orig_st)->first_dts;
 
     return st;
 }
@@ -531,10 +535,10 @@ static av_cold int rdt_init(AVFormatContext *s, int st_index, PayloadContext *rd
     if (!rdt->rmctx)
         return AVERROR(ENOMEM);
 
-    if ((ret = ff_copy_whitelists(rdt->rmctx, s)) < 0)
+    if ((ret = ff_copy_whiteblacklists(rdt->rmctx, s)) < 0)
         return ret;
 
-    return avformat_open_input(&rdt->rmctx, "", &ff_rdt_demuxer, NULL);
+    return avformat_open_input(&rdt->rmctx, "", &ff_rdt_demuxer.p, NULL);
 }
 
 static void
@@ -554,7 +558,7 @@ rdt_close_context (PayloadContext *rdt)
 }
 
 #define RDT_HANDLER(n, s, t) \
-static RTPDynamicProtocolHandler rdt_ ## n ## _handler = { \
+const RTPDynamicProtocolHandler ff_rdt_ ## n ## _handler = { \
     .enc_name         = s, \
     .codec_type       = t, \
     .codec_id         = AV_CODEC_ID_NONE, \
@@ -569,11 +573,3 @@ RDT_HANDLER(live_video, "x-pn-multirate-realvideo-live", AVMEDIA_TYPE_VIDEO);
 RDT_HANDLER(live_audio, "x-pn-multirate-realaudio-live", AVMEDIA_TYPE_AUDIO);
 RDT_HANDLER(video,      "x-pn-realvideo",                AVMEDIA_TYPE_VIDEO);
 RDT_HANDLER(audio,      "x-pn-realaudio",                AVMEDIA_TYPE_AUDIO);
-
-void ff_register_rdt_dynamic_payload_handlers(void)
-{
-    ff_register_dynamic_payload_handler(&rdt_video_handler);
-    ff_register_dynamic_payload_handler(&rdt_audio_handler);
-    ff_register_dynamic_payload_handler(&rdt_live_video_handler);
-    ff_register_dynamic_payload_handler(&rdt_live_audio_handler);
-}

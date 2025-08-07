@@ -20,9 +20,9 @@
  */
 
 #include "libavutil/attributes.h"
-#include "libavutil/common.h"
+#include "libavutil/mem.h"
 #include "audio_frame_queue.h"
-#include "internal.h"
+#include "encode.h"
 #include "libavutil/avassert.h"
 
 av_cold void ff_af_queue_init(AVCodecContext *avctx, AudioFrameQueue *afq)
@@ -73,7 +73,7 @@ int ff_af_queue_add(AudioFrameQueue *afq, const AVFrame *f)
 }
 
 void ff_af_queue_remove(AudioFrameQueue *afq, int nb_samples, int64_t *pts,
-                        int *duration)
+                        int64_t *duration)
 {
     int64_t out_pts = AV_NOPTS_VALUE;
     int removed_samples = 0;

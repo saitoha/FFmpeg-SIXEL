@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015 Manojkumar Bhosale (Manojkumar.Bhosale@imgtec.com)
+ * Copyright (c) 2015 - 2017 Manojkumar Bhosale (Manojkumar.Bhosale@imgtec.com)
  *
  * This file is part of FFmpeg.
  *
@@ -21,21 +21,16 @@
 #ifndef AVCODEC_MIPS_HEVC_MACROS_MSA_H
 #define AVCODEC_MIPS_HEVC_MACROS_MSA_H
 
-#define HEVC_PCK_SW_SB2(in0, in1, out)                            \
-{                                                                 \
-    v8i16 tmp0_m;                                                 \
-                                                                  \
-    tmp0_m = __msa_pckev_h((v8i16) in0, (v8i16) in1);             \
-    out = (v4i32) __msa_pckev_b((v16i8) tmp0_m, (v16i8) tmp0_m);  \
-}
-
-#define HEVC_PCK_SW_SB4(in0, in1, in2, in3, out)                  \
-{                                                                 \
-    v8i16 tmp0_m, tmp1_m;                                         \
-                                                                  \
-    PCKEV_H2_SH(in0, in1, in2, in3, tmp0_m, tmp1_m);              \
-    out = (v4i32) __msa_pckev_b((v16i8) tmp1_m, (v16i8) tmp0_m);  \
-}
+#define HEVC_FILT_8TAP_SH(in0, in1, in2, in3,                    \
+                          filt0, filt1, filt2, filt3)            \
+( {                                                              \
+    v8i16 out_m;                                                 \
+                                                                 \
+    out_m = __msa_dotp_s_h((v16i8) in0, (v16i8) filt0);          \
+    out_m = __msa_dpadd_s_h(out_m, (v16i8) in1, (v16i8) filt1);  \
+    DPADD_SB2_SH(in2, in3, filt2, filt3, out_m, out_m);          \
+    out_m;                                                       \
+} )
 
 #define HEVC_FILT_8TAP(in0, in1, in2, in3,                       \
                        filt0, filt1, filt2, filt3)               \
@@ -46,6 +41,33 @@
     out_m = __msa_dpadd_s_w(out_m, (v8i16) in1, (v8i16) filt1);  \
     DPADD_SH2_SW(in2, in3, filt2, filt3, out_m, out_m);          \
     out_m;                                                       \
+} )
+
+#define HEVC_FILT_4TAP_SH(in0, in1, filt0, filt1)                \
+( {                                                              \
+    v8i16 out_m;                                                 \
+                                                                 \
+    out_m = __msa_dotp_s_h((v16i8) in0, (v16i8) filt0);          \
+    out_m = __msa_dpadd_s_h(out_m, (v16i8) in1, (v16i8) filt1);  \
+    out_m;                                                       \
+} )
+
+#define HEVC_FILT_4TAP_SW(in0, in1, filt0, filt1)                \
+( {                                                              \
+    v4i32 out_m;                                                 \
+                                                                 \
+    out_m = __msa_dotp_s_w((v8i16) in0, (v8i16) filt0);          \
+    out_m = __msa_dpadd_s_w(out_m, (v8i16) in1, (v8i16) filt1);  \
+    out_m;                                                       \
+} )
+
+#define HEVC_FILT_4TAP(in0, in1, filt0, filt1)           \
+( {                                                      \
+    v4i32 out_m;                                         \
+                                                         \
+    out_m = __msa_dotp_s_w(in0, (v8i16) filt0);          \
+    out_m = __msa_dpadd_s_w(out_m, in1, (v8i16) filt1);  \
+    out_m;                                               \
 } )
 
 #endif  /* AVCODEC_MIPS_HEVC_MACROS_MSA_H */

@@ -1,5 +1,5 @@
 /*
- * LRC lyrics file format decoder
+ * LRC lyrics file format demuxer
  * Copyright (c) 2014 StarBrilliant <m13253@hotmail.com>
  *
  * This file is part of FFmpeg.
@@ -24,6 +24,7 @@
 #include <string.h>
 
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 #include "lrc.h"
 #include "metadata.h"
@@ -77,7 +78,9 @@ static int64_t count_ts(const char *p)
 static int64_t read_ts(const char *p, int64_t *start)
 {
     int64_t offset = 0;
-    uint64_t mm, ss, cs;
+    uint64_t mm;
+    double ss;
+    char prefix[3];
 
     while(p[offset] == ' ' || p[offset] == '\t') {
         offset++;
@@ -85,13 +88,13 @@ static int64_t read_ts(const char *p, int64_t *start)
     if(p[offset] != '[') {
         return 0;
     }
-    if(sscanf(p, "[-%"SCNu64":%"SCNu64".%"SCNu64"]", &mm, &ss, &cs) == 3) {
-        /* Just in case negative pts, players may drop it but we won't. */
-        *start = -(int64_t) (mm*60000 + ss*1000 + cs*10);
-    } else if(sscanf(p, "[%"SCNu64":%"SCNu64".%"SCNu64"]", &mm, &ss, &cs) == 3) {
-        *start = mm*60000 + ss*1000 + cs*10;
-    } else {
+    int ret = sscanf(p, "%2[[-]%"SCNu64":%lf]", prefix, &mm, &ss);
+    if (ret != 3 || prefix[0] != '[') {
         return 0;
+    }
+    *start = (mm * 60 + ss) * AV_TIME_BASE;
+    if (prefix[1] == '-') {
+        *start = - *start;
     }
     do {
         offset++;
@@ -116,7 +119,7 @@ static int64_t read_line(AVBPrint *buf, AVIOContext *pb)
     return pos;
 }
 
-static int lrc_probe(AVProbeData *p)
+static int lrc_probe(const AVProbeData *p)
 {
     int64_t offset = 0;
     int64_t mm;
@@ -163,15 +166,18 @@ static int lrc_read_header(AVFormatContext *s)
     if(!st) {
         return AVERROR(ENOMEM);
     }
-    avpriv_set_pts_info(st, 64, 1, 1000);
+    avpriv_set_pts_info(st, 64, 1, AV_TIME_BASE);
     lrc->ts_offset = 0;
-    st->codec->codec_type = AVMEDIA_TYPE_SUBTITLE;
-    st->codec->codec_id   = AV_CODEC_ID_TEXT;
+    st->codecpar->codec_type = AVMEDIA_TYPE_SUBTITLE;
+    st->codecpar->codec_id   = AV_CODEC_ID_TEXT;
     av_bprint_init(&line, 0, AV_BPRINT_SIZE_UNLIMITED);
 
     while(!avio_feof(s->pb)) {
-        int64_t pos = read_line(&line, s->pb);
-        int64_t header_offset = find_header(line.str);
+        int64_t header_offset, pos = read_line(&line, s->pb);
+
+        if (!av_bprint_is_complete(&line))
+            goto err_nomem_out;
+        header_offset = find_header(line.str);
         if(header_offset >= 0) {
             char *comma_offset = strchr(line.str, ':');
             if(comma_offset) {
@@ -185,6 +191,8 @@ static int lrc_read_header(AVFormatContext *s)
                    sscanf(comma_offset + 1, "%"SCNd64, &lrc->ts_offset) != 1) {
                     av_dict_set(&s->metadata, line.str + 1, comma_offset + 1, 0);
                 }
+                lrc->ts_offset = av_clip64(lrc->ts_offset, INT64_MIN/4, INT64_MAX/4);
+
                 *comma_offset = ':';
                 *right_bracket_offset = ']';
             }
@@ -198,51 +206,35 @@ static int lrc_read_header(AVFormatContext *s)
 
             while((ts_stroffset_incr = read_ts(line.str + ts_stroffset,
                                                &ts_start)) != 0) {
+                ts_start = av_clip64(ts_start, INT64_MIN/4, INT64_MAX/4);
                 ts_stroffset += ts_stroffset_incr;
                 sub = ff_subtitles_queue_insert(&lrc->q, line.str + ts_strlength,
                                                 line.len - ts_strlength, 0);
-                if(!sub) {
-                    return AVERROR(ENOMEM);
-                }
+                if (!sub)
+                    goto err_nomem_out;
                 sub->pos = pos;
                 sub->pts = ts_start - lrc->ts_offset;
                 sub->duration = -1;
             }
         }
     }
-    ff_subtitles_queue_finalize(&lrc->q);
+    ff_subtitles_queue_finalize(s, &lrc->q);
     ff_metadata_conv_ctx(s, NULL, ff_lrc_metadata_conv);
+    av_bprint_finalize(&line, NULL);
     return 0;
+err_nomem_out:
+    av_bprint_finalize(&line, NULL);
+    return AVERROR(ENOMEM);
 }
 
-static int lrc_read_packet(AVFormatContext *s, AVPacket *pkt)
-{
-    LRCContext *lrc = s->priv_data;
-    return ff_subtitles_queue_read_packet(&lrc->q, pkt);
-}
-
-static int lrc_read_seek(AVFormatContext *s, int stream_index,
-                         int64_t min_ts, int64_t ts, int64_t max_ts, int flags)
-{
-    LRCContext *lrc = s->priv_data;
-    return ff_subtitles_queue_seek(&lrc->q, s, stream_index,
-                                   min_ts, ts, max_ts, flags);
-}
-
-static int lrc_read_close(AVFormatContext *s)
-{
-    LRCContext *lrc = s->priv_data;
-    ff_subtitles_queue_clean(&lrc->q);
-    return 0;
-}
-
-AVInputFormat ff_lrc_demuxer = {
-    .name           = "lrc",
-    .long_name      = NULL_IF_CONFIG_SMALL("LRC lyrics"),
+const FFInputFormat ff_lrc_demuxer = {
+    .p.name         = "lrc",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("LRC lyrics"),
     .priv_data_size = sizeof (LRCContext),
+    .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
     .read_probe     = lrc_probe,
     .read_header    = lrc_read_header,
-    .read_packet    = lrc_read_packet,
-    .read_close     = lrc_read_close,
-    .read_seek2     = lrc_read_seek
+    .read_packet    = ff_subtitles_read_packet,
+    .read_close     = ff_subtitles_read_close,
+    .read_seek2     = ff_subtitles_read_seek
 };

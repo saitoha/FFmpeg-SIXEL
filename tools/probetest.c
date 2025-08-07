@@ -21,8 +21,10 @@
 #include <stdlib.h>
 
 #include "libavformat/avformat.h"
+#include "libavformat/demux.h"
 #include "libavcodec/put_bits.h"
 #include "libavutil/lfg.h"
+#include "libavutil/mem.h"
 #include "libavutil/timer.h"
 
 #define MAX_FORMATS 1000 //this must be larger than the number of formats
@@ -38,17 +40,18 @@ static const char *single_format;
 static void probe(AVProbeData *pd, int type, int p, int size)
 {
     int i = 0;
-    AVInputFormat *fmt = NULL;
+    const AVInputFormat *fmt = NULL;
+    void *fmt_opaque = NULL;
 
-    while ((fmt = av_iformat_next(fmt))) {
+    while ((fmt = av_demuxer_iterate(&fmt_opaque))) {
         if (fmt->flags & AVFMT_NOFILE)
             continue;
-        if (fmt->read_probe &&
+        if (ffifmt(fmt)->read_probe &&
             (!single_format || !strcmp(single_format, fmt->name))
         ) {
             int score;
             int64_t start = AV_READ_TIME();
-            score = fmt->read_probe(pd);
+            score = ffifmt(fmt)->read_probe(pd);
             time_array[i] += AV_READ_TIME() - start;
             if (score > score_array[i] && score > AVPROBE_SCORE_MAX / 4) {
                 score_array[i] = score;
@@ -65,9 +68,10 @@ static void probe(AVProbeData *pd, int type, int p, int size)
 static void print_times(void)
 {
     int i = 0;
-    AVInputFormat *fmt = NULL;
+    const AVInputFormat *fmt = NULL;
+    void *fmt_opaque = NULL;
 
-    while ((fmt = av_iformat_next(fmt))) {
+    while ((fmt = av_demuxer_iterate(&fmt_opaque))) {
         if (fmt->flags & AVFMT_NOFILE)
             continue;
         if (time_array[i] > 1000000) {
@@ -123,9 +127,6 @@ int main(int argc, char **argv)
         fprintf(stderr, "retry_count out of bounds\n");
         return 1;
     }
-
-    avcodec_register_all();
-    av_register_all();
 
     av_lfg_init(&state, 0xdeadbeef);
 

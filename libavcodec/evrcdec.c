@@ -25,9 +25,12 @@
  * @author Paul B Mahol
  */
 
+#include "libavutil/channel_layout.h"
 #include "libavutil/mathematics.h"
+#include "libavutil/opt.h"
 #include "avcodec.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include "get_bits.h"
 #include "evrcdata.h"
 #include "acelp_vectors.h"
@@ -66,6 +69,10 @@ typedef struct EVRCAFrame {
 } EVRCAFrame;
 
 typedef struct EVRCContext {
+    AVClass *class;
+
+    int              postfilter;
+
     GetBitContext    gb;
     evrc_packet_rate bitrate;
     evrc_packet_rate last_valid_bitrate;
@@ -175,7 +182,7 @@ static evrc_packet_rate buf_size2bitrate(const int buf_size)
  *
  * @param avctx the AV codec context
  * @param buf_size length of the buffer
- * @param buf the bufffer
+ * @param buf the buffer
  *
  * @return the bitrate on success,
  *         RATE_ERRS  if the bitrate cannot be satisfactorily determined
@@ -214,8 +221,8 @@ static evrc_packet_rate determine_bitrate(AVCodecContext *avctx,
 static void warn_insufficient_frame_quality(AVCodecContext *avctx,
                                             const char *message)
 {
-    av_log(avctx, AV_LOG_WARNING, "Frame #%d, %s\n",
-           avctx->frame_number, message);
+    av_log(avctx, AV_LOG_WARNING, "Frame #%"PRId64", %s\n",
+           avctx->frame_num, message);
 }
 
 /**
@@ -229,9 +236,11 @@ static av_cold int evrc_decode_init(AVCodecContext *avctx)
     int i, n, idx = 0;
     float denom = 2.0 / (2.0 * 8.0 + 1.0);
 
-    avctx->channels       = 1;
-    avctx->channel_layout = AV_CH_LAYOUT_MONO;
+    av_channel_layout_uninit(&avctx->ch_layout);
+    avctx->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
     avctx->sample_fmt     = AV_SAMPLE_FMT_FLT;
+    if (!avctx->sample_rate)
+        avctx->sample_rate = 8000;
 
     for (i = 0; i < FILTER_ORDER; i++) {
         e->prev_lspf[i] = (i + 1) * 0.048;
@@ -488,11 +497,11 @@ static void fcb_excitation(EVRCContext *e, const uint16_t *codebook,
 /**
  * Synthesis of the decoder output signal.
  *
- * param[in]     in              input signal
- * param[in]     filter_coeffs   LPC coefficients
- * param[in/out] memory          synthesis filter memory
- * param         buffer_length   amount of data to process
- * param[out]    samples         output samples
+ * @param[in]     in              input signal
+ * @param[in]     filter_coeffs   LPC coefficients
+ * @param[in/out] memory          synthesis filter memory
+ * @param         buffer_length   amount of data to process
+ * @param[out]    samples         output samples
  *
  * TIA/IS-127 5.2.3.15, 5.7.3.4
  */
@@ -734,11 +743,10 @@ static void frame_erasure(EVRCContext *e, float *samples)
     }
 }
 
-static int evrc_decode_frame(AVCodecContext *avctx, void *data,
+static int evrc_decode_frame(AVCodecContext *avctx, AVFrame *frame,
                              int *got_frame_ptr, AVPacket *avpkt)
 {
     const uint8_t *buf = avpkt->data;
-    AVFrame *frame     = data;
     EVRCContext *e     = avctx->priv_data;
     int buf_size       = avpkt->size;
     float ilspf[FILTER_ORDER], ilpc[FILTER_ORDER], idelay[NB_SUBFRAMES];
@@ -876,9 +884,11 @@ static int evrc_decode_frame(AVCodecContext *avctx, void *data,
         memmove(e->pitch, e->pitch + subframe_size, ACB_SIZE * sizeof(float));
 
         synthesis_filter(e->pitch + ACB_SIZE, ilpc,
-                         e->synthesis, subframe_size, tmp);
-        postfilter(e, tmp, ilpc, samples, pitch_lag,
-                   &postfilter_coeffs[e->bitrate], subframe_size);
+                         e->synthesis, subframe_size,
+                         e->postfilter ? tmp : samples);
+        if (e->postfilter)
+            postfilter(e, tmp, ilpc, samples, pitch_lag,
+                       &postfilter_coeffs[e->bitrate], subframe_size);
 
         samples += subframe_size;
     }
@@ -906,13 +916,29 @@ erasure:
     return avpkt->size;
 }
 
-AVCodec ff_evrc_decoder = {
-    .name           = "evrc",
-    .long_name      = NULL_IF_CONFIG_SMALL("EVRC (Enhanced Variable Rate Codec)"),
-    .type           = AVMEDIA_TYPE_AUDIO,
-    .id             = AV_CODEC_ID_EVRC,
+#define OFFSET(x) offsetof(EVRCContext, x)
+#define AD AV_OPT_FLAG_AUDIO_PARAM | AV_OPT_FLAG_DECODING_PARAM
+
+static const AVOption options[] = {
+    { "postfilter", "enable postfilter", OFFSET(postfilter), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, AD },
+    { NULL }
+};
+
+static const AVClass evrcdec_class = {
+    .class_name = "evrc",
+    .item_name  = av_default_item_name,
+    .option     = options,
+    .version    = LIBAVUTIL_VERSION_INT,
+};
+
+const FFCodec ff_evrc_decoder = {
+    .p.name         = "evrc",
+    CODEC_LONG_NAME("EVRC (Enhanced Variable Rate Codec)"),
+    .p.type         = AVMEDIA_TYPE_AUDIO,
+    .p.id           = AV_CODEC_ID_EVRC,
     .init           = evrc_decode_init,
-    .decode         = evrc_decode_frame,
-    .capabilities   = CODEC_CAP_DR1,
+    FF_CODEC_DECODE_CB(evrc_decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_CHANNEL_CONF,
     .priv_data_size = sizeof(EVRCContext),
+    .p.priv_class   = &evrcdec_class,
 };

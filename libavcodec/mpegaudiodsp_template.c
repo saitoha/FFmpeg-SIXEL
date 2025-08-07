@@ -21,7 +21,9 @@
 #include <stdint.h>
 
 #include "libavutil/attributes.h"
-#include "libavutil/mem.h"
+#include "libavutil/mem_internal.h"
+#include "libavutil/thread.h"
+
 #include "dct32.h"
 #include "mathops.h"
 #include "mpegaudiodsp.h"
@@ -63,8 +65,8 @@ static inline int round_sample(int64_t *sum)
 #   define MACS(rt, ra, rb) MAC64(rt, ra, rb)
 #   define MLSS(rt, ra, rb) MLS64(rt, ra, rb)
 #   define MULH3(x, y, s) MULH((s)*(x), y)
-#   define MULLx(x, y, s) MULL(x,y,s)
-#   define SHR(a,b)       ((a)>>(b))
+#   define MULLx(x, y, s) MULL((int)(x),(y),s)
+#   define SHR(a,b)       (((int)(a))>>(b))
 #   define FIXR(a)        ((int)((a) * FRAC_ONE + 0.5))
 #   define FIXHR(a)       ((int)((a) * (1LL<<32) + 0.5))
 #endif
@@ -120,7 +122,7 @@ DECLARE_ALIGNED(16, MPA_INT, RENAME(ff_mpa_synth_window))[512+256];
 
 void RENAME(ff_mpadsp_apply_window)(MPA_INT *synth_buf, MPA_INT *window,
                                   int *dither_state, OUT_INT *samples,
-                                  int incr)
+                                  ptrdiff_t incr)
 {
     register const MPA_INT *w, *w2, *p;
     int j;
@@ -176,7 +178,7 @@ void RENAME(ff_mpadsp_apply_window)(MPA_INT *synth_buf, MPA_INT *window,
 void RENAME(ff_mpa_synth_filter)(MPADSPContext *s, MPA_INT *synth_buf_ptr,
                                  int *synth_buf_offset,
                                  MPA_INT *window, int *dither_state,
-                                 OUT_INT *samples, int incr,
+                                 OUT_INT *samples, ptrdiff_t incr,
                                  MPA_INT *sb_samples)
 {
     MPA_INT *synth_buf;
@@ -192,7 +194,7 @@ void RENAME(ff_mpa_synth_filter)(MPADSPContext *s, MPA_INT *synth_buf_ptr,
     *synth_buf_offset = offset;
 }
 
-av_cold void RENAME(ff_mpa_synth_init)(MPA_INT *window)
+static av_cold void mpa_synth_init(MPA_INT *window)
 {
     int i, j;
 
@@ -221,48 +223,17 @@ av_cold void RENAME(ff_mpa_synth_init)(MPA_INT *window)
             window[512+128+16*i+j] = window[64*i+48-j];
 }
 
-av_cold void RENAME(ff_init_mpadsp_tabs)(void)
+static av_cold void mpa_synth_window_init(void)
 {
-    int i, j;
-    /* compute mdct windows */
-    for (i = 0; i < 36; i++) {
-        for (j = 0; j < 4; j++) {
-            double d;
-
-            if (j == 2 && i % 3 != 1)
-                continue;
-
-            d = sin(M_PI * (i + 0.5) / 36.0);
-            if (j == 1) {
-                if      (i >= 30) d = 0;
-                else if (i >= 24) d = sin(M_PI * (i - 18 + 0.5) / 12.0);
-                else if (i >= 18) d = 1;
-            } else if (j == 3) {
-                if      (i <   6) d = 0;
-                else if (i <  12) d = sin(M_PI * (i -  6 + 0.5) / 12.0);
-                else if (i <  18) d = 1;
-            }
-            //merge last stage of imdct into the window coefficients
-            d *= 0.5 * IMDCT_SCALAR / cos(M_PI * (2 * i + 19) / 72);
-
-            if (j == 2)
-                RENAME(ff_mdct_win)[j][i/3] = FIXHR((d / (1<<5)));
-            else {
-                int idx = i < 18 ? i : i + (MDCT_BUF_SIZE/2 - 18);
-                RENAME(ff_mdct_win)[j][idx] = FIXHR((d / (1<<5)));
-            }
-        }
-    }
-
-    /* NOTE: we do frequency inversion adter the MDCT by changing
-        the sign of the right window coefs */
-    for (j = 0; j < 4; j++) {
-        for (i = 0; i < MDCT_BUF_SIZE; i += 2) {
-            RENAME(ff_mdct_win)[j + 4][i    ] =  RENAME(ff_mdct_win)[j][i    ];
-            RENAME(ff_mdct_win)[j + 4][i + 1] = -RENAME(ff_mdct_win)[j][i + 1];
-        }
-    }
+    mpa_synth_init(RENAME(ff_mpa_synth_window));
 }
+
+av_cold void RENAME(ff_mpa_synth_init)(void)
+{
+    static AVOnce init_static_once = AV_ONCE_INIT;
+    ff_thread_once(&init_static_once, mpa_synth_window_init);
+}
+
 /* cos(pi*i/18) */
 #define C1 FIXHR(0.98480775301220805936/2)
 #define C2 FIXHR(0.93969262078590838405/2)
@@ -300,11 +271,11 @@ static const INTFLOAT icos36h[9] = {
 };
 
 /* using Lee like decomposition followed by hand coded 9 points DCT */
-static void imdct36(INTFLOAT *out, INTFLOAT *buf, INTFLOAT *in, INTFLOAT *win)
+static void imdct36(INTFLOAT *out, INTFLOAT *buf, SUINTFLOAT *in, INTFLOAT *win)
 {
     int i, j;
-    INTFLOAT t0, t1, t2, t3, s0, s1, s2, s3;
-    INTFLOAT tmp[18], *tmp1, *in1;
+    SUINTFLOAT t0, t1, t2, t3, s0, s1, s2, s3;
+    SUINTFLOAT tmp[18], *tmp1, *in1;
 
     for (i = 17; i >= 1; i--)
         in[i] += in[i-1];
@@ -398,4 +369,3 @@ void RENAME(ff_imdct36_blocks)(INTFLOAT *out, INTFLOAT *buf, INTFLOAT *in,
         out++;
     }
 }
-

@@ -1,6 +1,6 @@
 /*
  * Quicktime Video (RPZA) Video Decoder
- * Copyright (c) 2003 The FFmpeg Project
+ * Copyright (C) 2003 The FFmpeg project
  *
  * This file is part of FFmpeg.
  *
@@ -35,14 +35,12 @@
  */
 
 #include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 
 #include "libavutil/internal.h"
 #include "avcodec.h"
 #include "bytestream.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 
 typedef struct RpzaContext {
 
@@ -52,35 +50,36 @@ typedef struct RpzaContext {
     GetByteContext gb;
 } RpzaContext;
 
-#define ADVANCE_BLOCK() \
-{ \
-    pixel_ptr += 4; \
-    if (pixel_ptr >= width) \
-    { \
-        pixel_ptr = 0; \
-        row_ptr += stride * 4; \
-    } \
-    total_blocks--; \
-    if (total_blocks < 0) \
-    { \
-        av_log(s->avctx, AV_LOG_ERROR, "warning: block counter just went negative (this should not happen)\n"); \
-        return; \
-    } \
-}
+#define CHECK_BLOCK()                                                         \
+    if (total_blocks < 1) {                                                    \
+        av_log(s->avctx, AV_LOG_ERROR,                                         \
+               "Block counter just went negative (this should not happen)\n"); \
+        return AVERROR_INVALIDDATA;                                            \
+    }                                                                          \
 
-static void rpza_decode_stream(RpzaContext *s)
+#define ADVANCE_BLOCK()             \
+    {                               \
+        pixel_ptr += 4;             \
+        if (pixel_ptr >= width)     \
+        {                           \
+            pixel_ptr = 0;          \
+            row_ptr  += stride * 4; \
+        }                           \
+        total_blocks--;             \
+    }
+
+static int rpza_decode_stream(RpzaContext *s)
 {
     int width = s->avctx->width;
-    int stride = s->frame->linesize[0] / 2;
-    int row_inc = stride - 4;
+    int stride, row_inc, ret;
     int chunk_size;
     uint16_t colorA = 0, colorB;
     uint16_t color4[4];
     uint16_t ta, tb;
-    uint16_t *pixels = (uint16_t *)s->frame->data[0];
+    uint16_t *pixels;
 
     int row_ptr = 0;
-    int pixel_ptr = -4;
+    int pixel_ptr = 0;
     int block_ptr;
     int pixel_x, pixel_y;
     int total_blocks;
@@ -90,7 +89,7 @@ static void rpza_decode_stream(RpzaContext *s)
         av_log(s->avctx, AV_LOG_ERROR, "First chunk byte is 0x%02x instead of 0xe1\n",
                bytestream2_peek_byte(&s->gb));
 
-    /* Get chunk size, ingnoring first byte */
+    /* Get chunk size, ignoring first byte */
     chunk_size = bytestream2_get_be32(&s->gb) & 0x00FFFFFF;
 
     /* If length mismatch use size from MOV file and try to decode anyway */
@@ -103,6 +102,15 @@ static void rpza_decode_stream(RpzaContext *s)
 
     /* Number of 4x4 blocks in frame. */
     total_blocks = ((s->avctx->width + 3) / 4) * ((s->avctx->height + 3) / 4);
+
+    if (total_blocks / 32 > bytestream2_get_bytes_left(&s->gb))
+        return AVERROR_INVALIDDATA;
+
+    if ((ret = ff_reget_buffer(s->avctx, s->frame, 0)) < 0)
+        return ret;
+    pixels = (uint16_t *)s->frame->data[0];
+    stride = s->frame->linesize[0] / 2;
+    row_inc = stride - 4;
 
     /* Process chunk data */
     while (bytestream2_get_bytes_left(&s->gb)) {
@@ -130,7 +138,8 @@ static void rpza_decode_stream(RpzaContext *s)
         /* Skip blocks */
         case 0x80:
             while (n_blocks--) {
-              ADVANCE_BLOCK();
+                CHECK_BLOCK();
+                ADVANCE_BLOCK();
             }
             break;
 
@@ -138,7 +147,7 @@ static void rpza_decode_stream(RpzaContext *s)
         case 0xa0:
             colorA = bytestream2_get_be16(&s->gb);
             while (n_blocks--) {
-                ADVANCE_BLOCK()
+                CHECK_BLOCK();
                 block_ptr = row_ptr + pixel_ptr;
                 for (pixel_y = 0; pixel_y < 4; pixel_y++) {
                     for (pixel_x = 0; pixel_x < 4; pixel_x++){
@@ -147,6 +156,7 @@ static void rpza_decode_stream(RpzaContext *s)
                     }
                     block_ptr += row_inc;
                 }
+                ADVANCE_BLOCK();
             }
             break;
 
@@ -181,9 +191,9 @@ static void rpza_decode_stream(RpzaContext *s)
             color4[2] |= ((21 * ta + 11 * tb) >> 5);
 
             if (bytestream2_get_bytes_left(&s->gb) < n_blocks * 4)
-                return;
+                return AVERROR_INVALIDDATA;
             while (n_blocks--) {
-                ADVANCE_BLOCK();
+                CHECK_BLOCK();
                 block_ptr = row_ptr + pixel_ptr;
                 for (pixel_y = 0; pixel_y < 4; pixel_y++) {
                     uint8_t index = bytestream2_get_byteu(&s->gb);
@@ -194,14 +204,15 @@ static void rpza_decode_stream(RpzaContext *s)
                     }
                     block_ptr += row_inc;
                 }
+                ADVANCE_BLOCK();
             }
             break;
 
         /* Fill block with 16 colors */
         case 0x00:
             if (bytestream2_get_bytes_left(&s->gb) < 30)
-                return;
-            ADVANCE_BLOCK();
+                return AVERROR_INVALIDDATA;
+            CHECK_BLOCK();
             block_ptr = row_ptr + pixel_ptr;
             for (pixel_y = 0; pixel_y < 4; pixel_y++) {
                 for (pixel_x = 0; pixel_x < 4; pixel_x++){
@@ -213,6 +224,7 @@ static void rpza_decode_stream(RpzaContext *s)
                 }
                 block_ptr += row_inc;
             }
+            ADVANCE_BLOCK();
             break;
 
         /* Unknown opcode */
@@ -220,9 +232,11 @@ static void rpza_decode_stream(RpzaContext *s)
             av_log(s->avctx, AV_LOG_ERROR, "Unknown opcode %d in rpza chunk."
                  " Skip remaining %d bytes of chunk data.\n", opcode,
                  bytestream2_get_bytes_left(&s->gb));
-            return;
+            return AVERROR_INVALIDDATA;
         } /* Opcode switch */
     }
+
+    return 0;
 }
 
 static av_cold int rpza_decode_init(AVCodecContext *avctx)
@@ -239,21 +253,19 @@ static av_cold int rpza_decode_init(AVCodecContext *avctx)
     return 0;
 }
 
-static int rpza_decode_frame(AVCodecContext *avctx,
-                             void *data, int *got_frame,
-                             AVPacket *avpkt)
+static int rpza_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
+                             int *got_frame, AVPacket *avpkt)
 {
     RpzaContext *s = avctx->priv_data;
     int ret;
 
     bytestream2_init(&s->gb, avpkt->data, avpkt->size);
 
-    if ((ret = ff_reget_buffer(avctx, s->frame)) < 0)
+    ret = rpza_decode_stream(s);
+    if (ret < 0)
         return ret;
 
-    rpza_decode_stream(s);
-
-    if ((ret = av_frame_ref(data, s->frame)) < 0)
+    if ((ret = av_frame_ref(rframe, s->frame)) < 0)
         return ret;
 
     *got_frame      = 1;
@@ -271,14 +283,14 @@ static av_cold int rpza_decode_end(AVCodecContext *avctx)
     return 0;
 }
 
-AVCodec ff_rpza_decoder = {
-    .name           = "rpza",
-    .long_name      = NULL_IF_CONFIG_SMALL("QuickTime video (RPZA)"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_RPZA,
+const FFCodec ff_rpza_decoder = {
+    .p.name         = "rpza",
+    CODEC_LONG_NAME("QuickTime video (RPZA)"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_RPZA,
     .priv_data_size = sizeof(RpzaContext),
     .init           = rpza_decode_init,
     .close          = rpza_decode_end,
-    .decode         = rpza_decode_frame,
-    .capabilities   = CODEC_CAP_DR1,
+    FF_CODEC_DECODE_CB(rpza_decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1,
 };

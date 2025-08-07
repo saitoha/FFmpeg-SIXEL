@@ -24,11 +24,11 @@
  * Cirrus Logic AccuPak encoder.
  */
 
-#include "libavutil/common.h"
 #include "libavutil/opt.h"
 
 #include "avcodec.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "encode.h"
 #include "put_bits.h"
 
 typedef struct CLJRContext {
@@ -42,7 +42,7 @@ static int encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     CLJRContext *a = avctx->priv_data;
     PutBitContext pb;
     int x, y, ret;
-    uint32_t dither= avctx->frame_number;
+    uint32_t dither= avctx->frame_num;
     static const uint32_t ordered_dither[2][2] =
     {
         { 0x10400000, 0x104F0000 },
@@ -56,15 +56,16 @@ static int encode_frame(AVCodecContext *avctx, AVPacket *pkt,
          return AVERROR_EXPERIMENTAL;
     }
 
-    if ((ret = ff_alloc_packet2(avctx, pkt, 32*avctx->height*avctx->width/4)) < 0)
+    ret = ff_get_encode_buffer(avctx, pkt, 4 * avctx->height * ((avctx->width + 3) / 4), 0);
+    if (ret < 0)
         return ret;
 
     init_put_bits(&pb, pkt->data, pkt->size);
 
     for (y = 0; y < avctx->height; y++) {
-        uint8_t *luma = &p->data[0][y * p->linesize[0]];
-        uint8_t *cb   = &p->data[1][y * p->linesize[1]];
-        uint8_t *cr   = &p->data[2][y * p->linesize[2]];
+        const uint8_t *luma = &p->data[0][y * p->linesize[0]];
+        const uint8_t *cb   = &p->data[1][y * p->linesize[1]];
+        const uint8_t *cr   = &p->data[2][y * p->linesize[2]];
         uint8_t luma_tmp[4];
         for (x = 0; x < avctx->width; x += 4) {
             switch (a->dither_type) {
@@ -89,8 +90,6 @@ static int encode_frame(AVCodecContext *avctx, AVPacket *pkt,
 
     flush_put_bits(&pb);
 
-    pkt->size   = put_bits_count(&pb) / 8;
-    pkt->flags |= AV_PKT_FLAG_KEY;
     *got_packet = 1;
     return 0;
 }
@@ -109,14 +108,15 @@ static const AVClass cljr_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-AVCodec ff_cljr_encoder = {
-    .name           = "cljr",
-    .long_name      = NULL_IF_CONFIG_SMALL("Cirrus Logic AccuPak"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_CLJR,
+const FFCodec ff_cljr_encoder = {
+    .p.name         = "cljr",
+    CODEC_LONG_NAME("Cirrus Logic AccuPak"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_CLJR,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
     .priv_data_size = sizeof(CLJRContext),
-    .encode2        = encode_frame,
-    .pix_fmts       = (const enum AVPixelFormat[]) { AV_PIX_FMT_YUV411P,
-                                                   AV_PIX_FMT_NONE },
-    .priv_class     = &cljr_class,
+    FF_CODEC_ENCODE_CB(encode_frame),
+    CODEC_PIXFMTS(AV_PIX_FMT_YUV411P),
+    .color_ranges   = AVCOL_RANGE_MPEG,
+    .p.priv_class   = &cljr_class,
 };

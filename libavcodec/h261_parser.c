@@ -1,5 +1,5 @@
 /*
- * H261 parser
+ * H.261 parser
  * Copyright (c) 2002-2004 Michael Niedermayer <michaelni@gmx.at>
  * Copyright (c) 2004 Maarten Daniels
  *
@@ -22,7 +22,7 @@
 
 /**
  * @file
- * h261codec.
+ * H.261 parser
  */
 
 #include "parser.h"
@@ -86,7 +86,7 @@ static int h261_parse(AVCodecParserContext *s,
     return next;
 }
 
-AVCodecParser ff_h261_parser = {
+const AVCodecParser ff_h261_parser = {
     .codec_ids      = { AV_CODEC_ID_H261 },
     .priv_data_size = sizeof(ParseContext),
     .parser_parse   = h261_parse,

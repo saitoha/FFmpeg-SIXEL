@@ -29,11 +29,10 @@
 #include "libavutil/pixdesc.h"
 #include "libavutil/intreadwrite.h"
 #include "avfilter.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
 #include "video.h"
 
-typedef struct {
+typedef struct Super2xSaIContext {
     /* masks used for two pixels interpolation */
     uint32_t hi_pixel_mask;
     uint32_t lo_pixel_mask;
@@ -46,6 +45,10 @@ typedef struct {
     int is_be;
 } Super2xSaIContext;
 
+typedef struct ThreadData {
+    AVFrame *in, *out;
+} ThreadData;
+
 #define GET_RESULT(A, B, C, D) ((A != C || A != D) - (B != C || B != D))
 
 #define INTERPOLATE(A, B) (((A & hi_pixel_mask) >> 1) + ((B & hi_pixel_mask) >> 1) + (A & B & lo_pixel_mask))
@@ -53,32 +56,40 @@ typedef struct {
 #define Q_INTERPOLATE(A, B, C, D) ((A & q_hi_pixel_mask) >> 2) + ((B & q_hi_pixel_mask) >> 2) + ((C & q_hi_pixel_mask) >> 2) + ((D & q_hi_pixel_mask) >> 2) \
     + ((((A & q_lo_pixel_mask) + (B & q_lo_pixel_mask) + (C & q_lo_pixel_mask) + (D & q_lo_pixel_mask)) >> 2) & q_lo_pixel_mask)
 
-static void super2xsai(AVFilterContext *ctx,
-                       uint8_t *src, int src_linesize,
-                       uint8_t *dst, int dst_linesize,
-                       int width, int height)
+static int super2xsai(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
 {
-    Super2xSaIContext *sai = ctx->priv;
+    Super2xSaIContext *s = ctx->priv;
+    ThreadData *td = arg;
+    AVFrame *in = td->in;
+    AVFrame *out = td->out;
+    const uint8_t *src = in->data[0];
+    uint8_t *dst = out->data[0];
+    const int src_linesize = in->linesize[0];
+    const int dst_linesize = out->linesize[0];
+    const int width = in->width;
+    const int height = in->height;
     unsigned int x, y;
     uint32_t color[4][4];
-    unsigned char *src_line[4];
-    const int bpp = sai->bpp;
-    const uint32_t hi_pixel_mask = sai->hi_pixel_mask;
-    const uint32_t lo_pixel_mask = sai->lo_pixel_mask;
-    const uint32_t q_hi_pixel_mask = sai->q_hi_pixel_mask;
-    const uint32_t q_lo_pixel_mask = sai->q_lo_pixel_mask;
+    const uint8_t *src_line[4];
+    const int bpp = s->bpp;
+    const uint32_t hi_pixel_mask = s->hi_pixel_mask;
+    const uint32_t lo_pixel_mask = s->lo_pixel_mask;
+    const uint32_t q_hi_pixel_mask = s->q_hi_pixel_mask;
+    const uint32_t q_lo_pixel_mask = s->q_lo_pixel_mask;
+    const int slice_start = (height * jobnr) / nb_jobs;
+    const int slice_end = (height * (jobnr+1)) / nb_jobs;
 
     /* Point to the first 4 lines, first line is duplicated */
-    src_line[0] = src;
-    src_line[1] = src;
-    src_line[2] = src + src_linesize*FFMIN(1, height-1);
-    src_line[3] = src + src_linesize*FFMIN(2, height-1);
+    src_line[0] = src + src_linesize*FFMAX(slice_start - 1, 0);
+    src_line[1] = src + src_linesize*slice_start;
+    src_line[2] = src + src_linesize*FFMIN(slice_start + 1, height-1);
+    src_line[3] = src + src_linesize*FFMIN(slice_start + 2, height-1);
 
 #define READ_COLOR4(dst, src_line, off) dst = *((const uint32_t *)src_line + off)
 #define READ_COLOR3(dst, src_line, off) dst = AV_RL24 (src_line + 3*off)
-#define READ_COLOR2(dst, src_line, off) dst = sai->is_be ? AV_RB16(src_line + 2 * off) : AV_RL16(src_line + 2 * off)
+#define READ_COLOR2(dst, src_line, off) dst = s->is_be ? AV_RB16(src_line + 2 * off) : AV_RL16(src_line + 2 * off)
 
-    for (y = 0; y < height; y++) {
+    for (y = slice_start; y < slice_end; y++) {
         uint8_t *dst_line[2];
 
         dst_line[0] = dst + dst_linesize*2*y;
@@ -179,7 +190,7 @@ static void super2xsai(AVFilterContext *ctx,
                 AV_WL24(dst_line[1] + x * 6 + 3, product2b);
                 break;
             default: // bpp = 2
-                if (sai->is_be) {
+                if (s->is_be) {
                     AV_WB32(dst_line[0] + x * 4, product1a | (product1b << 16));
                     AV_WB32(dst_line[1] + x * 4, product2a | (product2b << 16));
                 } else {
@@ -229,62 +240,56 @@ static void super2xsai(AVFilterContext *ctx,
         if (y < height - 3)
             src_line[3] += src_linesize;
     } // y loop
+
+    return 0;
 }
 
-static int query_formats(AVFilterContext *ctx)
-{
-    static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_RGBA, AV_PIX_FMT_BGRA, AV_PIX_FMT_ARGB, AV_PIX_FMT_ABGR,
-        AV_PIX_FMT_RGB24, AV_PIX_FMT_BGR24,
-        AV_PIX_FMT_RGB565BE, AV_PIX_FMT_BGR565BE, AV_PIX_FMT_RGB555BE, AV_PIX_FMT_BGR555BE,
-        AV_PIX_FMT_RGB565LE, AV_PIX_FMT_BGR565LE, AV_PIX_FMT_RGB555LE, AV_PIX_FMT_BGR555LE,
-        AV_PIX_FMT_NONE
-    };
-
-    AVFilterFormats *fmts_list = ff_make_format_list(pix_fmts);
-    if (!fmts_list)
-        return AVERROR(ENOMEM);
-    return ff_set_common_formats(ctx, fmts_list);
-}
+static const enum AVPixelFormat pix_fmts[] = {
+    AV_PIX_FMT_RGBA, AV_PIX_FMT_BGRA, AV_PIX_FMT_ARGB, AV_PIX_FMT_ABGR,
+    AV_PIX_FMT_RGB24, AV_PIX_FMT_BGR24,
+    AV_PIX_FMT_RGB565BE, AV_PIX_FMT_BGR565BE, AV_PIX_FMT_RGB555BE, AV_PIX_FMT_BGR555BE,
+    AV_PIX_FMT_RGB565LE, AV_PIX_FMT_BGR565LE, AV_PIX_FMT_RGB555LE, AV_PIX_FMT_BGR555LE,
+    AV_PIX_FMT_NONE
+};
 
 static int config_input(AVFilterLink *inlink)
 {
-    Super2xSaIContext *sai = inlink->dst->priv;
+    Super2xSaIContext *s = inlink->dst->priv;
 
-    sai->hi_pixel_mask   = 0xFEFEFEFE;
-    sai->lo_pixel_mask   = 0x01010101;
-    sai->q_hi_pixel_mask = 0xFCFCFCFC;
-    sai->q_lo_pixel_mask = 0x03030303;
-    sai->bpp  = 4;
+    s->hi_pixel_mask   = 0xFEFEFEFE;
+    s->lo_pixel_mask   = 0x01010101;
+    s->q_hi_pixel_mask = 0xFCFCFCFC;
+    s->q_lo_pixel_mask = 0x03030303;
+    s->bpp  = 4;
 
     switch (inlink->format) {
     case AV_PIX_FMT_RGB24:
     case AV_PIX_FMT_BGR24:
-        sai->bpp = 3;
+        s->bpp = 3;
         break;
 
     case AV_PIX_FMT_RGB565BE:
     case AV_PIX_FMT_BGR565BE:
-        sai->is_be = 1;
+        s->is_be = 1;
     case AV_PIX_FMT_RGB565LE:
     case AV_PIX_FMT_BGR565LE:
-        sai->hi_pixel_mask   = 0xF7DEF7DE;
-        sai->lo_pixel_mask   = 0x08210821;
-        sai->q_hi_pixel_mask = 0xE79CE79C;
-        sai->q_lo_pixel_mask = 0x18631863;
-        sai->bpp = 2;
+        s->hi_pixel_mask   = 0xF7DEF7DE;
+        s->lo_pixel_mask   = 0x08210821;
+        s->q_hi_pixel_mask = 0xE79CE79C;
+        s->q_lo_pixel_mask = 0x18631863;
+        s->bpp = 2;
         break;
 
     case AV_PIX_FMT_BGR555BE:
     case AV_PIX_FMT_RGB555BE:
-        sai->is_be = 1;
+        s->is_be = 1;
     case AV_PIX_FMT_BGR555LE:
     case AV_PIX_FMT_RGB555LE:
-        sai->hi_pixel_mask   = 0x7BDE7BDE;
-        sai->lo_pixel_mask   = 0x04210421;
-        sai->q_hi_pixel_mask = 0x739C739C;
-        sai->q_lo_pixel_mask = 0x0C630C63;
-        sai->bpp = 2;
+        s->hi_pixel_mask   = 0x7BDE7BDE;
+        s->lo_pixel_mask   = 0x04210421;
+        s->q_hi_pixel_mask = 0x739C739C;
+        s->q_lo_pixel_mask = 0x0C630C63;
+        s->bpp = 2;
         break;
     }
 
@@ -305,24 +310,26 @@ static int config_output(AVFilterLink *outlink)
     return 0;
 }
 
-static int filter_frame(AVFilterLink *inlink, AVFrame *inpicref)
+static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 {
-    AVFilterLink *outlink = inlink->dst->outputs[0];
-    AVFrame *outpicref = ff_get_video_buffer(outlink, outlink->w, outlink->h);
-    if (!outpicref) {
-        av_frame_free(&inpicref);
+    AVFilterContext *ctx = inlink->dst;
+    AVFilterLink *outlink = ctx->outputs[0];
+    ThreadData td;
+    AVFrame *out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
+    if (!out) {
+        av_frame_free(&in);
         return AVERROR(ENOMEM);
     }
-    av_frame_copy_props(outpicref, inpicref);
-    outpicref->width  = outlink->w;
-    outpicref->height = outlink->h;
+    av_frame_copy_props(out, in);
+    out->width  = outlink->w;
+    out->height = outlink->h;
 
-    super2xsai(inlink->dst, inpicref->data[0], inpicref->linesize[0],
-               outpicref->data[0], outpicref->linesize[0],
-               inlink->w, inlink->h);
+    td.in = in, td.out = out;
+    ff_filter_execute(ctx, super2xsai, &td, NULL,
+                      FFMIN(in->height, ff_filter_get_nb_threads(ctx)));
 
-    av_frame_free(&inpicref);
-    return ff_filter_frame(outlink, outpicref);
+    av_frame_free(&in);
+    return ff_filter_frame(outlink, out);
 }
 
 static const AVFilterPad super2xsai_inputs[] = {
@@ -332,7 +339,6 @@ static const AVFilterPad super2xsai_inputs[] = {
         .config_props = config_input,
         .filter_frame = filter_frame,
     },
-    { NULL }
 };
 
 static const AVFilterPad super2xsai_outputs[] = {
@@ -341,14 +347,14 @@ static const AVFilterPad super2xsai_outputs[] = {
         .type         = AVMEDIA_TYPE_VIDEO,
         .config_props = config_output,
     },
-    { NULL }
 };
 
-AVFilter ff_vf_super2xsai = {
-    .name          = "super2xsai",
-    .description   = NULL_IF_CONFIG_SMALL("Scale the input by 2x using the Super2xSaI pixel art algorithm."),
+const FFFilter ff_vf_super2xsai = {
+    .p.name        = "super2xsai",
+    .p.description = NULL_IF_CONFIG_SMALL("Scale the input by 2x using the Super2xSaI pixel art algorithm."),
+    .p.flags       = AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(Super2xSaIContext),
-    .query_formats = query_formats,
-    .inputs        = super2xsai_inputs,
-    .outputs       = super2xsai_outputs,
+    FILTER_INPUTS(super2xsai_inputs),
+    FILTER_OUTPUTS(super2xsai_outputs),
+    FILTER_PIXFMTS_ARRAY(pix_fmts),
 };

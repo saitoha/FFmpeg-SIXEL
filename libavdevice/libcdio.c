@@ -34,10 +34,10 @@
 #endif
 
 #include "libavutil/log.h"
-#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 
 #include "libavformat/avformat.h"
+#include "libavformat/demux.h"
 #include "libavformat/internal.h"
 
 typedef struct CDIOContext {
@@ -60,9 +60,9 @@ static av_cold int read_header(AVFormatContext *ctx)
 
     if (!(st = avformat_new_stream(ctx, NULL)))
         return AVERROR(ENOMEM);
-    s->drive = cdio_cddap_identify(ctx->filename, CDDA_MESSAGE_LOGIT, &err);
+    s->drive = cdio_cddap_identify(ctx->url, CDDA_MESSAGE_LOGIT, &err);
     if (!s->drive) {
-        av_log(ctx, AV_LOG_ERROR, "Could not open drive %s.\n", ctx->filename);
+        av_log(ctx, AV_LOG_ERROR, "Could not open drive %s.\n", ctx->url);
         return AVERROR(EINVAL);
     }
     if (err) {
@@ -70,7 +70,7 @@ static av_cold int read_header(AVFormatContext *ctx)
         free(err);
     }
     if ((ret = cdio_cddap_open(s->drive)) < 0 || !s->drive->opened) {
-        av_log(ctx, AV_LOG_ERROR, "Could not open disk in drive %s.\n", ctx->filename);
+        av_log(ctx, AV_LOG_ERROR, "Could not open disk in drive %s.\n", ctx->url);
         return AVERROR(EINVAL);
     }
 
@@ -85,19 +85,20 @@ static av_cold int read_header(AVFormatContext *ctx)
     }
     cdio_paranoia_modeset(s->paranoia, s->paranoia_mode);
 
-    st->codec->codec_type      = AVMEDIA_TYPE_AUDIO;
+    st->codecpar->codec_type      = AVMEDIA_TYPE_AUDIO;
     if (s->drive->bigendianp)
-        st->codec->codec_id    = AV_CODEC_ID_PCM_S16BE;
+        st->codecpar->codec_id    = AV_CODEC_ID_PCM_S16BE;
     else
-        st->codec->codec_id    = AV_CODEC_ID_PCM_S16LE;
-    st->codec->sample_rate     = 44100;
-    st->codec->channels        = 2;
+        st->codecpar->codec_id    = AV_CODEC_ID_PCM_S16LE;
+    st->codecpar->sample_rate     = 44100;
+    st->codecpar->ch_layout       = (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
     if (s->drive->audio_last_sector != CDIO_INVALID_LSN &&
         s->drive->audio_first_sector != CDIO_INVALID_LSN)
         st->duration           = s->drive->audio_last_sector - s->drive->audio_first_sector;
     else if (s->drive->tracks)
         st->duration = s->drive->disc_toc[s->drive->tracks].dwStartSector;
-    avpriv_set_pts_info(st, 64, CDIO_CD_FRAMESIZE_RAW, 2*st->codec->channels*st->codec->sample_rate);
+    avpriv_set_pts_info(st, 64, CDIO_CD_FRAMESIZE_RAW,
+                        2 * st->codecpar->ch_layout.nb_channels * st->codecpar->sample_rate);
 
     for (i = 0; i < s->drive->tracks; i++) {
         char title[16];
@@ -117,9 +118,6 @@ static int read_packet(AVFormatContext *ctx, AVPacket *pkt)
     int ret;
     uint16_t *buf;
     char *err = NULL;
-
-    if (ctx->streams[0]->cur_dts > s->last_sector)
-        return AVERROR_EOF;
 
     buf = cdio_paranoia_read(s->paranoia, NULL);
     if (!buf)
@@ -157,7 +155,7 @@ static int read_seek(AVFormatContext *ctx, int stream_index, int64_t timestamp,
     AVStream *st = ctx->streams[0];
 
     cdio_paranoia_seek(s->paranoia, timestamp, SEEK_SET);
-    st->cur_dts = timestamp;
+    avpriv_update_cur_dts(ctx, st, timestamp);
     return 0;
 }
 
@@ -165,12 +163,12 @@ static int read_seek(AVFormatContext *ctx, int stream_index, int64_t timestamp,
 #define DEC AV_OPT_FLAG_DECODING_PARAM
 static const AVOption options[] = {
     { "speed",              "set drive reading speed", OFFSET(speed),         AV_OPT_TYPE_INT,   { .i64 = 0 }, 0,       INT_MAX, DEC },
-    { "paranoia_mode",      "set error recovery mode", OFFSET(paranoia_mode), AV_OPT_TYPE_FLAGS, { .i64 = PARANOIA_MODE_DISABLE }, INT_MIN, INT_MAX, DEC, "paranoia_mode" },
-        { "disable",        "apply no fixups",                      0,    AV_OPT_TYPE_CONST, { .i64 = PARANOIA_MODE_DISABLE },   0, 0, DEC, "paranoia_mode" },
-        { "verify",         "verify data integrity in overlap area", 0,   AV_OPT_TYPE_CONST, { .i64 = PARANOIA_MODE_VERIFY },    0, 0, DEC, "paranoia_mode" },
-        { "overlap",        "perform overlapped reads",             0,    AV_OPT_TYPE_CONST, { .i64 = PARANOIA_MODE_OVERLAP },   0, 0, DEC, "paranoia_mode" },
-        { "neverskip",      "do not skip failed reads",             0,    AV_OPT_TYPE_CONST, { .i64 = PARANOIA_MODE_NEVERSKIP }, 0, 0, DEC, "paranoia_mode" },
-        { "full",           "apply all recovery modes",             0,    AV_OPT_TYPE_CONST, { .i64 = PARANOIA_MODE_FULL },      0, 0, DEC, "paranoia_mode" },
+    { "paranoia_mode",      "set error recovery mode", OFFSET(paranoia_mode), AV_OPT_TYPE_FLAGS, { .i64 = PARANOIA_MODE_DISABLE }, INT_MIN, INT_MAX, DEC, .unit = "paranoia_mode" },
+        { "disable",        "apply no fixups",                      0,    AV_OPT_TYPE_CONST, { .i64 = PARANOIA_MODE_DISABLE },   0, 0, DEC, .unit = "paranoia_mode" },
+        { "verify",         "verify data integrity in overlap area", 0,   AV_OPT_TYPE_CONST, { .i64 = PARANOIA_MODE_VERIFY },    0, 0, DEC, .unit = "paranoia_mode" },
+        { "overlap",        "perform overlapped reads",             0,    AV_OPT_TYPE_CONST, { .i64 = PARANOIA_MODE_OVERLAP },   0, 0, DEC, .unit = "paranoia_mode" },
+        { "neverskip",      "do not skip failed reads",             0,    AV_OPT_TYPE_CONST, { .i64 = PARANOIA_MODE_NEVERSKIP }, 0, 0, DEC, .unit = "paranoia_mode" },
+        { "full",           "apply all recovery modes",             0,    AV_OPT_TYPE_CONST, { .i64 = PARANOIA_MODE_FULL },      0, 0, DEC, .unit = "paranoia_mode" },
     { NULL },
 };
 
@@ -182,13 +180,13 @@ static const AVClass libcdio_class = {
     .category   = AV_CLASS_CATEGORY_DEVICE_AUDIO_INPUT,
 };
 
-AVInputFormat ff_libcdio_demuxer = {
-    .name           = "libcdio",
+const FFInputFormat ff_libcdio_demuxer = {
+    .p.name         = "libcdio",
+    .p.flags        = AVFMT_NOFILE,
+    .p.priv_class   = &libcdio_class,
     .read_header    = read_header,
     .read_packet    = read_packet,
     .read_close     = read_close,
     .read_seek      = read_seek,
     .priv_data_size = sizeof(CDIOContext),
-    .flags          = AVFMT_NOFILE,
-    .priv_class     = &libcdio_class,
 };

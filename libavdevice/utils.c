@@ -17,10 +17,12 @@
  */
 
 #include "internal.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavformat/avformat.h"
+#include "libavformat/demux.h"
 
-int ff_alloc_input_device_context(AVFormatContext **avctx, AVInputFormat *iformat, const char *format)
+int ff_alloc_input_device_context(AVFormatContext **avctx, const AVInputFormat *iformat, const char *format)
 {
     AVFormatContext *s;
     int ret = 0;
@@ -38,8 +40,8 @@ int ff_alloc_input_device_context(AVFormatContext **avctx, AVInputFormat *iforma
         goto error;
     }
     s->iformat = iformat;
-    if (s->iformat->priv_data_size > 0) {
-        s->priv_data = av_mallocz(s->iformat->priv_data_size);
+    if (ffifmt(s->iformat)->priv_data_size > 0) {
+        s->priv_data = av_mallocz(ffifmt(s->iformat)->priv_data_size);
         if (!s->priv_data) {
             ret = AVERROR(ENOMEM);
             goto error;

@@ -47,7 +47,6 @@ enum {
 };
 
 #define IVI_VLC_BITS 13 ///< max number of bits of the ivi's huffman codes
-#define IVI4_STREAM_ANALYSER    0
 #define IVI5_IS_PROTECTED       0x20
 
 /**
@@ -62,18 +61,17 @@ typedef struct IVIHuffDesc {
  *  macroblock/block huffman table descriptor
  */
 typedef struct IVIHuffTab {
-    int32_t     tab_sel;    /// index of one of the predefined tables
-                            /// or "7" for custom one
-    VLC         *tab;       /// pointer to the table associated with tab_sel
+    int32_t     tab_sel;    ///< index of one of the predefined tables, or "7" for custom one
+    VLC         *tab;       ///< pointer to the table associated with tab_sel
 
-    /// the following are used only when tab_sel == 7
-    IVIHuffDesc cust_desc;  /// custom Huffman codebook descriptor
-    VLC         cust_tab;   /// vlc table for custom codebook
+    // the following are used only when tab_sel == 7
+    IVIHuffDesc cust_desc;  ///< custom Huffman codebook descriptor
+    VLC         cust_tab;   ///< vlc table for custom codebook
 } IVIHuffTab;
 
 enum {
-    IVI_MB_HUFF   = 0,      /// Huffman table is used for coding macroblocks
-    IVI_BLK_HUFF  = 1       /// Huffman table is used for coding blocks
+    IVI_MB_HUFF   = 0,      ///< Huffman table is used for coding macroblocks
+    IVI_BLK_HUFF  = 1       ///< Huffman table is used for coding blocks
 };
 
 
@@ -88,8 +86,8 @@ extern const uint8_t ff_ivi_direct_scan_4x4[16];
 /**
  *  Declare inverse transform function types
  */
-typedef void (InvTransformPtr)(const int32_t *in, int16_t *out, uint32_t pitch, const uint8_t *flags);
-typedef void (DCTransformPtr) (const int32_t *in, int16_t *out, uint32_t pitch, int blk_size);
+typedef void (InvTransformPtr)(const int32_t *in, int16_t *out, ptrdiff_t pitch, const uint8_t *flags);
+typedef void (DCTransformPtr) (const int32_t *in, int16_t *out, ptrdiff_t pitch, int blk_size);
 
 
 /**
@@ -154,7 +152,7 @@ typedef struct IVIBandDesc {
     int16_t         *ref_buf;       ///< pointer to the reference frame buffer (for motion compensation)
     int16_t         *b_ref_buf;     ///< pointer to the second reference frame buffer (for motion compensation)
     int16_t         *bufs[4];       ///< array of pointers to the band buffers
-    int             pitch;          ///< pitch associated with the buffers above
+    ptrdiff_t       pitch;          ///< pitch associated with the buffers above
     int             is_empty;       ///< = 1 if this band doesn't contain any data
     int             mb_size;        ///< macroblock size
     int             blk_size;       ///< block size
@@ -220,7 +218,6 @@ typedef struct IVI45DecContext {
     int             prev_frame_type; ///< frame type of the previous frame
     uint32_t        data_size;       ///< size of the frame data in bytes from picture header
     int             is_scalable;
-    int             transp_status;   ///< transparency mode status: 1 - enabled
     const uint8_t   *frame_data;     ///< input frame data pointer
     int             inter_scal;      ///< signals a sequence of scalable inter frames
     uint32_t        frame_size;      ///< frame size in bytes
@@ -250,13 +247,12 @@ typedef struct IVI45DecContext {
     uint8_t         gop_flags;
     uint32_t        lock_word;
 
-#if IVI4_STREAM_ANALYSER
+    int             show_indeo4_info;
     uint8_t         has_b_frames;
-    uint8_t         has_transp;
+    uint8_t         has_transp;      ///< transparency mode status: 1 - enabled
     uint8_t         uses_tiling;
     uint8_t         uses_haar;
     uint8_t         uses_fullpel;
-#endif
 
     int             (*decode_pic_hdr)  (struct IVI45DecContext *ctx, AVCodecContext *avctx);
     int             (*decode_band_hdr) (struct IVI45DecContext *ctx, IVIBandDesc *band, AVCodecContext *avctx);
@@ -325,8 +321,8 @@ int  ff_ivi_dec_huff_desc(GetBitContext *gb, int desc_coded, int which_tab,
  *  @param[in]      is_indeo4  flag signalling if it is Indeo 4 or not
  *  @return             result code: 0 - OK
  */
-int  ff_ivi_init_planes(IVIPlaneDesc *planes, const IVIPicConfig *cfg,
-                        int is_indeo4);
+int  ff_ivi_init_planes(AVCodecContext *avctx, IVIPlaneDesc *planes,
+                        const IVIPicConfig *cfg, int is_indeo4);
 
 /**
  *  Initialize tile and macroblock descriptors.
@@ -338,8 +334,8 @@ int  ff_ivi_init_planes(IVIPlaneDesc *planes, const IVIPicConfig *cfg,
  */
 int  ff_ivi_init_tiles(IVIPlaneDesc *planes, int tile_width, int tile_height);
 
-int ff_ivi_decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
-                        AVPacket *avpkt);
+int ff_ivi_decode_frame(AVCodecContext *avctx, AVFrame *data,
+                        int *got_frame, AVPacket *avpkt);
 int ff_ivi_decode_close(AVCodecContext *avctx);
 
 #endif /* AVCODEC_IVI_H */

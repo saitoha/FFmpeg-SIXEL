@@ -1,6 +1,6 @@
 /*
  * Westwood Studios AUD Format Demuxer
- * Copyright (c) 2003 The FFmpeg Project
+ * Copyright (c) 2003 The FFmpeg project
  *
  * This file is part of FFmpeg.
  *
@@ -36,13 +36,14 @@
 #include "libavutil/channel_layout.h"
 #include "libavutil/intreadwrite.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
 #define AUD_HEADER_SIZE 12
 #define AUD_CHUNK_PREAMBLE_SIZE 8
 #define AUD_CHUNK_SIGNATURE 0x0000DEAF
 
-static int wsaud_probe(AVProbeData *p)
+static int wsaud_probe(const AVProbeData *p)
 {
     int field;
 
@@ -105,23 +106,21 @@ static int wsaud_read_header(AVFormatContext *s)
             avpriv_request_sample(s, "Stereo WS-SND1");
             return AVERROR_PATCHWELCOME;
         }
-        st->codec->codec_id = AV_CODEC_ID_WESTWOOD_SND1;
+        st->codecpar->codec_id = AV_CODEC_ID_WESTWOOD_SND1;
         break;
     case 99:
-        st->codec->codec_id = AV_CODEC_ID_ADPCM_IMA_WS;
-        st->codec->bits_per_coded_sample = 4;
-        st->codec->bit_rate = channels * sample_rate * 4;
+        st->codecpar->codec_id = AV_CODEC_ID_ADPCM_IMA_WS;
+        st->codecpar->bits_per_coded_sample = 4;
+        st->codecpar->bit_rate = channels * sample_rate * 4;
         break;
     default:
         avpriv_request_sample(s, "Unknown codec: %d", codec);
         return AVERROR_PATCHWELCOME;
     }
     avpriv_set_pts_info(st, 64, 1, sample_rate);
-    st->codec->codec_type  = AVMEDIA_TYPE_AUDIO;
-    st->codec->channels    = channels;
-    st->codec->channel_layout = channels == 1 ? AV_CH_LAYOUT_MONO :
-                                                AV_CH_LAYOUT_STEREO;
-    st->codec->sample_rate = sample_rate;
+    st->codecpar->codec_type  = AVMEDIA_TYPE_AUDIO;
+    av_channel_layout_default(&st->codecpar->ch_layout, channels);
+    st->codecpar->sample_rate = sample_rate;
 
     return 0;
 }
@@ -145,7 +144,7 @@ static int wsaud_read_packet(AVFormatContext *s,
 
     chunk_size = AV_RL16(&preamble[0]);
 
-    if (st->codec->codec_id == AV_CODEC_ID_WESTWOOD_SND1) {
+    if (st->codecpar->codec_id == AV_CODEC_ID_WESTWOOD_SND1) {
         /* For Westwood SND1 audio we need to add the output size and input
            size to the start of the packet to match what is in VQA.
            Specifically, this is needed to signal when a packet should be
@@ -164,17 +163,23 @@ static int wsaud_read_packet(AVFormatContext *s,
         if (ret != chunk_size)
             return AVERROR(EIO);
 
+        if (st->codecpar->ch_layout.nb_channels <= 0) {
+            av_log(s, AV_LOG_ERROR, "invalid number of channels %d\n",
+                   st->codecpar->ch_layout.nb_channels);
+            return AVERROR_INVALIDDATA;
+        }
+
         /* 2 samples/byte, 1 or 2 samples per frame depending on stereo */
-        pkt->duration = (chunk_size * 2) / st->codec->channels;
+        pkt->duration = (chunk_size * 2) / st->codecpar->ch_layout.nb_channels;
     }
     pkt->stream_index = st->index;
 
     return ret;
 }
 
-AVInputFormat ff_wsaud_demuxer = {
-    .name           = "wsaud",
-    .long_name      = NULL_IF_CONFIG_SMALL("Westwood Studios audio"),
+const FFInputFormat ff_wsaud_demuxer = {
+    .p.name         = "wsaud",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Westwood Studios audio"),
     .read_probe     = wsaud_probe,
     .read_header    = wsaud_read_header,
     .read_packet    = wsaud_read_packet,

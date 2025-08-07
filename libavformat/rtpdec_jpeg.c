@@ -112,7 +112,7 @@ static int jpeg_create_header(uint8_t *buf, int size, uint32_t type, uint32_t w,
     jpeg_put_marker(&pbc, APP0);
     bytestream2_put_be16(&pbc, 16);
     bytestream2_put_buffer(&pbc, "JFIF", 5);
-    bytestream2_put_be16(&pbc, 0x0201);
+    bytestream2_put_be16(&pbc, 0x0102);
     bytestream2_put_byte(&pbc, 0);
     bytestream2_put_be16(&pbc, 1);
     bytestream2_put_be16(&pbc, 1);
@@ -144,14 +144,14 @@ static int jpeg_create_header(uint8_t *buf, int size, uint32_t type, uint32_t w,
     bytestream2_put_be16(&pbc, 0);
 
     dht_size  = 2;
-    dht_size += jpeg_create_huffman_table(&pbc, 0, 0,avpriv_mjpeg_bits_dc_luminance,
-                                          avpriv_mjpeg_val_dc);
-    dht_size += jpeg_create_huffman_table(&pbc, 0, 1, avpriv_mjpeg_bits_dc_chrominance,
-                                          avpriv_mjpeg_val_dc);
-    dht_size += jpeg_create_huffman_table(&pbc, 1, 0, avpriv_mjpeg_bits_ac_luminance,
-                                          avpriv_mjpeg_val_ac_luminance);
-    dht_size += jpeg_create_huffman_table(&pbc, 1, 1, avpriv_mjpeg_bits_ac_chrominance,
-                                          avpriv_mjpeg_val_ac_chrominance);
+    dht_size += jpeg_create_huffman_table(&pbc, 0, 0,ff_mjpeg_bits_dc_luminance,
+                                          ff_mjpeg_val_dc);
+    dht_size += jpeg_create_huffman_table(&pbc, 0, 1, ff_mjpeg_bits_dc_chrominance,
+                                          ff_mjpeg_val_dc);
+    dht_size += jpeg_create_huffman_table(&pbc, 1, 0, ff_mjpeg_bits_ac_luminance,
+                                          ff_mjpeg_val_ac_luminance);
+    dht_size += jpeg_create_huffman_table(&pbc, 1, 1, ff_mjpeg_bits_ac_chrominance,
+                                          ff_mjpeg_val_ac_chrominance);
     AV_WB16(dht_size_ptr, dht_size);
 
     /* SOF0 */
@@ -193,16 +193,17 @@ static void create_default_qtables(uint8_t *qtables, uint8_t q)
 {
     int factor = q;
     int i;
+    uint16_t S;
 
     factor = av_clip(q, 1, 99);
 
     if (q < 50)
-        q = 5000 / factor;
+        S = 5000 / factor;
     else
-        q = 200 - factor * 2;
+        S = 200 - factor * 2;
 
     for (i = 0; i < 128; i++) {
-        int val = (default_quantizers[i] * q + 50) / 100;
+        int val = (default_quantizers[i] * S + 50) / 100;
 
         /* Limit the quantizers to 1 <= q <= 255. */
         val = av_clip(val, 1, 255);
@@ -232,6 +233,8 @@ static int jpeg_parse_packet(AVFormatContext *ctx, PayloadContext *jpeg,
     q      = AV_RB8(buf + 5);   /* quantization factor (or table id) */
     width  = AV_RB8(buf + 6);   /* frame width in 8 pixel blocks */
     height = AV_RB8(buf + 7);   /* frame height in 8 pixel blocks */
+    st->codecpar->width = width*8;
+    st->codecpar->height = height*8;
     buf += 8;
     len -= 8;
 
@@ -245,14 +248,8 @@ static int jpeg_parse_packet(AVFormatContext *ctx, PayloadContext *jpeg,
         len -= 4;
         type &= ~0x40;
     }
-    /* Parse the restart marker header. */
-    if (type > 63) {
-        av_log(ctx, AV_LOG_ERROR,
-               "Unimplemented RTP/JPEG restart marker header.\n");
-        return AVERROR_PATCHWELCOME;
-    }
     if (type > 1) {
-        av_log(ctx, AV_LOG_ERROR, "Unimplemented RTP/JPEG type %d\n", type);
+        avpriv_report_missing_feature(ctx, "RTP/JPEG type %"PRIu8, type);
         return AVERROR_PATCHWELCOME;
     }
 
@@ -384,7 +381,7 @@ static int jpeg_parse_packet(AVFormatContext *ctx, PayloadContext *jpeg,
     return AVERROR(EAGAIN);
 }
 
-RTPDynamicProtocolHandler ff_jpeg_dynamic_handler = {
+const RTPDynamicProtocolHandler ff_jpeg_dynamic_handler = {
     .enc_name          = "JPEG",
     .codec_type        = AVMEDIA_TYPE_VIDEO,
     .codec_id          = AV_CODEC_ID_MJPEG,

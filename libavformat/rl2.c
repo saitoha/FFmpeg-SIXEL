@@ -36,7 +36,9 @@
 
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mathematics.h"
+#include "libavutil/mem.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
 #define EXTRADATA1_SIZE (6 + 256 * 3) ///< video base, clr, palette
@@ -55,7 +57,7 @@ typedef struct Rl2DemuxContext {
  * @param p probe buffer
  * @return 0 when the probe buffer does not contain rl2 data, > 0 otherwise
  */
-static int rl2_probe(AVProbeData *p)
+static int rl2_probe(const AVProbeData *p)
 {
 
     if(AV_RB32(&p->buf[0]) != FORM_TAG)
@@ -104,7 +106,7 @@ static av_cold int rl2_read_header(AVFormatContext *s)
     if(back_size > INT_MAX/2  || frame_count > INT_MAX / sizeof(uint32_t))
         return AVERROR_INVALIDDATA;
 
-    avio_skip(pb, 2);         /* encoding mentod */
+    avio_skip(pb, 2);         /* encoding method */
     sound_rate = avio_rl16(pb);
     rate = avio_rl16(pb);
     channels = avio_rl16(pb);
@@ -115,20 +117,21 @@ static av_cold int rl2_read_header(AVFormatContext *s)
     if(!st)
          return AVERROR(ENOMEM);
 
-    st->codec->codec_type = AVMEDIA_TYPE_VIDEO;
-    st->codec->codec_id = AV_CODEC_ID_RL2;
-    st->codec->codec_tag = 0;  /* no fourcc */
-    st->codec->width = 320;
-    st->codec->height = 200;
+    st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+    st->codecpar->codec_id = AV_CODEC_ID_RL2;
+    st->codecpar->codec_tag = 0;  /* no fourcc */
+    st->codecpar->width = 320;
+    st->codecpar->height = 200;
 
     /** allocate and fill extradata */
-    st->codec->extradata_size = EXTRADATA1_SIZE;
+    st->codecpar->extradata_size = EXTRADATA1_SIZE;
 
     if(signature == RLV3_TAG && back_size > 0)
-        st->codec->extradata_size += back_size;
+        st->codecpar->extradata_size += back_size;
 
-    if(ff_get_extradata(st->codec, pb, st->codec->extradata_size) < 0)
-        return AVERROR(ENOMEM);
+    ret = ff_get_extradata(s, st->codecpar, pb, st->codecpar->extradata_size);
+    if (ret < 0)
+        return ret;
 
     /** setup audio stream if present */
     if(sound_rate){
@@ -143,16 +146,16 @@ static av_cold int rl2_read_header(AVFormatContext *s)
         st = avformat_new_stream(s, NULL);
         if (!st)
             return AVERROR(ENOMEM);
-        st->codec->codec_type = AVMEDIA_TYPE_AUDIO;
-        st->codec->codec_id = AV_CODEC_ID_PCM_U8;
-        st->codec->codec_tag = 1;
-        st->codec->channels = channels;
-        st->codec->bits_per_coded_sample = 8;
-        st->codec->sample_rate = rate;
-        st->codec->bit_rate = st->codec->channels * st->codec->sample_rate *
-            st->codec->bits_per_coded_sample;
-        st->codec->block_align = st->codec->channels *
-            st->codec->bits_per_coded_sample / 8;
+        st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
+        st->codecpar->codec_id = AV_CODEC_ID_PCM_U8;
+        st->codecpar->codec_tag = 1;
+        st->codecpar->ch_layout.nb_channels = channels;
+        st->codecpar->bits_per_coded_sample = 8;
+        st->codecpar->sample_rate = rate;
+        st->codecpar->bit_rate = channels * st->codecpar->sample_rate *
+            st->codecpar->bits_per_coded_sample;
+        st->codecpar->block_align = channels *
+            st->codecpar->bits_per_coded_sample / 8;
         avpriv_set_pts_info(st,32,1,rate);
     }
 
@@ -170,12 +173,27 @@ static av_cold int rl2_read_header(AVFormatContext *s)
     }
 
     /** read offset and size tables */
-    for(i=0; i < frame_count;i++)
+    for(i=0; i < frame_count;i++) {
+        if (avio_feof(pb)) {
+            ret = AVERROR_INVALIDDATA;
+            goto end;
+        }
         chunk_size[i] = avio_rl32(pb);
-    for(i=0; i < frame_count;i++)
+    }
+    for(i=0; i < frame_count;i++) {
+        if (avio_feof(pb)) {
+            ret = AVERROR_INVALIDDATA;
+            goto end;
+        }
         chunk_offset[i] = avio_rl32(pb);
-    for(i=0; i < frame_count;i++)
+    }
+    for(i=0; i < frame_count;i++) {
+        if (avio_feof(pb)) {
+            ret = AVERROR_INVALIDDATA;
+            goto end;
+        }
         audio_size[i] = avio_rl32(pb) & 0xFFFF;
+    }
 
     /** build the sample index */
     for(i=0;i<frame_count;i++){
@@ -194,7 +212,7 @@ static av_cold int rl2_read_header(AVFormatContext *s)
         ++video_frame_counter;
     }
 
-
+end:
     av_free(chunk_size);
     av_free(audio_size);
     av_free(chunk_offset);
@@ -221,9 +239,10 @@ static int rl2_read_packet(AVFormatContext *s,
 
     /** check if there is a valid video or audio entry that can be used */
     for(i=0; i<s->nb_streams; i++){
-        if(rl2->index_pos[i] < s->streams[i]->nb_index_entries
-              && s->streams[i]->index_entries[ rl2->index_pos[i] ].pos < pos){
-            sample = &s->streams[i]->index_entries[ rl2->index_pos[i] ];
+        const FFStream *const sti = ffstream(s->streams[i]);
+        if (rl2->index_pos[i] < sti->nb_index_entries
+              && sti->index_entries[ rl2->index_pos[i] ].pos < pos) {
+            sample = &sti->index_entries[ rl2->index_pos[i] ];
             pos= sample->pos;
             stream_id= i;
         }
@@ -240,7 +259,6 @@ static int rl2_read_packet(AVFormatContext *s,
     /** fill the packet */
     ret = av_get_packet(pb, pkt, sample->size);
     if(ret != sample->size){
-        av_free_packet(pkt);
         return AVERROR(EIO);
     }
 
@@ -268,7 +286,7 @@ static int rl2_read_seek(AVFormatContext *s, int stream_index, int64_t timestamp
         return -1;
 
     rl2->index_pos[stream_index] = index;
-    timestamp = st->index_entries[index].timestamp;
+    timestamp = ffstream(st)->index_entries[index].timestamp;
 
     for(i=0; i < s->nb_streams; i++){
         AVStream *st2 = s->streams[i];
@@ -285,9 +303,9 @@ static int rl2_read_seek(AVFormatContext *s, int stream_index, int64_t timestamp
     return 0;
 }
 
-AVInputFormat ff_rl2_demuxer = {
-    .name           = "rl2",
-    .long_name      = NULL_IF_CONFIG_SMALL("RL2"),
+const FFInputFormat ff_rl2_demuxer = {
+    .p.name         = "rl2",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("RL2"),
     .priv_data_size = sizeof(Rl2DemuxContext),
     .read_probe     = rl2_probe,
     .read_header    = rl2_read_header,

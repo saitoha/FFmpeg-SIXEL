@@ -20,9 +20,10 @@
 
 #include "libavutil/pixdesc.h"
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
+#include "video.h"
 
-typedef struct {
+typedef struct SeparateFieldsContext {
     int nb_planes;
     AVFrame *second;
 } SeparateFieldsContext;
@@ -30,10 +31,12 @@ typedef struct {
 static int config_props_output(AVFilterLink *outlink)
 {
     AVFilterContext *ctx = outlink->src;
-    SeparateFieldsContext *sf = ctx->priv;
+    SeparateFieldsContext *s = ctx->priv;
     AVFilterLink *inlink = ctx->inputs[0];
+    FilterLink       *il = ff_filter_link(inlink);
+    FilterLink       *ol = ff_filter_link(outlink);
 
-    sf->nb_planes = av_pix_fmt_count_planes(inlink->format);
+    s->nb_planes = av_pix_fmt_count_planes(inlink->format);
 
     if (inlink->h & 1) {
         av_log(ctx, AV_LOG_ERROR, "height must be even\n");
@@ -42,8 +45,8 @@ static int config_props_output(AVFilterLink *outlink)
 
     outlink->time_base.num = inlink->time_base.num;
     outlink->time_base.den = inlink->time_base.den * 2;
-    outlink->frame_rate.num = inlink->frame_rate.num * 2;
-    outlink->frame_rate.den = inlink->frame_rate.den;
+    ol->frame_rate.num = il->frame_rate.num * 2;
+    ol->frame_rate.den = il->frame_rate.den;
     outlink->w = inlink->w;
     outlink->h = inlink->h / 2;
 
@@ -64,19 +67,19 @@ static void extract_field(AVFrame *frame, int nb_planes, int type)
 static int filter_frame(AVFilterLink *inlink, AVFrame *inpicref)
 {
     AVFilterContext *ctx = inlink->dst;
-    SeparateFieldsContext *sf = ctx->priv;
+    SeparateFieldsContext *s = ctx->priv;
     AVFilterLink *outlink = ctx->outputs[0];
     int ret;
 
     inpicref->height = outlink->h;
-    inpicref->interlaced_frame = 0;
+    inpicref->flags &= ~AV_FRAME_FLAG_INTERLACED;
 
-    if (!sf->second) {
+    if (!s->second) {
         goto clone;
     } else {
-        AVFrame *second = sf->second;
+        AVFrame *second = s->second;
 
-        extract_field(second, sf->nb_planes, second->top_field_first);
+        extract_field(second, s->nb_planes, !!(second->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST));
 
         if (second->pts != AV_NOPTS_VALUE &&
             inpicref->pts != AV_NOPTS_VALUE)
@@ -88,12 +91,12 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *inpicref)
         if (ret < 0)
             return ret;
 clone:
-        sf->second = av_frame_clone(inpicref);
-        if (!sf->second)
+        s->second = av_frame_clone(inpicref);
+        if (!s->second)
             return AVERROR(ENOMEM);
     }
 
-    extract_field(inpicref, sf->nb_planes, !inpicref->top_field_first);
+    extract_field(inpicref, s->nb_planes, !(inpicref->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST));
 
     if (inpicref->pts != AV_NOPTS_VALUE)
         inpicref->pts *= 2;
@@ -101,46 +104,74 @@ clone:
     return ff_filter_frame(outlink, inpicref);
 }
 
-static int request_frame(AVFilterLink *outlink)
+static int flush_frame(AVFilterLink *outlink, int64_t pts, int64_t *out_pts)
 {
     AVFilterContext *ctx = outlink->src;
-    SeparateFieldsContext *sf = ctx->priv;
-    int ret;
+    SeparateFieldsContext *s = ctx->priv;
+    int ret = 0;
 
-    ret = ff_request_frame(ctx->inputs[0]);
-    if (ret == AVERROR_EOF && sf->second) {
-        sf->second->pts *= 2;
-        extract_field(sf->second, sf->nb_planes, sf->second->top_field_first);
-        ret = ff_filter_frame(outlink, sf->second);
-        sf->second = 0;
+    if (s->second) {
+        *out_pts = s->second->pts += pts;
+        extract_field(s->second, s->nb_planes, !!(s->second->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST));
+        ret = ff_filter_frame(outlink, s->second);
+        s->second = NULL;
     }
 
     return ret;
 }
 
-static const AVFilterPad separatefields_inputs[] = {
-    {
-        .name         = "default",
-        .type         = AVMEDIA_TYPE_VIDEO,
-        .filter_frame = filter_frame,
-    },
-    { NULL }
-};
+static int activate(AVFilterContext *ctx)
+{
+    AVFilterLink *inlink = ctx->inputs[0];
+    AVFilterLink *outlink = ctx->outputs[0];
+    AVFrame *in;
+    int64_t pts;
+    int ret, status;
+
+    FF_FILTER_FORWARD_STATUS_BACK(outlink, inlink);
+
+    ret = ff_inlink_consume_frame(inlink, &in);
+    if (ret < 0)
+        return ret;
+    if (ret > 0)
+        return filter_frame(inlink, in);
+
+    if (ff_inlink_acknowledge_status(inlink, &status, &pts)) {
+        if (status == AVERROR_EOF) {
+            int64_t out_pts = pts;
+
+            ret = flush_frame(outlink, pts, &out_pts);
+            ff_outlink_set_status(outlink, status, out_pts);
+            return ret;
+        }
+    }
+
+    FF_FILTER_FORWARD_WANTED(outlink, inlink);
+
+    return FFERROR_NOT_READY;
+}
+
+static av_cold void uninit(AVFilterContext *ctx)
+{
+    SeparateFieldsContext *s = ctx->priv;
+
+    av_frame_free(&s->second);
+}
 
 static const AVFilterPad separatefields_outputs[] = {
     {
         .name          = "default",
         .type          = AVMEDIA_TYPE_VIDEO,
         .config_props  = config_props_output,
-        .request_frame = request_frame,
     },
-    { NULL }
 };
 
-AVFilter ff_vf_separatefields = {
-    .name        = "separatefields",
-    .description = NULL_IF_CONFIG_SMALL("Split input video frames into fields."),
+const FFFilter ff_vf_separatefields = {
+    .p.name        = "separatefields",
+    .p.description = NULL_IF_CONFIG_SMALL("Split input video frames into fields."),
     .priv_size   = sizeof(SeparateFieldsContext),
-    .inputs      = separatefields_inputs,
-    .outputs     = separatefields_outputs,
+    .activate    = activate,
+    .uninit      = uninit,
+    FILTER_INPUTS(ff_video_default_filterpad),
+    FILTER_OUTPUTS(separatefields_outputs),
 };

@@ -1,6 +1,6 @@
 /*
  * AMR Audio encoder stub
- * Copyright (c) 2003 The FFmpeg Project
+ * Copyright (c) 2003 The FFmpeg project
  *
  * This file is part of FFmpeg.
  *
@@ -25,10 +25,10 @@
 
 #include "libavutil/avstring.h"
 #include "libavutil/internal.h"
-#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "avcodec.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "encode.h"
 
 #define MAX_PACKET_SIZE  (1 + (477 + 7) / 8)
 
@@ -46,12 +46,15 @@ static const AVOption options[] = {
 };
 
 static const AVClass amrwb_class = {
-    "libvo_amrwbenc", av_default_item_name, options, LIBAVUTIL_VERSION_INT
+    .class_name = "libvo_amrwbenc",
+    .item_name  = av_default_item_name,
+    .option     = options,
+    .version    = LIBAVUTIL_VERSION_INT,
 };
 
 static int get_wb_bitrate_mode(int bitrate, void *log_ctx)
 {
-    /* make the correspondance between bitrate and mode */
+    /* make the correspondence between bitrate and mode */
     static const int rates[] = {  6600,  8850, 12650, 14250, 15850, 18250,
                                  19850, 23050, 23850 };
     int i, best = -1, min_diff = 0;
@@ -84,7 +87,7 @@ static av_cold int amr_wb_encode_init(AVCodecContext *avctx)
         return AVERROR(ENOSYS);
     }
 
-    if (avctx->channels != 1) {
+    if (avctx->ch_layout.nb_channels != 1) {
         av_log(avctx, AV_LOG_ERROR, "Only mono supported\n");
         return AVERROR(ENOSYS);
     }
@@ -115,7 +118,7 @@ static int amr_wb_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
     const int16_t *samples = (const int16_t *)frame->data[0];
     int size, ret;
 
-    if ((ret = ff_alloc_packet2(avctx, avpkt, MAX_PACKET_SIZE)) < 0)
+    if ((ret = ff_alloc_packet(avctx, avpkt, MAX_PACKET_SIZE)) < 0)
         return ret;
 
     if (s->last_bitrate != avctx->bit_rate) {
@@ -136,17 +139,19 @@ static int amr_wb_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
     return 0;
 }
 
-AVCodec ff_libvo_amrwbenc_encoder = {
-    .name           = "libvo_amrwbenc",
-    .long_name      = NULL_IF_CONFIG_SMALL("Android VisualOn AMR-WB "
-                                           "(Adaptive Multi-Rate Wide-Band)"),
-    .type           = AVMEDIA_TYPE_AUDIO,
-    .id             = AV_CODEC_ID_AMR_WB,
+const FFCodec ff_libvo_amrwbenc_encoder = {
+    .p.name         = "libvo_amrwbenc",
+    CODEC_LONG_NAME("Android VisualOn AMR-WB (Adaptive Multi-Rate Wide-Band)"),
+    .p.type         = AVMEDIA_TYPE_AUDIO,
+    .p.id           = AV_CODEC_ID_AMR_WB,
+    .p.capabilities = AV_CODEC_CAP_DR1 |
+                      AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
+    .p.priv_class   = &amrwb_class,
+    .p.wrapper_name = "libvo_amrwbenc",
+    .caps_internal  = FF_CODEC_CAP_NOT_INIT_THREADSAFE,
     .priv_data_size = sizeof(AMRWBContext),
     .init           = amr_wb_encode_init,
-    .encode2        = amr_wb_encode_frame,
+    FF_CODEC_ENCODE_CB(amr_wb_encode_frame),
     .close          = amr_wb_encode_close,
-    .sample_fmts    = (const enum AVSampleFormat[]){ AV_SAMPLE_FMT_S16,
-                                                     AV_SAMPLE_FMT_NONE },
-    .priv_class     = &amrwb_class,
+    CODEC_SAMPLEFMTS(AV_SAMPLE_FMT_S16),
 };

@@ -19,17 +19,19 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <limits.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "config.h"
-#include "common.h"
 #include "mem.h"
 #include "avassert.h"
 #include "avstring.h"
 #include "bprint.h"
+#include "error.h"
+#include "macros.h"
 
 int av_strstart(const char *str, const char *pfx, const char **ptr)
 {
@@ -136,19 +138,11 @@ end:
     return p;
 }
 
-char *av_d2str(double d)
-{
-    char *str = av_malloc(16);
-    if (str)
-        snprintf(str, 16, "%f", d);
-    return str;
-}
-
-#define WHITESPACES " \n\t"
+#define WHITESPACES " \n\t\r"
 
 char *av_get_token(const char **buf, const char *term)
 {
-    char *out     = av_malloc(strlen(*buf) + 1);
+    char *out     = av_realloc(NULL, strlen(*buf) + 1);
     char *ret     = out, *end = out;
     const char *p = *buf;
     if (!out)
@@ -178,7 +172,8 @@ char *av_get_token(const char **buf, const char *term)
 
     *buf = p;
 
-    return ret;
+    char *small_ret = av_realloc(ret, out - ret + 2);
+    return small_ret ? small_ret : ret;
 }
 
 char *av_strtok(char *s, const char *delim, char **saveptr)
@@ -222,23 +217,53 @@ int av_strcasecmp(const char *a, const char *b)
 
 int av_strncasecmp(const char *a, const char *b, size_t n)
 {
-    const char *end = a + n;
     uint8_t c1, c2;
+    if (n <= 0)
+        return 0;
     do {
         c1 = av_tolower(*a++);
         c2 = av_tolower(*b++);
-    } while (a < end && c1 && c1 == c2);
+    } while (--n && c1 && c1 == c2);
     return c1 - c2;
+}
+
+char *av_strireplace(const char *str, const char *from, const char *to)
+{
+    char *ret = NULL;
+    const char *pstr2, *pstr = str;
+    size_t tolen = strlen(to), fromlen = strlen(from);
+    AVBPrint pbuf;
+
+    av_bprint_init(&pbuf, 1, AV_BPRINT_SIZE_UNLIMITED);
+    while ((pstr2 = av_stristr(pstr, from))) {
+        av_bprint_append_data(&pbuf, pstr, pstr2 - pstr);
+        pstr = pstr2 + fromlen;
+        av_bprint_append_data(&pbuf, to, tolen);
+    }
+    av_bprint_append_data(&pbuf, pstr, strlen(pstr));
+    if (!av_bprint_is_complete(&pbuf)) {
+        av_bprint_finalize(&pbuf, NULL);
+    } else {
+        av_bprint_finalize(&pbuf, &ret);
+    }
+
+    return ret;
 }
 
 const char *av_basename(const char *path)
 {
-    char *p = strrchr(path, '/');
-
+    char *p;
 #if HAVE_DOS_PATHS
-    char *q = strrchr(path, '\\');
-    char *d = strchr(path, ':');
+    char *q, *d;
+#endif
 
+    if (!path || *path == '\0')
+        return ".";
+
+    p = strrchr(path, '/');
+#if HAVE_DOS_PATHS
+    q = strrchr(path, '\\');
+    d = strchr(path, ':');
     p = FFMAX3(p, q, d);
 #endif
 
@@ -250,11 +275,11 @@ const char *av_basename(const char *path)
 
 const char *av_dirname(char *path)
 {
-    char *p = strrchr(path, '/');
+    char *p = path ? strrchr(path, '/') : NULL;
 
 #if HAVE_DOS_PATHS
-    char *q = strrchr(path, '\\');
-    char *d = strchr(path, ':');
+    char *q = path ? strrchr(path, '\\') : NULL;
+    char *d = path ? strchr(path, ':')  : NULL;
 
     d = d ? d + 1 : d;
 
@@ -304,57 +329,41 @@ int av_escape(char **dst, const char *src, const char *special_chars,
               enum AVEscapeMode mode, int flags)
 {
     AVBPrint dstbuf;
+    int ret;
 
-    av_bprint_init(&dstbuf, 1, AV_BPRINT_SIZE_UNLIMITED);
+    av_bprint_init(&dstbuf, 1, INT_MAX); /* (int)dstbuf.len must be >= 0 */
     av_bprint_escape(&dstbuf, src, special_chars, mode, flags);
 
     if (!av_bprint_is_complete(&dstbuf)) {
         av_bprint_finalize(&dstbuf, NULL);
         return AVERROR(ENOMEM);
-    } else {
-        av_bprint_finalize(&dstbuf, dst);
-        return dstbuf.len;
     }
-}
-
-int av_isdigit(int c)
-{
-    return c >= '0' && c <= '9';
-}
-
-int av_isgraph(int c)
-{
-    return c > 32 && c < 127;
-}
-
-int av_isspace(int c)
-{
-    return c == ' ' || c == '\f' || c == '\n' || c == '\r' || c == '\t' ||
-           c == '\v';
-}
-
-int av_isxdigit(int c)
-{
-    c = av_tolower(c);
-    return av_isdigit(c) || (c >= 'a' && c <= 'f');
+    if ((ret = av_bprint_finalize(&dstbuf, dst)) < 0)
+        return ret;
+    return dstbuf.len;
 }
 
 int av_match_name(const char *name, const char *names)
 {
     const char *p;
-    int len, namelen;
+    size_t len, namelen;
 
     if (!name || !names)
         return 0;
 
     namelen = strlen(name);
-    while ((p = strchr(names, ','))) {
+    while (*names) {
+        int negate = '-' == *names;
+        p = strchr(names, ',');
+        if (!p)
+            p = names + strlen(names);
+        names += negate;
         len = FFMAX(p - names, namelen);
-        if (!av_strncasecmp(name, names, len))
-            return 1;
-        names = p + 1;
+        if (!av_strncasecmp(name, names, len) || !strncmp("ALL", names, FFMAX(3, p - names)))
+            return !negate;
+        names = p + (*p == ',');
     }
-    return !av_strcasecmp(name, names);
+    return 0;
 }
 
 int av_utf8_decode(int32_t *codep, const uint8_t **bufp, const uint8_t *buf_end,
@@ -408,7 +417,7 @@ int av_utf8_decode(int32_t *codep, const uint8_t **bufp, const uint8_t *buf_end,
         goto end;
     }
 
-    if (code >= 1<<31) {
+    if (code >= 1U<<31) {
         ret = AVERROR(EILSEQ);  /* out-of-range value */
         goto end;
     }
@@ -444,75 +453,13 @@ int av_match_list(const char *name, const char *list, char separator)
                 if (k && (!p[k] || p[k] == separator))
                     return 1;
             q = strchr(q, separator);
-            q += !!q;
+            if(q)
+                q++;
         }
         p = strchr(p, separator);
-        p += !!p;
+        if (p)
+            p++;
     }
 
     return 0;
 }
-
-#ifdef TEST
-
-int main(void)
-{
-    int i;
-    char *fullpath;
-    static const char * const strings[] = {
-        "''",
-        "",
-        ":",
-        "\\",
-        "'",
-        "    ''    :",
-        "    ''  ''  :",
-        "foo   '' :",
-        "'foo'",
-        "foo     ",
-        "  '  foo  '  ",
-        "foo\\",
-        "foo':  blah:blah",
-        "foo\\:  blah:blah",
-        "foo\'",
-        "'foo :  '  :blahblah",
-        "\\ :blah",
-        "     foo",
-        "      foo       ",
-        "      foo     \\ ",
-        "foo ':blah",
-        " foo   bar    :   blahblah",
-        "\\f\\o\\o",
-        "'foo : \\ \\  '   : blahblah",
-        "'\\fo\\o:': blahblah",
-        "\\'fo\\o\\:':  foo  '  :blahblah"
-    };
-
-    printf("Testing av_get_token()\n");
-    for (i = 0; i < FF_ARRAY_ELEMS(strings); i++) {
-        const char *p = strings[i];
-        char *q;
-        printf("|%s|", p);
-        q = av_get_token(&p, ":");
-        printf(" -> |%s|", q);
-        printf(" + |%s|\n", p);
-        av_free(q);
-    }
-
-    printf("Testing av_append_path_component()\n");
-    #define TEST_APPEND_PATH_COMPONENT(path, component, expected) \
-        fullpath = av_append_path_component((path), (component)); \
-        printf("%s = %s\n", fullpath, expected); \
-        av_free(fullpath);
-    TEST_APPEND_PATH_COMPONENT(NULL, NULL, "(null)")
-    TEST_APPEND_PATH_COMPONENT("path", NULL, "path");
-    TEST_APPEND_PATH_COMPONENT(NULL, "comp", "comp");
-    TEST_APPEND_PATH_COMPONENT("path", "comp", "path/comp");
-    TEST_APPEND_PATH_COMPONENT("path/", "comp", "path/comp");
-    TEST_APPEND_PATH_COMPONENT("path", "/comp", "path/comp");
-    TEST_APPEND_PATH_COMPONENT("path/", "/comp", "path/comp");
-    TEST_APPEND_PATH_COMPONENT("path/path2/", "/comp/comp2", "path/path2/comp/comp2");
-    return 0;
-}
-
-#endif /* TEST */

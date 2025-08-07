@@ -39,11 +39,26 @@
 
 #include "libavutil/channel_layout.h"
 #include "libavutil/float_dsp.h"
+#include "libavutil/mem.h"
+#include "libavutil/mem_internal.h"
+#include "libavutil/thread.h"
 #include "avcodec.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include "get_bits.h"
-#include "internal.h"
 #include "atrac.h"
 #include "atrac3plus.h"
+
+static const uint8_t channel_map[8][8] = {
+    { 0, },
+    { 0, 1, },
+    { 0, 1, 2, },
+    { 0, 1, 2, 3, },
+    { 0, },
+    { 0, 1, 2, 4, 5, 3, },
+    { 0, 1, 2, 4, 5, 6, 3, },
+    { 0, 1, 2, 4, 5, 6, 7, 3, },
+};
 
 typedef struct ATRAC3PContext {
     GetBitContext gb;
@@ -55,14 +70,16 @@ typedef struct ATRAC3PContext {
     DECLARE_ALIGNED(32, float, outp_buf)[2][ATRAC3P_FRAME_SAMPLES];
 
     AtracGCContext gainc_ctx;   ///< gain compensation context
-    FFTContext mdct_ctx;
-    FFTContext ipqf_dct_ctx;    ///< IDCT context used by IPQF
+    AVTXContext *mdct_ctx;
+    av_tx_fn mdct_fn;
+    AVTXContext *ipqf_dct_ctx;  ///< IDCT context used by IPQF
+    av_tx_fn ipqf_dct_fn;
 
     Atrac3pChanUnitCtx *ch_units;   ///< global channel units
 
     int num_channel_blocks;     ///< number of channel blocks
     uint8_t channel_blocks[5];  ///< channel configuration descriptor
-    uint64_t my_channel_layout; ///< current channel layout
+    const uint8_t *channel_map; ///< channel layout map
 } ATRAC3PContext;
 
 static av_cold int atrac3p_decode_close(AVCodecContext *avctx)
@@ -72,8 +89,8 @@ static av_cold int atrac3p_decode_close(AVCodecContext *avctx)
     av_freep(&ctx->ch_units);
     av_freep(&ctx->fdsp);
 
-    ff_mdct_end(&ctx->mdct_ctx);
-    ff_mdct_end(&ctx->ipqf_dct_ctx);
+    av_tx_uninit(&ctx->mdct_ctx);
+    av_tx_uninit(&ctx->ipqf_dct_ctx);
 
     return 0;
 }
@@ -81,36 +98,36 @@ static av_cold int atrac3p_decode_close(AVCodecContext *avctx)
 static av_cold int set_channel_params(ATRAC3PContext *ctx,
                                       AVCodecContext *avctx)
 {
+    int channels = avctx->ch_layout.nb_channels;
     memset(ctx->channel_blocks, 0, sizeof(ctx->channel_blocks));
 
-    switch (avctx->channels) {
+    av_channel_layout_uninit(&avctx->ch_layout);
+    switch (channels) {
     case 1:
-        if (avctx->channel_layout != AV_CH_FRONT_LEFT)
-            avctx->channel_layout = AV_CH_LAYOUT_MONO;
-
+        avctx->ch_layout        = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
         ctx->num_channel_blocks = 1;
         ctx->channel_blocks[0]  = CH_UNIT_MONO;
         break;
     case 2:
-        avctx->channel_layout   = AV_CH_LAYOUT_STEREO;
+        avctx->ch_layout        = (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
         ctx->num_channel_blocks = 1;
         ctx->channel_blocks[0]  = CH_UNIT_STEREO;
         break;
     case 3:
-        avctx->channel_layout   = AV_CH_LAYOUT_SURROUND;
+        avctx->ch_layout        = (AVChannelLayout)AV_CHANNEL_LAYOUT_SURROUND;
         ctx->num_channel_blocks = 2;
         ctx->channel_blocks[0]  = CH_UNIT_STEREO;
         ctx->channel_blocks[1]  = CH_UNIT_MONO;
         break;
     case 4:
-        avctx->channel_layout   = AV_CH_LAYOUT_4POINT0;
+        avctx->ch_layout        = (AVChannelLayout)AV_CHANNEL_LAYOUT_4POINT0;
         ctx->num_channel_blocks = 3;
         ctx->channel_blocks[0]  = CH_UNIT_STEREO;
         ctx->channel_blocks[1]  = CH_UNIT_MONO;
         ctx->channel_blocks[2]  = CH_UNIT_MONO;
         break;
     case 6:
-        avctx->channel_layout   = AV_CH_LAYOUT_5POINT1_BACK;
+        avctx->ch_layout        = (AVChannelLayout)AV_CHANNEL_LAYOUT_5POINT1_BACK;
         ctx->num_channel_blocks = 4;
         ctx->channel_blocks[0]  = CH_UNIT_STEREO;
         ctx->channel_blocks[1]  = CH_UNIT_MONO;
@@ -118,7 +135,7 @@ static av_cold int set_channel_params(ATRAC3PContext *ctx,
         ctx->channel_blocks[3]  = CH_UNIT_MONO;
         break;
     case 7:
-        avctx->channel_layout   = AV_CH_LAYOUT_6POINT1_BACK;
+        avctx->ch_layout        = (AVChannelLayout)AV_CHANNEL_LAYOUT_6POINT1_BACK;
         ctx->num_channel_blocks = 5;
         ctx->channel_blocks[0]  = CH_UNIT_STEREO;
         ctx->channel_blocks[1]  = CH_UNIT_MONO;
@@ -127,7 +144,7 @@ static av_cold int set_channel_params(ATRAC3PContext *ctx,
         ctx->channel_blocks[4]  = CH_UNIT_MONO;
         break;
     case 8:
-        avctx->channel_layout   = AV_CH_LAYOUT_7POINT1;
+        avctx->ch_layout        = (AVChannelLayout)AV_CHANNEL_LAYOUT_7POINT1;
         ctx->num_channel_blocks = 5;
         ctx->channel_blocks[0]  = CH_UNIT_STEREO;
         ctx->channel_blocks[1]  = CH_UNIT_MONO;
@@ -137,16 +154,26 @@ static av_cold int set_channel_params(ATRAC3PContext *ctx,
         break;
     default:
         av_log(avctx, AV_LOG_ERROR,
-               "Unsupported channel count: %d!\n", avctx->channels);
+               "Unsupported channel count: %d!\n", channels);
         return AVERROR_INVALIDDATA;
     }
+
+    ctx->channel_map = channel_map[channels - 1];
 
     return 0;
 }
 
+static av_cold void atrac3p_init_static(void)
+{
+    ff_atrac3p_init_vlcs();
+    ff_atrac3p_init_dsp_static();
+}
+
 static av_cold int atrac3p_decode_init(AVCodecContext *avctx)
 {
+    static AVOnce init_static_once = AV_ONCE_INIT;
     ATRAC3PContext *ctx = avctx->priv_data;
+    float scale;
     int i, ch, ret;
 
     if (!avctx->block_align) {
@@ -154,27 +181,28 @@ static av_cold int atrac3p_decode_init(AVCodecContext *avctx)
         return AVERROR(EINVAL);
     }
 
-    ff_atrac3p_init_vlcs();
-
     /* initialize IPQF */
-    ff_mdct_init(&ctx->ipqf_dct_ctx, 5, 1, 32.0 / 32768.0);
+    scale = 32.0 / 32768.0;
+    ret = av_tx_init(&ctx->ipqf_dct_ctx, &ctx->ipqf_dct_fn, AV_TX_FLOAT_MDCT,
+                     1, 16, &scale, 0);
+    if (ret < 0)
+        return ret;
 
-    ff_atrac3p_init_imdct(avctx, &ctx->mdct_ctx);
+    scale = -1.0f;
+    ret = av_tx_init(&ctx->mdct_ctx, &ctx->mdct_fn, AV_TX_FLOAT_MDCT,
+                     1, 128, &scale, AV_TX_FULL_IMDCT);
+    if (ret < 0)
+        return ret;
 
     ff_atrac_init_gain_compensation(&ctx->gainc_ctx, 6, 2);
-
-    ff_atrac3p_init_wave_synth();
 
     if ((ret = set_channel_params(ctx, avctx)) < 0)
         return ret;
 
-    ctx->my_channel_layout = avctx->channel_layout;
-
-    ctx->ch_units = av_mallocz_array(ctx->num_channel_blocks, sizeof(*ctx->ch_units));
-    ctx->fdsp = avpriv_float_dsp_alloc(avctx->flags & CODEC_FLAG_BITEXACT);
+    ctx->ch_units = av_calloc(ctx->num_channel_blocks, sizeof(*ctx->ch_units));
+    ctx->fdsp = avpriv_float_dsp_alloc(avctx->flags & AV_CODEC_FLAG_BITEXACT);
 
     if (!ctx->ch_units || !ctx->fdsp) {
-        atrac3p_decode_close(avctx);
         return AVERROR(ENOMEM);
     }
 
@@ -195,10 +223,12 @@ static av_cold int atrac3p_decode_init(AVCodecContext *avctx)
 
     avctx->sample_fmt = AV_SAMPLE_FMT_FLTP;
 
+    ff_thread_once(&init_static_once, atrac3p_init_static);
+
     return 0;
 }
 
-static void decode_residual_spectrum(Atrac3pChanUnitCtx *ctx,
+static void decode_residual_spectrum(ATRAC3PContext *ctx, Atrac3pChanUnitCtx *ch_unit,
                                      float out[2][ATRAC3P_FRAME_SAMPLES],
                                      int num_channels,
                                      AVCodecContext *avctx)
@@ -209,17 +239,17 @@ static void decode_residual_spectrum(Atrac3pChanUnitCtx *ctx,
     /* calculate RNG table index for each subband */
     int sb_RNG_index[ATRAC3P_SUBBANDS] = { 0 };
 
-    if (ctx->mute_flag) {
+    if (ch_unit->mute_flag) {
         for (ch = 0; ch < num_channels; ch++)
             memset(out[ch], 0, ATRAC3P_FRAME_SAMPLES * sizeof(*out[ch]));
         return;
     }
 
-    for (qu = 0, RNG_index = 0; qu < ctx->used_quant_units; qu++)
-        RNG_index += ctx->channels[0].qu_sf_idx[qu] +
-                     ctx->channels[1].qu_sf_idx[qu];
+    for (qu = 0, RNG_index = 0; qu < ch_unit->used_quant_units; qu++)
+        RNG_index += ch_unit->channels[0].qu_sf_idx[qu] +
+                     ch_unit->channels[1].qu_sf_idx[qu];
 
-    for (sb = 0; sb < ctx->num_coded_subbands; sb++, RNG_index += 128)
+    for (sb = 0; sb < ch_unit->num_coded_subbands; sb++, RNG_index += 128)
         sb_RNG_index[sb] = RNG_index & 0x3FC;
 
     /* inverse quant and power compensation */
@@ -227,35 +257,35 @@ static void decode_residual_spectrum(Atrac3pChanUnitCtx *ctx,
         /* clear channel's residual spectrum */
         memset(out[ch], 0, ATRAC3P_FRAME_SAMPLES * sizeof(*out[ch]));
 
-        for (qu = 0; qu < ctx->used_quant_units; qu++) {
-            src        = &ctx->channels[ch].spectrum[ff_atrac3p_qu_to_spec_pos[qu]];
+        for (qu = 0; qu < ch_unit->used_quant_units; qu++) {
+            src        = &ch_unit->channels[ch].spectrum[ff_atrac3p_qu_to_spec_pos[qu]];
             dst        = &out[ch][ff_atrac3p_qu_to_spec_pos[qu]];
             nspeclines = ff_atrac3p_qu_to_spec_pos[qu + 1] -
                          ff_atrac3p_qu_to_spec_pos[qu];
 
-            if (ctx->channels[ch].qu_wordlen[qu] > 0) {
-                q = ff_atrac3p_sf_tab[ctx->channels[ch].qu_sf_idx[qu]] *
-                    ff_atrac3p_mant_tab[ctx->channels[ch].qu_wordlen[qu]];
+            if (ch_unit->channels[ch].qu_wordlen[qu] > 0) {
+                q = ff_atrac3p_sf_tab[ch_unit->channels[ch].qu_sf_idx[qu]] *
+                    ff_atrac3p_mant_tab[ch_unit->channels[ch].qu_wordlen[qu]];
                 for (i = 0; i < nspeclines; i++)
                     dst[i] = src[i] * q;
             }
         }
 
-        for (sb = 0; sb < ctx->num_coded_subbands; sb++)
-            ff_atrac3p_power_compensation(ctx, ch, &out[ch][0],
+        for (sb = 0; sb < ch_unit->num_coded_subbands; sb++)
+            ff_atrac3p_power_compensation(ch_unit, ctx->fdsp, ch, &out[ch][0],
                                           sb_RNG_index[sb], sb);
     }
 
-    if (ctx->unit_type == CH_UNIT_STEREO) {
-        for (sb = 0; sb < ctx->num_coded_subbands; sb++) {
-            if (ctx->swap_channels[sb]) {
+    if (ch_unit->unit_type == CH_UNIT_STEREO) {
+        for (sb = 0; sb < ch_unit->num_coded_subbands; sb++) {
+            if (ch_unit->swap_channels[sb]) {
                 for (i = 0; i < ATRAC3P_SUBBAND_SAMPLES; i++)
                     FFSWAP(float, out[0][sb * ATRAC3P_SUBBAND_SAMPLES + i],
                                   out[1][sb * ATRAC3P_SUBBAND_SAMPLES + i]);
             }
 
             /* flip coefficients' sign if requested */
-            if (ctx->negate_coeffs[sb])
+            if (ch_unit->negate_coeffs[sb])
                 for (i = 0; i < ATRAC3P_SUBBAND_SAMPLES; i++)
                     out[1][sb * ATRAC3P_SUBBAND_SAMPLES + i] = -(out[1][sb * ATRAC3P_SUBBAND_SAMPLES + i]);
         }
@@ -270,7 +300,7 @@ static void reconstruct_frame(ATRAC3PContext *ctx, Atrac3pChanUnitCtx *ch_unit,
     for (ch = 0; ch < num_channels; ch++) {
         for (sb = 0; sb < ch_unit->num_subbands; sb++) {
             /* inverse transform and windowing */
-            ff_atrac3p_imdct(ctx->fdsp, &ctx->mdct_ctx,
+            ff_atrac3p_imdct(ctx->fdsp, ctx->mdct_ctx, ctx->mdct_fn,
                              &ctx->samples[ch][sb * ATRAC3P_SUBBAND_SAMPLES],
                              &ctx->mdct_buf[ch][sb * ATRAC3P_SUBBAND_SAMPLES],
                              (ch_unit->channels[ch].wnd_shape_prev[sb] << 1) +
@@ -310,8 +340,9 @@ static void reconstruct_frame(ATRAC3PContext *ctx, Atrac3pChanUnitCtx *ch_unit,
         }
 
         /* subband synthesis and acoustic signal output */
-        ff_atrac3p_ipqf(&ctx->ipqf_dct_ctx, &ch_unit->ipqf_ctx[ch],
-                        &ctx->time_buf[ch][0], &ctx->outp_buf[ch][0]);
+        ff_atrac3p_ipqf(ctx->ipqf_dct_ctx, ctx->ipqf_dct_fn,
+                        &ch_unit->ipqf_ctx[ch], &ctx->time_buf[ch][0],
+                        &ctx->outp_buf[ch][0]);
     }
 
     /* swap window shape and gain control buffers. */
@@ -327,11 +358,10 @@ static void reconstruct_frame(ATRAC3PContext *ctx, Atrac3pChanUnitCtx *ch_unit,
     FFSWAP(Atrac3pWaveSynthParams *, ch_unit->waves_info, ch_unit->waves_info_prev);
 }
 
-static int atrac3p_decode_frame(AVCodecContext *avctx, void *data,
+static int atrac3p_decode_frame(AVCodecContext *avctx, AVFrame *frame,
                                 int *got_frame_ptr, AVPacket *avpkt)
 {
     ATRAC3PContext *ctx = avctx->priv_data;
-    AVFrame *frame      = data;
     int i, ret, ch_unit_id, ch_block = 0, out_ch_index = 0, channels_to_process;
     float **samples_p = (float **)frame->extended_data;
 
@@ -369,13 +399,13 @@ static int atrac3p_decode_frame(AVCodecContext *avctx, void *data,
                                                   avctx)) < 0)
             return ret;
 
-        decode_residual_spectrum(&ctx->ch_units[ch_block], ctx->samples,
+        decode_residual_spectrum(ctx, &ctx->ch_units[ch_block], ctx->samples,
                                  channels_to_process, avctx);
         reconstruct_frame(ctx, &ctx->ch_units[ch_block],
                           channels_to_process, avctx);
 
         for (i = 0; i < channels_to_process; i++)
-            memcpy(samples_p[out_ch_index + i], ctx->outp_buf[i],
+            memcpy(samples_p[ctx->channel_map[out_ch_index + i]], ctx->outp_buf[i],
                    ATRAC3P_FRAME_SAMPLES * sizeof(**samples_p));
 
         ch_block++;
@@ -384,16 +414,31 @@ static int atrac3p_decode_frame(AVCodecContext *avctx, void *data,
 
     *got_frame_ptr = 1;
 
-    return avctx->block_align;
+    return avctx->codec_id == AV_CODEC_ID_ATRAC3P ? FFMIN(avctx->block_align, avpkt->size) : avpkt->size;
 }
 
-AVCodec ff_atrac3p_decoder = {
-    .name           = "atrac3plus",
-    .long_name      = NULL_IF_CONFIG_SMALL("ATRAC3+ (Adaptive TRansform Acoustic Coding 3+)"),
-    .type           = AVMEDIA_TYPE_AUDIO,
-    .id             = AV_CODEC_ID_ATRAC3P,
+const FFCodec ff_atrac3p_decoder = {
+    .p.name         = "atrac3plus",
+    CODEC_LONG_NAME("ATRAC3+ (Adaptive TRansform Acoustic Coding 3+)"),
+    .p.type         = AVMEDIA_TYPE_AUDIO,
+    .p.id           = AV_CODEC_ID_ATRAC3P,
+    .p.capabilities = AV_CODEC_CAP_DR1,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
     .priv_data_size = sizeof(ATRAC3PContext),
     .init           = atrac3p_decode_init,
     .close          = atrac3p_decode_close,
-    .decode         = atrac3p_decode_frame,
+    FF_CODEC_DECODE_CB(atrac3p_decode_frame),
+};
+
+const FFCodec ff_atrac3pal_decoder = {
+    .p.name         = "atrac3plusal",
+    CODEC_LONG_NAME("ATRAC3+ AL (Adaptive TRansform Acoustic Coding 3+ Advanced Lossless)"),
+    .p.type         = AVMEDIA_TYPE_AUDIO,
+    .p.id           = AV_CODEC_ID_ATRAC3PAL,
+    .p.capabilities = AV_CODEC_CAP_DR1,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
+    .priv_data_size = sizeof(ATRAC3PContext),
+    .init           = atrac3p_decode_init,
+    .close          = atrac3p_decode_close,
+    FF_CODEC_DECODE_CB(atrac3p_decode_frame),
 };

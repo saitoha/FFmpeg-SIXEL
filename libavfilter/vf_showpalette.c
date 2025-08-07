@@ -21,14 +21,13 @@
  * Display frame palette (AV_PIX_FMT_PAL8)
  */
 
-#include "libavutil/avassert.h"
 #include "libavutil/opt.h"
 #include "avfilter.h"
+#include "filters.h"
 #include "formats.h"
-#include "internal.h"
 #include "video.h"
 
-typedef struct {
+typedef struct ShowPaletteContext {
     const AVClass *class;
     int size;
 } ShowPaletteContext;
@@ -42,20 +41,19 @@ static const AVOption showpalette_options[] = {
 
 AVFILTER_DEFINE_CLASS(showpalette);
 
-static int query_formats(AVFilterContext *ctx)
+static int query_formats(const AVFilterContext *ctx,
+                         AVFilterFormatsConfig **cfg_in,
+                         AVFilterFormatsConfig **cfg_out)
 {
     static const enum AVPixelFormat in_fmts[]  = {AV_PIX_FMT_PAL8,  AV_PIX_FMT_NONE};
     static const enum AVPixelFormat out_fmts[] = {AV_PIX_FMT_RGB32, AV_PIX_FMT_NONE};
-    AVFilterFormats *in  = ff_make_format_list(in_fmts);
-    AVFilterFormats *out = ff_make_format_list(out_fmts);
-    if (!in || !out) {
-        av_freep(&in);
-        av_freep(&out);
-        return AVERROR(ENOMEM);
-    }
-    ff_formats_ref(in,  &ctx->inputs[0]->out_formats);
-    ff_formats_ref(out, &ctx->outputs[0]->in_formats);
-    return 0;
+    int ret = ff_formats_ref(ff_make_format_list(in_fmts),
+                             &cfg_in[0]->formats);
+    if (ret < 0)
+        return ret;
+
+    return ff_formats_ref(ff_make_format_list(out_fmts),
+                          &cfg_out[0]->formats);
 }
 
 static int config_output(AVFilterLink *outlink)
@@ -66,7 +64,7 @@ static int config_output(AVFilterLink *outlink)
     return 0;
 }
 
-static int disp_palette(AVFrame *out, const AVFrame *in, int size)
+static void disp_palette(AVFrame *out, const AVFrame *in, int size)
 {
     int x, y, i, j;
     uint32_t *dst = (uint32_t *)out->data[0];
@@ -78,15 +76,13 @@ static int disp_palette(AVFrame *out, const AVFrame *in, int size)
             for (j = 0; j < size; j++)
                 for (i = 0; i < size; i++)
                     dst[(y*dst_linesize + x) * size + j*dst_linesize + i] = pal[y*16 + x];
-    return 0;
 }
 
 static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 {
-    int ret;
     AVFrame *out;
     AVFilterContext *ctx = inlink->dst;
-    const ShowPaletteContext *s= ctx->priv;
+    const ShowPaletteContext *s = ctx->priv;
     AVFilterLink *outlink = ctx->outputs[0];
 
     out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
@@ -95,9 +91,9 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
         return AVERROR(ENOMEM);
     }
     av_frame_copy_props(out, in);
-    ret = disp_palette(out, in, s->size);
+    disp_palette(out, in, s->size);
     av_frame_free(&in);
-    return ret < 0 ? ret : ff_filter_frame(outlink, out);
+    return ff_filter_frame(outlink, out);
 }
 
 static const AVFilterPad showpalette_inputs[] = {
@@ -106,7 +102,6 @@ static const AVFilterPad showpalette_inputs[] = {
         .type         = AVMEDIA_TYPE_VIDEO,
         .filter_frame = filter_frame,
     },
-    { NULL }
 };
 
 static const AVFilterPad showpalette_outputs[] = {
@@ -115,16 +110,14 @@ static const AVFilterPad showpalette_outputs[] = {
         .type         = AVMEDIA_TYPE_VIDEO,
         .config_props = config_output,
     },
-    { NULL }
 };
 
-AVFilter ff_vf_showpalette = {
-    .name          = "showpalette",
-    .description   = NULL_IF_CONFIG_SMALL("Display frame palette"),
+const FFFilter ff_vf_showpalette = {
+    .p.name        = "showpalette",
+    .p.description = NULL_IF_CONFIG_SMALL("Display frame palette."),
+    .p.priv_class  = &showpalette_class,
     .priv_size     = sizeof(ShowPaletteContext),
-    .query_formats = query_formats,
-    .inputs        = showpalette_inputs,
-    .outputs       = showpalette_outputs,
-    .priv_class    = &showpalette_class,
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
+    FILTER_INPUTS(showpalette_inputs),
+    FILTER_OUTPUTS(showpalette_outputs),
+    FILTER_QUERY_FUNC2(query_formats),
 };

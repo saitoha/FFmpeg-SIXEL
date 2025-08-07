@@ -23,11 +23,17 @@
 #include <inttypes.h>
 
 #include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
 #include "bswapdsp.h"
 #include "canopus.h"
 #include "get_bits.h"
 #include "avcodec.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "thread.h"
+
+#define VLC_BITS 7
+#define VLC_DEPTH 2
+
 
 typedef struct CLLCContext {
     AVCodecContext *avctx;
@@ -41,23 +47,24 @@ static int read_code_table(CLLCContext *ctx, GetBitContext *gb, VLC *vlc)
 {
     uint8_t symbols[256];
     uint8_t bits[256];
-    uint16_t codes[256];
-    int num_lens, num_codes, num_codes_sum, prefix;
+    int num_lens, num_codes, num_codes_sum;
     int i, j, count;
 
-    prefix        = 0;
     count         = 0;
     num_codes_sum = 0;
 
     num_lens = get_bits(gb, 5);
+
+    if (num_lens > VLC_BITS * VLC_DEPTH) {
+        av_log(ctx->avctx, AV_LOG_ERROR, "To long VLCs %d\n", num_lens);
+        return AVERROR_INVALIDDATA;
+    }
 
     for (i = 0; i < num_lens; i++) {
         num_codes      = get_bits(gb, 9);
         num_codes_sum += num_codes;
 
         if (num_codes_sum > 256) {
-            vlc->table = NULL;
-
             av_log(ctx->avctx, AV_LOG_ERROR,
                    "Too many VLCs (%d) to be read.\n", num_codes_sum);
             return AVERROR_INVALIDDATA;
@@ -66,16 +73,13 @@ static int read_code_table(CLLCContext *ctx, GetBitContext *gb, VLC *vlc)
         for (j = 0; j < num_codes; j++) {
             symbols[count] = get_bits(gb, 8);
             bits[count]    = i + 1;
-            codes[count]   = prefix++;
 
             count++;
         }
-
-        prefix <<= 1;
     }
 
-    return ff_init_vlc_sparse(vlc, 7, count, bits, 1, 1,
-                              codes, 2, 2, symbols, 1, 1, 0);
+    return ff_vlc_init_from_lengths(vlc, VLC_BITS, count, bits, 1,
+                                    symbols, 1, 1, 0, 0, ctx->avctx);
 }
 
 /*
@@ -101,7 +105,7 @@ static int read_argb_line(CLLCContext *ctx, GetBitContext *gb, int *top_left,
     for (i = 0; i < ctx->avctx->width; i++) {
         /* Always get the alpha component */
         UPDATE_CACHE(bits, gb);
-        GET_VLC(code, bits, gb, vlc[0].table, 7, 2);
+        GET_VLC(code, bits, gb, vlc[0].table, VLC_BITS, VLC_DEPTH);
 
         pred[0] += code;
         dst[0]   = pred[0];
@@ -110,21 +114,21 @@ static int read_argb_line(CLLCContext *ctx, GetBitContext *gb, int *top_left,
         if (dst[0]) {
             /* Red */
             UPDATE_CACHE(bits, gb);
-            GET_VLC(code, bits, gb, vlc[1].table, 7, 2);
+            GET_VLC(code, bits, gb, vlc[1].table, VLC_BITS, VLC_DEPTH);
 
             pred[1] += code;
             dst[1]   = pred[1];
 
             /* Green */
             UPDATE_CACHE(bits, gb);
-            GET_VLC(code, bits, gb, vlc[2].table, 7, 2);
+            GET_VLC(code, bits, gb, vlc[2].table, VLC_BITS, VLC_DEPTH);
 
             pred[2] += code;
             dst[2]   = pred[2];
 
             /* Blue */
             UPDATE_CACHE(bits, gb);
-            GET_VLC(code, bits, gb, vlc[3].table, 7, 2);
+            GET_VLC(code, bits, gb, vlc[3].table, VLC_BITS, VLC_DEPTH);
 
             pred[3] += code;
             dst[3]   = pred[3];
@@ -166,7 +170,7 @@ static int read_rgb24_component_line(CLLCContext *ctx, GetBitContext *gb,
     /* Simultaneously read and restore the line */
     for (i = 0; i < ctx->avctx->width; i++) {
         UPDATE_CACHE(bits, gb);
-        GET_VLC(code, bits, gb, vlc->table, 7, 2);
+        GET_VLC(code, bits, gb, vlc->table, VLC_BITS, VLC_DEPTH);
 
         pred  += code;
         dst[0] = pred;
@@ -195,7 +199,7 @@ static int read_yuv_component_line(CLLCContext *ctx, GetBitContext *gb,
     /* Simultaneously read and restore the line */
     for (i = 0; i < ctx->avctx->width >> is_chroma; i++) {
         UPDATE_CACHE(bits, gb);
-        GET_VLC(code, bits, gb, vlc->table, 7, 2);
+        GET_VLC(code, bits, gb, vlc->table, VLC_BITS, VLC_DEPTH);
 
         pred     += code;
         outbuf[i] = pred;
@@ -231,8 +235,8 @@ static int decode_argb_frame(CLLCContext *ctx, GetBitContext *gb, AVFrame *pic)
     for (i = 0; i < 4; i++) {
         ret = read_code_table(ctx, gb, &vlc[i]);
         if (ret < 0) {
-            for (j = 0; j <= i; j++)
-                ff_free_vlc(&vlc[j]);
+            for (j = 0; j < i; j++)
+                ff_vlc_free(&vlc[j]);
 
             av_log(ctx->avctx, AV_LOG_ERROR,
                    "Could not read code table %d.\n", i);
@@ -248,7 +252,7 @@ static int decode_argb_frame(CLLCContext *ctx, GetBitContext *gb, AVFrame *pic)
     }
 
     for (i = 0; i < 4; i++)
-        ff_free_vlc(&vlc[i]);
+        ff_vlc_free(&vlc[i]);
 
     return 0;
 }
@@ -274,8 +278,8 @@ static int decode_rgb24_frame(CLLCContext *ctx, GetBitContext *gb, AVFrame *pic)
     for (i = 0; i < 3; i++) {
         ret = read_code_table(ctx, gb, &vlc[i]);
         if (ret < 0) {
-            for (j = 0; j <= i; j++)
-                ff_free_vlc(&vlc[j]);
+            for (j = 0; j < i; j++)
+                ff_vlc_free(&vlc[j]);
 
             av_log(ctx->avctx, AV_LOG_ERROR,
                    "Could not read code table %d.\n", i);
@@ -292,7 +296,7 @@ static int decode_rgb24_frame(CLLCContext *ctx, GetBitContext *gb, AVFrame *pic)
     }
 
     for (i = 0; i < 3; i++)
-        ff_free_vlc(&vlc[i]);
+        ff_vlc_free(&vlc[i]);
 
     return 0;
 }
@@ -327,8 +331,8 @@ static int decode_yuv_frame(CLLCContext *ctx, GetBitContext *gb, AVFrame *pic)
     for (i = 0; i < 2; i++) {
         ret = read_code_table(ctx, gb, &vlc[i]);
         if (ret < 0) {
-            for (j = 0; j <= i; j++)
-                ff_free_vlc(&vlc[j]);
+            for (j = 0; j < i; j++)
+                ff_vlc_free(&vlc[j]);
 
             av_log(ctx->avctx, AV_LOG_ERROR,
                    "Could not read code table %d.\n", i);
@@ -347,17 +351,16 @@ static int decode_yuv_frame(CLLCContext *ctx, GetBitContext *gb, AVFrame *pic)
     }
 
     for (i = 0; i < 2; i++)
-        ff_free_vlc(&vlc[i]);
+        ff_vlc_free(&vlc[i]);
 
     return 0;
 }
 
-static int cllc_decode_frame(AVCodecContext *avctx, void *data,
+static int cllc_decode_frame(AVCodecContext *avctx, AVFrame *pic,
                              int *got_picture_ptr, AVPacket *avpkt)
 {
     CLLCContext *ctx = avctx->priv_data;
-    AVFrame *pic = data;
-    uint8_t *src = avpkt->data;
+    const uint8_t *src = avpkt->data;
     uint32_t info_tag, info_offset;
     int data_size;
     GetBitContext gb;
@@ -412,12 +415,15 @@ static int cllc_decode_frame(AVCodecContext *avctx, void *data,
     coding_type = (AV_RL32(src) >> 8) & 0xFF;
     av_log(avctx, AV_LOG_DEBUG, "Frame coding type: %d\n", coding_type);
 
+    if(get_bits_left(&gb) < avctx->height * avctx->width)
+        return AVERROR_INVALIDDATA;
+
     switch (coding_type) {
     case 0:
         avctx->pix_fmt             = AV_PIX_FMT_YUV422P;
         avctx->bits_per_raw_sample = 8;
 
-        if ((ret = ff_get_buffer(avctx, pic, 0)) < 0)
+        if ((ret = ff_thread_get_buffer(avctx, pic, 0)) < 0)
             return ret;
 
         ret = decode_yuv_frame(ctx, &gb, pic);
@@ -430,7 +436,7 @@ static int cllc_decode_frame(AVCodecContext *avctx, void *data,
         avctx->pix_fmt             = AV_PIX_FMT_RGB24;
         avctx->bits_per_raw_sample = 8;
 
-        if ((ret = ff_get_buffer(avctx, pic, 0)) < 0)
+        if ((ret = ff_thread_get_buffer(avctx, pic, 0)) < 0)
             return ret;
 
         ret = decode_rgb24_frame(ctx, &gb, pic);
@@ -442,7 +448,7 @@ static int cllc_decode_frame(AVCodecContext *avctx, void *data,
         avctx->pix_fmt             = AV_PIX_FMT_ARGB;
         avctx->bits_per_raw_sample = 8;
 
-        if ((ret = ff_get_buffer(avctx, pic, 0)) < 0)
+        if ((ret = ff_thread_get_buffer(avctx, pic, 0)) < 0)
             return ret;
 
         ret = decode_argb_frame(ctx, &gb, pic);
@@ -454,9 +460,6 @@ static int cllc_decode_frame(AVCodecContext *avctx, void *data,
         av_log(avctx, AV_LOG_ERROR, "Unknown coding type: %d.\n", coding_type);
         return AVERROR_INVALIDDATA;
     }
-
-    pic->key_frame = 1;
-    pic->pict_type = AV_PICTURE_TYPE_I;
 
     *got_picture_ptr = 1;
 
@@ -486,14 +489,14 @@ static av_cold int cllc_decode_init(AVCodecContext *avctx)
     return 0;
 }
 
-AVCodec ff_cllc_decoder = {
-    .name           = "cllc",
-    .long_name      = NULL_IF_CONFIG_SMALL("Canopus Lossless Codec"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_CLLC,
+const FFCodec ff_cllc_decoder = {
+    .p.name         = "cllc",
+    CODEC_LONG_NAME("Canopus Lossless Codec"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_CLLC,
     .priv_data_size = sizeof(CLLCContext),
     .init           = cllc_decode_init,
-    .decode         = cllc_decode_frame,
+    FF_CODEC_DECODE_CB(cllc_decode_frame),
     .close          = cllc_decode_close,
-    .capabilities   = CODEC_CAP_DR1,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_FRAME_THREADS,
 };

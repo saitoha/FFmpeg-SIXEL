@@ -26,74 +26,12 @@
  * floating-point AC-3 encoder.
  */
 
-#define CONFIG_AC3ENC_FLOAT 1
-#include "internal.h"
+#define AC3ENC_FLOAT 1
 #include "audiodsp.h"
 #include "ac3enc.h"
+#include "codec_internal.h"
 #include "eac3enc.h"
 #include "kbdwin.h"
-
-
-#define AC3ENC_TYPE AC3ENC_TYPE_AC3
-#include "ac3enc_opts_template.c"
-static const AVClass ac3enc_class = {
-    .class_name = "AC-3 Encoder",
-    .item_name  = av_default_item_name,
-    .option     = ac3_options,
-    .version    = LIBAVUTIL_VERSION_INT,
-};
-
-#include "ac3enc_template.c"
-
-
-/**
- * Finalize MDCT and free allocated memory.
- *
- * @param s  AC-3 encoder private context
- */
-av_cold void ff_ac3_float_mdct_end(AC3EncodeContext *s)
-{
-    ff_mdct_end(&s->mdct);
-    av_freep(&s->mdct_window);
-}
-
-
-/**
- * Initialize MDCT tables.
- *
- * @param s  AC-3 encoder private context
- * @return   0 on success, negative error code on failure
- */
-av_cold int ff_ac3_float_mdct_init(AC3EncodeContext *s)
-{
-    float *window;
-    int i, n, n2;
-
-    n  = 1 << 9;
-    n2 = n >> 1;
-
-    window = av_malloc_array(n, sizeof(*window));
-    if (!window) {
-        av_log(s->avctx, AV_LOG_ERROR, "Cannot allocate memory.\n");
-        return AVERROR(ENOMEM);
-    }
-    ff_kbd_window_init(window, 5.0, n2);
-    for (i = 0; i < n2; i++)
-        window[n-1-i] = window[i];
-    s->mdct_window = window;
-
-    return ff_mdct_init(&s->mdct, 9, 0, -2.0 / n);
-}
-
-
-/*
- * Normalize the input samples.
- * Not needed for the floating-point encoder.
- */
-static int normalize_samples(AC3EncodeContext *s)
-{
-    return 0;
-}
 
 
 /*
@@ -108,12 +46,6 @@ static void scale_coefficients(AC3EncodeContext *s)
                                chan_size * (s->channels + cpl));
 }
 
-static void sum_square_butterfly(AC3EncodeContext *s, float sum[4],
-                                 const float *coef0, const float *coef1,
-                                 int len)
-{
-    s->ac3dsp.sum_square_butterfly_float(sum, coef0, coef1, len);
-}
 
 /*
  * Clip MDCT coefficients to allowable range.
@@ -121,7 +53,7 @@ static void sum_square_butterfly(AC3EncodeContext *s, float sum[4],
 static void clip_coefficients(AudioDSPContext *adsp, float *coef,
                               unsigned int len)
 {
-    adsp->vector_clipf(coef, coef, COEF_MIN, COEF_MAX, len);
+    adsp->vector_clipf(coef, coef, len, COEF_MIN, COEF_MAX);
 }
 
 
@@ -136,27 +68,63 @@ static CoefType calc_cpl_coord(CoefSumType energy_ch, CoefSumType energy_cpl)
     return FFMIN(coord, COEF_MAX);
 }
 
+static void sum_square_butterfly(AC3EncodeContext *s, float sum[4],
+                                 const float *coef0, const float *coef1,
+                                 int len)
+{
+    s->ac3dsp.sum_square_butterfly_float(sum, coef0, coef1, len);
+}
+
+#include "ac3enc_template.c"
+
+/**
+ * Initialize MDCT tables.
+ *
+ * @param s  AC-3 encoder private context
+ * @return   0 on success, negative error code on failure
+ */
+static av_cold int ac3_float_mdct_init(AC3EncodeContext *s)
+{
+    const float scale = -2.0 / AC3_WINDOW_SIZE;
+
+    ff_kbd_window_init(s->mdct_window_float, 5.0, AC3_BLOCK_SIZE);
+
+    return av_tx_init(&s->tx, &s->tx_fn, AV_TX_FLOAT_MDCT, 0,
+                      AC3_BLOCK_SIZE, &scale, 0);
+}
+
+
 av_cold int ff_ac3_float_encode_init(AVCodecContext *avctx)
 {
     AC3EncodeContext *s = avctx->priv_data;
-    s->fdsp = avpriv_float_dsp_alloc(avctx->flags & CODEC_FLAG_BITEXACT);
+    int ret;
+
+    s->encode_frame            = encode_frame;
+    s->fdsp = avpriv_float_dsp_alloc(avctx->flags & AV_CODEC_FLAG_BITEXACT);
     if (!s->fdsp)
         return AVERROR(ENOMEM);
+
+    ret = ac3_float_mdct_init(s);
+    if (ret < 0)
+        return ret;
+
     return ff_ac3_encode_init(avctx);
 }
 
-AVCodec ff_ac3_encoder = {
-    .name            = "ac3",
-    .long_name       = NULL_IF_CONFIG_SMALL("ATSC A/52A (AC-3)"),
-    .type            = AVMEDIA_TYPE_AUDIO,
-    .id              = AV_CODEC_ID_AC3,
+const FFCodec ff_ac3_encoder = {
+    .p.name          = "ac3",
+    CODEC_LONG_NAME("ATSC A/52A (AC-3)"),
+    .p.type          = AVMEDIA_TYPE_AUDIO,
+    .p.id            = AV_CODEC_ID_AC3,
+    .p.capabilities  = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
     .priv_data_size  = sizeof(AC3EncodeContext),
     .init            = ff_ac3_float_encode_init,
-    .encode2         = ff_ac3_float_encode_frame,
+    FF_CODEC_ENCODE_CB(ff_ac3_encode_frame),
     .close           = ff_ac3_encode_close,
-    .sample_fmts     = (const enum AVSampleFormat[]){ AV_SAMPLE_FMT_FLTP,
-                                                      AV_SAMPLE_FMT_NONE },
-    .priv_class      = &ac3enc_class,
-    .channel_layouts = ff_ac3_channel_layouts,
-    .defaults        = ac3_defaults,
+    CODEC_SAMPLEFMTS(AV_SAMPLE_FMT_FLTP),
+    .p.priv_class    = &ff_ac3enc_class,
+    CODEC_SAMPLERATES_ARRAY(ff_ac3_sample_rate_tab),
+    CODEC_CH_LAYOUTS_ARRAY(ff_ac3_ch_layouts),
+    .defaults        = ff_ac3_enc_defaults,
+    .caps_internal   = FF_CODEC_CAP_INIT_CLEANUP,
 };

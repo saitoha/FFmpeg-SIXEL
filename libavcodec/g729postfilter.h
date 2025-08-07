@@ -18,10 +18,11 @@
  * License along with FFmpeg; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
-#ifndef FFMPEG_G729POSTFILTER_H
-#define FFMPEG_G729POSTFILTER_H
+#ifndef AVCODEC_G729POSTFILTER_H
+#define AVCODEC_G729POSTFILTER_H
 
 #include <stdint.h>
+#include "acelp_pitch_delay.h"
 #include "audiodsp.h"
 
 /**
@@ -78,15 +79,15 @@
 /**
  * \brief Signal postfiltering (4.2)
  * \param dsp initialized DSP context
- * \param ht_prev_data [in/out] (Q12) pointer to variable receiving tilt
+ * \param[in,out] ht_prev_data  (Q12) pointer to variable receiving tilt
  *                     compensation filter data from previous subframe
- * \param voicing [in/out] (Q0) pointer to variable receiving voicing decision
+ * \param[in,out] voicing  (Q0) pointer to variable receiving voicing decision
  * \param lp_filter_coeffs (Q12) LP filter coefficients
  * \param pitch_delay_int integer part of the pitch delay
- * \param residual [in/out] (Q0) residual signal buffer (used in long-term postfilter)
- * \param res_filter_data [in/out] (Q0) speech data of previous subframe
- * \param pos_filter_data [in/out] (Q0) previous speech data for short-term postfilter
- * \param speech [in/out] (Q0) signal buffer
+ * \param[in,out] residual  (Q0) residual signal buffer (used in long-term postfilter)
+ * \param[in,out] res_filter_data  (Q0) speech data of previous subframe
+ * \param[in,out] pos_filter_data  (Q0) previous speech data for short-term postfilter
+ * \param[in,out] speech  (Q0) signal buffer
  * \param subframe_size size of subframe
  *
  * Filtering has the following  stages:
@@ -104,7 +105,7 @@ void ff_g729_postfilter(AudioDSPContext *adsp, int16_t* ht_prev_data, int* voici
  * \brief Adaptive gain control (4.2.4)
  * \param gain_before (Q0) gain of speech before applying postfilters
  * \param gain_after  (Q0) gain of speech after applying postfilters
- * \param speech [in/out] (Q0) signal buffer
+ * \param[in,out] speech  (Q0) signal buffer
  * \param subframe_size length of subframe
  * \param gain_prev (Q12) previous value of gain coefficient
  *
@@ -113,4 +114,4 @@ void ff_g729_postfilter(AudioDSPContext *adsp, int16_t* ht_prev_data, int* voici
 int16_t ff_g729_adaptive_gain_control(int gain_before, int gain_after, int16_t *speech,
                                    int subframe_size, int16_t gain_prev);
 
-#endif // FFMPEG_G729POSTFILTER_H
+#endif // AVCODEC_G729POSTFILTER_H

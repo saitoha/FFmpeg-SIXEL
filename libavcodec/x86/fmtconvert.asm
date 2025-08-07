@@ -21,7 +21,7 @@
 
 %include "libavutil/x86/x86util.asm"
 
-SECTION_TEXT
+SECTION .text
 
 ;------------------------------------------------------------------------------
 ; void ff_int32_to_float_fmul_scalar(float *dst, const int32_t *src, float mul,
@@ -39,33 +39,22 @@ cglobal int32_to_float_fmul_scalar, 4, 4, %1, dst, src, mul, len
     movss   m0, mulm
 %endif
     SPLATD  m0
-    shl     lenq, 2
+    shl     lend, 2
     add     srcq, lenq
     add     dstq, lenq
     neg     lenq
 .loop:
-%if cpuflag(sse2)
     cvtdq2ps  m1, [srcq+lenq   ]
     cvtdq2ps  m2, [srcq+lenq+16]
-%else
-    cvtpi2ps  m1, [srcq+lenq   ]
-    cvtpi2ps  m3, [srcq+lenq+ 8]
-    cvtpi2ps  m2, [srcq+lenq+16]
-    cvtpi2ps  m4, [srcq+lenq+24]
-    movlhps   m1, m3
-    movlhps   m2, m4
-%endif
     mulps     m1, m0
     mulps     m2, m0
     mova  [dstq+lenq   ], m1
     mova  [dstq+lenq+16], m2
     add     lenq, 32
     jl .loop
-    REP_RET
+    RET
 %endmacro
 
-INIT_XMM sse
-INT32_TO_FLOAT_FMUL_SCALAR 5
 INIT_XMM sse2
 INT32_TO_FLOAT_FMUL_SCALAR 3
 
@@ -82,17 +71,8 @@ cglobal int32_to_float_fmul_array8, 5, 5, 5, c, dst, src, mul, len
 .loop:
     movss     m0, [mulq]
     SPLATD    m0
-%if cpuflag(sse2)
     cvtdq2ps  m1, [srcq+lenq   ]
     cvtdq2ps  m2, [srcq+lenq+16]
-%else
-    cvtpi2ps  m1, [srcq+lenq   ]
-    cvtpi2ps  m3, [srcq+lenq+ 8]
-    cvtpi2ps  m2, [srcq+lenq+16]
-    cvtpi2ps  m4, [srcq+lenq+24]
-    movlhps   m1, m3
-    movlhps   m2, m4
-%endif
     mulps     m1, m0
     mulps     m2, m0
     mova  [dstq+lenq   ], m1
@@ -100,11 +80,8 @@ cglobal int32_to_float_fmul_array8, 5, 5, 5, c, dst, src, mul, len
     add     mulq, 4
     add     lenq, 32
     jl .loop
-    REP_RET
+    RET
 %endmacro
 
-INIT_XMM sse
-INT32_TO_FLOAT_FMUL_ARRAY8
 INIT_XMM sse2
 INT32_TO_FLOAT_FMUL_ARRAY8
-

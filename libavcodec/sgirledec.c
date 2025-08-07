@@ -29,19 +29,12 @@
 #include "libavutil/common.h"
 
 #include "avcodec.h"
-#include "internal.h"
-
-typedef struct SGIRLEContext {
-    AVFrame *frame;
-} SGIRLEContext;
+#include "codec_internal.h"
+#include "decode.h"
 
 static av_cold int sgirle_decode_init(AVCodecContext *avctx)
 {
-    SGIRLEContext *s = avctx->priv_data;
     avctx->pix_fmt = AV_PIX_FMT_BGR8;
-    s->frame = av_frame_alloc();
-    if (!s->frame)
-        return AVERROR(ENOMEM);
     return 0;
 }
 
@@ -117,44 +110,33 @@ static int decode_sgirle8(AVCodecContext *avctx, uint8_t *dst,
     return 0;
 }
 
-static int sgirle_decode_frame(AVCodecContext *avctx, void *data,
+static int sgirle_decode_frame(AVCodecContext *avctx, AVFrame *frame,
                                int *got_frame, AVPacket *avpkt)
 {
-    SGIRLEContext *s = avctx->priv_data;
     int ret;
 
-    if ((ret = ff_reget_buffer(avctx, s->frame)) < 0)
+    if (avpkt->size * 192ll / 2 < avctx->width * avctx->height)
+        return AVERROR_INVALIDDATA;
+
+    if ((ret = ff_get_buffer(avctx, frame, 0)) < 0)
         return ret;
 
-    ret = decode_sgirle8(avctx, s->frame->data[0], avpkt->data, avpkt->size,
-                         avctx->width, avctx->height, s->frame->linesize[0]);
+    ret = decode_sgirle8(avctx, frame->data[0], avpkt->data, avpkt->size,
+                         avctx->width, avctx->height, frame->linesize[0]);
     if (ret < 0)
         return ret;
 
     *got_frame = 1;
-    if ((ret = av_frame_ref(data, s->frame)) < 0)
-        return ret;
 
     return avpkt->size;
 }
 
-static av_cold int sgirle_decode_end(AVCodecContext *avctx)
-{
-    SGIRLEContext *s = avctx->priv_data;
-
-    av_frame_free(&s->frame);
-
-    return 0;
-}
-
-AVCodec ff_sgirle_decoder = {
-    .name           = "sgirle",
-    .long_name      = NULL_IF_CONFIG_SMALL("Silicon Graphics RLE 8-bit video"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_SGIRLE,
-    .priv_data_size = sizeof(SGIRLEContext),
+const FFCodec ff_sgirle_decoder = {
+    .p.name         = "sgirle",
+    CODEC_LONG_NAME("Silicon Graphics RLE 8-bit video"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_SGIRLE,
     .init           = sgirle_decode_init,
-    .close          = sgirle_decode_end,
-    .decode         = sgirle_decode_frame,
-    .capabilities   = CODEC_CAP_DR1,
+    FF_CODEC_DECODE_CB(sgirle_decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1,
 };

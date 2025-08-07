@@ -25,6 +25,7 @@
 #include "libavutil/avstring.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mathematics.h"
+#include "libavutil/mem.h"
 
 static int usage(const char *argv0, int ret)
 {
@@ -52,22 +53,23 @@ struct Tracks {
     int multiple_tracks_per_file;
 };
 
-static void set_codec_str(AVCodecContext *codec, char *str, int size)
+static void set_codec_str(AVCodecParameters *codecpar, char *str, int size)
 {
-    switch (codec->codec_id) {
+    switch (codecpar->codec_id) {
     case AV_CODEC_ID_H264:
         snprintf(str, size, "avc1");
-        if (codec->extradata_size >= 4 && codec->extradata[0] == 1) {
+        if (codecpar->extradata_size >= 4 && codecpar->extradata[0] == 1) {
             av_strlcatf(str, size, ".%02x%02x%02x",
-                        codec->extradata[1], codec->extradata[2], codec->extradata[3]);
+                        codecpar->extradata[1], codecpar->extradata[2],
+                        codecpar->extradata[3]);
         }
         break;
     case AV_CODEC_ID_AAC:
         snprintf(str, size, "mp4a.40"); // 0x40 is the mp4 object type for AAC
-        if (codec->extradata_size >= 2) {
-            int aot = codec->extradata[0] >> 3;
+        if (codecpar->extradata_size >= 2) {
+            int aot = codecpar->extradata[0] >> 3;
             if (aot == 31)
-                aot = ((AV_RB16(codec->extradata) >> 5) & 0x3f) + 32;
+                aot = ((AV_RB16(codecpar->extradata) >> 5) & 0x3f) + 32;
             av_strlcatf(str, size, ".%d", aot);
         }
         break;
@@ -117,20 +119,18 @@ static int handle_file(struct Tracks *tracks, const char *file)
 {
     AVFormatContext *ctx = NULL;
     int err = 0, i, orig_tracks = tracks->nb_tracks;
-    char errbuf[50], *ptr;
+    char *ptr;
     struct Track *track;
 
     err = avformat_open_input(&ctx, file, NULL, NULL);
     if (err < 0) {
-        av_strerror(err, errbuf, sizeof(errbuf));
-        fprintf(stderr, "Unable to open %s: %s\n", file, errbuf);
+        fprintf(stderr, "Unable to open %s: %s\n", file, av_err2str(err));
         return 1;
     }
 
     err = avformat_find_stream_info(ctx, NULL);
     if (err < 0) {
-        av_strerror(err, errbuf, sizeof(errbuf));
-        fprintf(stderr, "Unable to identify %s: %s\n", file, errbuf);
+        fprintf(stderr, "Unable to identify %s: %s\n", file, av_err2str(err));
         goto fail;
     }
 
@@ -145,7 +145,7 @@ static int handle_file(struct Tracks *tracks, const char *file)
         struct Track **temp;
         AVStream *st = ctx->streams[i];
 
-        if (st->codec->bit_rate == 0) {
+        if (st->codecpar->bit_rate == 0) {
             fprintf(stderr, "Skipping track %d in %s as it has zero bitrate\n",
                     st->id, file);
             continue;
@@ -170,12 +170,12 @@ static int handle_file(struct Tracks *tracks, const char *file)
         if ((ptr = strrchr(file, '/')))
             track->name = ptr + 1;
 
-        track->bitrate   = st->codec->bit_rate;
+        track->bitrate   = st->codecpar->bit_rate;
         track->track_id  = st->id;
         track->timescale = st->time_base.den;
         track->duration  = st->duration;
-        track->is_audio  = st->codec->codec_type == AVMEDIA_TYPE_AUDIO;
-        track->is_video  = st->codec->codec_type == AVMEDIA_TYPE_VIDEO;
+        track->is_audio  = st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO;
+        track->is_video  = st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO;
 
         if (!track->is_audio && !track->is_video) {
             fprintf(stderr,
@@ -190,14 +190,14 @@ static int handle_file(struct Tracks *tracks, const char *file)
                                                 track->timescale, AV_ROUND_UP));
 
         if (track->is_audio) {
-            track->channels    = st->codec->channels;
-            track->sample_rate = st->codec->sample_rate;
+            track->channels    = st->codecpar->ch_layout.nb_channels;
+            track->sample_rate = st->codecpar->sample_rate;
         }
         if (track->is_video) {
-            track->width  = st->codec->width;
-            track->height = st->codec->height;
+            track->width  = st->codecpar->width;
+            track->height = st->codecpar->height;
         }
-        set_codec_str(st->codec, track->codec_str, sizeof(track->codec_str));
+        set_codec_str(st->codecpar, track->codec_str, sizeof(track->codec_str));
 
         tracks->nb_tracks++;
     }
@@ -361,8 +361,6 @@ int main(int argc, char **argv)
     const char *out = NULL;
     struct Tracks tracks = { 0 };
     int i;
-
-    av_register_all();
 
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-out")) {

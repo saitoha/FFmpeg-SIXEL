@@ -38,6 +38,10 @@
 #include <string.h>
 #include "libavutil/avstring.h"
 
+#if HAVE_GETAUXVAL
+#include <sys/auxv.h>
+#endif
+
 #define AT_HWCAP        16
 
 /* Relevant HWCAP values from kernel headers */
@@ -47,6 +51,19 @@
 #define HWCAP_NEON      (1 << 12)
 #define HWCAP_VFPv3     (1 << 13)
 #define HWCAP_TLS       (1 << 15)
+
+static int get_auxval(uint32_t *hwcap)
+{
+#if HAVE_GETAUXVAL
+    unsigned long ret = ff_getauxval(AT_HWCAP);
+    if (ret == 0)
+        return -1;
+    *hwcap = ret;
+    return 0;
+#else
+    return -1;
+#endif
+}
 
 static int get_hwcap(uint32_t *hwcap)
 {
@@ -106,9 +123,10 @@ int ff_get_cpu_flags_arm(void)
     int flags = CORE_CPU_FLAGS;
     uint32_t hwcap;
 
-    if (get_hwcap(&hwcap) < 0)
-        if (get_cpuinfo(&hwcap) < 0)
-            return flags;
+    if (get_auxval(&hwcap) < 0)
+        if (get_hwcap(&hwcap) < 0)
+            if (get_cpuinfo(&hwcap) < 0)
+                return flags;
 
 #define check_cap(cap, flag) do {               \
         if (hwcap & HWCAP_ ## cap)              \
@@ -128,7 +146,7 @@ int ff_get_cpu_flags_arm(void)
        trickle down. */
     if (flags & (AV_CPU_FLAG_VFPV3 | AV_CPU_FLAG_NEON))
         flags |= AV_CPU_FLAG_ARMV6T2;
-    else
+    else if (flags & (AV_CPU_FLAG_ARMV6T2 | AV_CPU_FLAG_ARMV6))
     /* Some functions use the 'setend' instruction which is deprecated on ARMv8
      * and serializing on some ARMv7 cores. This ensures such functions
      * are only enabled on ARMv6. */
@@ -136,6 +154,10 @@ int ff_get_cpu_flags_arm(void)
 
     if (flags & AV_CPU_FLAG_ARMV6T2)
         flags |= AV_CPU_FLAG_ARMV6;
+
+    /* set the virtual VFPv2 vector mode flag */
+    if ((flags & AV_CPU_FLAG_VFP) && !(flags & (AV_CPU_FLAG_VFPV3 | AV_CPU_FLAG_NEON)))
+        flags |= AV_CPU_FLAG_VFP_VM;
 
     return flags;
 }
@@ -154,3 +176,13 @@ int ff_get_cpu_flags_arm(void)
 }
 
 #endif
+
+size_t ff_get_cpu_max_align_arm(void)
+{
+    int flags = av_get_cpu_flags();
+
+    if (flags & AV_CPU_FLAG_NEON)
+        return 16;
+
+    return 8;
+}

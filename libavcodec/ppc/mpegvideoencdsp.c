@@ -17,22 +17,20 @@
  */
 
 #include "config.h"
+
 #include <stdint.h>
-#if HAVE_ALTIVEC_H
-#include <altivec.h>
-#endif
 
 #include "libavutil/attributes.h"
 #include "libavutil/cpu.h"
 #include "libavutil/ppc/cpu.h"
-#include "libavutil/ppc/types_altivec.h"
 #include "libavutil/ppc/util_altivec.h"
+
 #include "libavcodec/mpegvideoencdsp.h"
 
 #if HAVE_ALTIVEC
 
 #if HAVE_VSX
-static int pix_norm1_altivec(uint8_t *pix, int line_size)
+static int pix_norm1_altivec(const uint8_t *pix, ptrdiff_t line_size)
 {
     int i, s = 0;
     const vector unsigned int zero =
@@ -59,7 +57,7 @@ static int pix_norm1_altivec(uint8_t *pix, int line_size)
     return s;
 }
 #else
-static int pix_norm1_altivec(uint8_t *pix, int line_size)
+static int pix_norm1_altivec(const uint8_t *pix, ptrdiff_t line_size)
 {
     int i, s = 0;
     const vector unsigned int zero =
@@ -89,7 +87,7 @@ static int pix_norm1_altivec(uint8_t *pix, int line_size)
 #endif /* HAVE_VSX */
 
 #if HAVE_VSX
-static int pix_sum_altivec(uint8_t *pix, int line_size)
+static int pix_sum_altivec(const uint8_t *pix, ptrdiff_t line_size)
 {
     int i, s;
     const vector unsigned int zero =
@@ -117,7 +115,7 @@ static int pix_sum_altivec(uint8_t *pix, int line_size)
     return s;
 }
 #else
-static int pix_sum_altivec(uint8_t *pix, int line_size)
+static int pix_sum_altivec(const uint8_t *pix, ptrdiff_t line_size)
 {
     int i, s;
     const vector unsigned int zero =

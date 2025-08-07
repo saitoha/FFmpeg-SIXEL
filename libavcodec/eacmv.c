@@ -32,7 +32,8 @@
 #include "libavutil/intreadwrite.h"
 #include "libavutil/imgutils.h"
 #include "avcodec.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 
 typedef struct CmvContext {
     AVCodecContext *avctx;
@@ -50,11 +51,8 @@ static av_cold int cmv_decode_init(AVCodecContext *avctx){
 
     s->last_frame  = av_frame_alloc();
     s->last2_frame = av_frame_alloc();
-    if (!s->last_frame || !s->last2_frame) {
-        av_frame_free(&s->last_frame);
-        av_frame_free(&s->last2_frame);
+    if (!s->last_frame || !s->last2_frame)
         return AVERROR(ENOMEM);
-    }
 
     return 0;
 }
@@ -72,8 +70,8 @@ static void cmv_decode_intra(CmvContext * s, AVFrame *frame,
     }
 }
 
-static void cmv_motcomp(unsigned char *dst, int dst_stride,
-                        const unsigned char *src, int src_stride,
+static void cmv_motcomp(unsigned char *dst, ptrdiff_t dst_stride,
+                        const unsigned char *src, ptrdiff_t src_stride,
                         int x, int y,
                         int xoffset, int yoffset,
                         int width, int height){
@@ -171,15 +169,13 @@ static int cmv_process_header(CmvContext *s, const uint8_t *buf, const uint8_t *
 #define EA_PREAMBLE_SIZE 8
 #define MVIh_TAG MKTAG('M', 'V', 'I', 'h')
 
-static int cmv_decode_frame(AVCodecContext *avctx,
-                            void *data, int *got_frame,
-                            AVPacket *avpkt)
+static int cmv_decode_frame(AVCodecContext *avctx, AVFrame *frame,
+                            int *got_frame, AVPacket *avpkt)
 {
     const uint8_t *buf = avpkt->data;
     int buf_size = avpkt->size;
     CmvContext *s = avctx->priv_data;
     const uint8_t *buf_end = buf + buf_size;
-    AVFrame *frame = data;
     int ret;
 
     if (buf_end - buf < EA_PREAMBLE_SIZE)
@@ -191,32 +187,34 @@ static int cmv_decode_frame(AVCodecContext *avctx,
         if (ret < 0)
             return ret;
         if (size > buf_end - buf - EA_PREAMBLE_SIZE)
-            return -1;
+            return AVERROR_INVALIDDATA;
         buf += size;
     }
 
-    if (av_image_check_size(s->width, s->height, 0, s->avctx))
-        return -1;
+    if ((ret = av_image_check_size(s->width, s->height, 0, s->avctx)) < 0)
+        return ret;
+
+    buf += EA_PREAMBLE_SIZE;
+    if (!(buf[0]&1) && buf_end - buf < s->width * s->height * (int64_t)(100 - s->avctx->discard_damaged_percentage) / 100)
+        return AVERROR_INVALIDDATA;
 
     if ((ret = ff_get_buffer(avctx, frame, AV_GET_BUFFER_FLAG_REF)) < 0)
         return ret;
 
     memcpy(frame->data[1], s->palette, AVPALETTE_SIZE);
 
-    buf += EA_PREAMBLE_SIZE;
     if ((buf[0]&1)) {  // subtype
         cmv_decode_inter(s, frame, buf+2, buf_end);
-        frame->key_frame = 0;
+        frame->flags &= ~AV_FRAME_FLAG_KEY;
         frame->pict_type = AV_PICTURE_TYPE_P;
     }else{
-        frame->key_frame = 1;
+        frame->flags |= AV_FRAME_FLAG_KEY;
         frame->pict_type = AV_PICTURE_TYPE_I;
         cmv_decode_intra(s, frame, buf+2, buf_end);
     }
 
-    av_frame_unref(s->last2_frame);
-    av_frame_move_ref(s->last2_frame, s->last_frame);
-    if ((ret = av_frame_ref(s->last_frame, frame)) < 0)
+    FFSWAP(AVFrame*, s->last2_frame, s->last_frame);
+    if ((ret = av_frame_replace(s->last_frame, frame)) < 0)
         return ret;
 
     *got_frame = 1;
@@ -233,14 +231,15 @@ static av_cold int cmv_decode_end(AVCodecContext *avctx){
     return 0;
 }
 
-AVCodec ff_eacmv_decoder = {
-    .name           = "eacmv",
-    .long_name      = NULL_IF_CONFIG_SMALL("Electronic Arts CMV video"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_CMV,
+const FFCodec ff_eacmv_decoder = {
+    .p.name         = "eacmv",
+    CODEC_LONG_NAME("Electronic Arts CMV video"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_CMV,
     .priv_data_size = sizeof(CmvContext),
     .init           = cmv_decode_init,
     .close          = cmv_decode_end,
-    .decode         = cmv_decode_frame,
-    .capabilities   = CODEC_CAP_DR1,
+    FF_CODEC_DECODE_CB(cmv_decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };

@@ -17,6 +17,7 @@
  */
 
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 #include "libavutil/intreadwrite.h"
 
@@ -27,8 +28,8 @@ static int sup_read_header(AVFormatContext *s)
     AVStream *st = avformat_new_stream(s, NULL);
     if (!st)
         return AVERROR(ENOMEM);
-    st->codec->codec_type = AVMEDIA_TYPE_SUBTITLE;
-    st->codec->codec_id = AV_CODEC_ID_HDMV_PGS_SUBTITLE;
+    st->codecpar->codec_type = AVMEDIA_TYPE_SUBTITLE;
+    st->codecpar->codec_id = AV_CODEC_ID_HDMV_PGS_SUBTITLE;
     avpriv_set_pts_info(st, 32, 1, 90000);
 
     return 0;
@@ -68,7 +69,7 @@ static int sup_read_packet(AVFormatContext *s, AVPacket *pkt)
     return 0;
 }
 
-static int sup_probe(AVProbeData *p)
+static int sup_probe(const AVProbeData *p)
 {
     unsigned char *buf = p->buf;
     size_t buf_size = p->buf_size;
@@ -97,13 +98,13 @@ static int sup_probe(AVProbeData *p)
     return AVPROBE_SCORE_MAX;
 }
 
-AVInputFormat ff_sup_demuxer = {
-    .name           = "sup",
-    .long_name      = NULL_IF_CONFIG_SMALL("raw HDMV Presentation Graphic Stream subtitles"),
-    .extensions     = "sup",
-    .mime_type      = "application/x-pgs",
+const FFInputFormat ff_sup_demuxer = {
+    .p.name         = "sup",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("raw HDMV Presentation Graphic Stream subtitles"),
+    .p.extensions   = "sup",
+    .p.mime_type    = "application/x-pgs",
+    .p.flags        = AVFMT_GENERIC_INDEX,
     .read_probe     = sup_probe,
     .read_header    = sup_read_header,
     .read_packet    = sup_read_packet,
-    .flags          = AVFMT_GENERIC_INDEX,
 };

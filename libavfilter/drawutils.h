@@ -29,19 +29,7 @@
 #include "libavutil/pixfmt.h"
 
 int ff_fill_rgba_map(uint8_t *rgba_map, enum AVPixelFormat pix_fmt);
-
-int ff_fill_line_with_color(uint8_t *line[4], int pixel_step[4], int w,
-                            uint8_t dst_color[4],
-                            enum AVPixelFormat pix_fmt, uint8_t rgba_color[4],
-                            int *is_packed_rgba, uint8_t rgba_map[4]);
-
-void ff_draw_rectangle(uint8_t *dst[4], int dst_linesize[4],
-                       uint8_t *src[4], int pixelstep[4],
-                       int hsub, int vsub, int x, int y, int w, int h);
-
-void ff_copy_rectangle(uint8_t *dst[4], int dst_linesize[4],
-                       uint8_t *src[4], int src_linesize[4], int pixelstep[4],
-                       int hsub, int vsub, int x, int y, int y2, int w, int h);
+int ff_fill_ayuv_map(uint8_t *ayuv_map, enum AVPixelFormat pix_fmt);
 
 #define MAX_PLANES 4
 
@@ -50,34 +38,58 @@ typedef struct FFDrawContext {
     enum AVPixelFormat format;
     unsigned nb_planes;
     int pixelstep[MAX_PLANES]; /*< offset between pixels */
-    uint8_t comp_mask[MAX_PLANES]; /*< bitmask of used non-alpha components */
     uint8_t hsub[MAX_PLANES];  /*< horizontal subsampling */
     uint8_t vsub[MAX_PLANES];  /*< vertical subsampling */
     uint8_t hsub_max;
     uint8_t vsub_max;
+    enum AVColorRange range;
+    unsigned flags;
+    enum AVColorSpace csp;
+    double rgb2yuv[3][3];
 } FFDrawContext;
 
 typedef struct FFDrawColor {
     uint8_t rgba[4];
     union {
-        uint32_t u32;
-        uint16_t u16;
-        uint8_t  u8[4];
+        uint32_t u32[4];
+        uint16_t u16[8];
+        uint8_t  u8[16];
     } comp[MAX_PLANES];
 } FFDrawColor;
+
+/**
+  * Process alpha pixel component.
+  */
+#define FF_DRAW_PROCESS_ALPHA 1
 
 /**
  * Init a draw context.
  *
  * Only a limited number of pixel formats are supported, if format is not
  * supported the function will return an error.
- * No flags currently defined.
- * @return  0 for success, < 0 for error
+ * @param format  pixel format of the frames that will be drawn onto
+ * @param csp     color space of the frames that will be drawn onto,
+ *                defaulting to BT601 or RGB depending on the specified format
+ *                when AVCOL_SPC_UNSPECIFIED is passed.
+ * @param range   sample value range of the frames that will be drawn onto,
+ *                defaulting to TV-range unless using a legacy J format
+ *                when AVCOL_RANGE_UNSPECIFIED is passed.
+ * @param flags   combination of FF_DRAW_* flags.
+ * @return        0 for success, < 0 for error
+ */
+int ff_draw_init2(FFDrawContext *draw, enum AVPixelFormat format, enum AVColorSpace csp,
+                  enum AVColorRange range, unsigned flags);
+
+/*
+ * Legacy wrapper for ff_draw_init2.
  */
 int ff_draw_init(FFDrawContext *draw, enum AVPixelFormat format, unsigned flags);
 
+
+
 /**
- * Prepare a color.
+ * Prepare a color. The rgba value passed is always 8-bit full-range in the RGB space
+ * corresponding to the space set at initialization.
  */
 void ff_draw_color(FFDrawContext *draw, FFDrawColor *color, const uint8_t rgba[4]);
 
@@ -130,7 +142,7 @@ void ff_blend_rectangle(FFDrawContext *draw, FFDrawColor *color,
  */
 void ff_blend_mask(FFDrawContext *draw, FFDrawColor *color,
                    uint8_t *dst[], int dst_linesize[], int dst_w, int dst_h,
-                   uint8_t *mask, int mask_linesize, int mask_w, int mask_h,
+                   const uint8_t *mask, int mask_linesize, int mask_w, int mask_h,
                    int l2depth, unsigned endianness, int x0, int y0);
 
 /**

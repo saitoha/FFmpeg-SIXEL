@@ -18,34 +18,72 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <float.h>
+
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
+#include "libavutil/pixdesc.h"
 #include "avfilter.h"
 #include "drawutils.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
 #include "video.h"
+#include "preserve_color.h"
 
 #define R 0
 #define G 1
 #define B 2
 #define A 3
 
-typedef struct {
+typedef struct ThreadData {
+    AVFrame *in, *out;
+} ThreadData;
+
+typedef struct ColorChannelMixerContext {
     const AVClass *class;
     double rr, rg, rb, ra;
     double gr, gg, gb, ga;
     double br, bg, bb, ba;
     double ar, ag, ab, aa;
+    double preserve_amount;
+    int preserve_color;
 
     int *lut[4][4];
 
     int *buffer;
 
     uint8_t rgba_map[4];
+
+    int (*filter_slice[2])(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs);
 } ColorChannelMixerContext;
 
+static float lerpf(float v0, float v1, float f)
+{
+    return v0 + (v1 - v0) * f;
+}
+
+static void preservel(float *r, float *g, float *b, float lin, float lout, float max)
+{
+    if (lout <= 0.f)
+        lout = 1.f / (max * 2.f);
+    *r *= lin / lout;
+    *g *= lin / lout;
+    *b *= lin / lout;
+}
+
+#define DEPTH 8
+#include "colorchannelmixer_template.c"
+
+#undef DEPTH
+#define DEPTH 16
+#include "colorchannelmixer_template.c"
+
+#undef DEPTH
+#define DEPTH 32
+#include "colorchannelmixer_template.c"
+
 #define OFFSET(x) offsetof(ColorChannelMixerContext, x)
-#define FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM
+#define FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM|AV_OPT_FLAG_RUNTIME_PARAM
+
 static const AVOption colorchannelmixer_options[] = {
     { "rr", "set the red gain for the red channel",     OFFSET(rr), AV_OPT_TYPE_DOUBLE, {.dbl=1}, -2, 2, FLAGS },
     { "rg", "set the green gain for the red channel",   OFFSET(rg), AV_OPT_TYPE_DOUBLE, {.dbl=0}, -2, 2, FLAGS },
@@ -63,77 +101,329 @@ static const AVOption colorchannelmixer_options[] = {
     { "ag", "set the green gain for the alpha channel", OFFSET(ag), AV_OPT_TYPE_DOUBLE, {.dbl=0}, -2, 2, FLAGS },
     { "ab", "set the blue gain for the alpha channel",  OFFSET(ab), AV_OPT_TYPE_DOUBLE, {.dbl=0}, -2, 2, FLAGS },
     { "aa", "set the alpha gain for the alpha channel", OFFSET(aa), AV_OPT_TYPE_DOUBLE, {.dbl=1}, -2, 2, FLAGS },
+    { "pc", "set the preserve color mode",  OFFSET(preserve_color), AV_OPT_TYPE_INT,    {.i64=0},  0, NB_PRESERVE-1, FLAGS, .unit = "preserve" },
+    { "none",  "disabled",                     0,                        AV_OPT_TYPE_CONST,  {.i64=P_NONE}, 0, 0, FLAGS, .unit = "preserve" },
+    { "lum",   "luminance",                    0,                        AV_OPT_TYPE_CONST,  {.i64=P_LUM},  0, 0, FLAGS, .unit = "preserve" },
+    { "max",   "max",                          0,                        AV_OPT_TYPE_CONST,  {.i64=P_MAX},  0, 0, FLAGS, .unit = "preserve" },
+    { "avg",   "average",                      0,                        AV_OPT_TYPE_CONST,  {.i64=P_AVG},  0, 0, FLAGS, .unit = "preserve" },
+    { "sum",   "sum",                          0,                        AV_OPT_TYPE_CONST,  {.i64=P_SUM},  0, 0, FLAGS, .unit = "preserve" },
+    { "nrm",   "norm",                         0,                        AV_OPT_TYPE_CONST,  {.i64=P_NRM},  0, 0, FLAGS, .unit = "preserve" },
+    { "pwr",   "power",                        0,                        AV_OPT_TYPE_CONST,  {.i64=P_PWR},  0, 0, FLAGS, .unit = "preserve" },
+    { "pa", "set the preserve color amount",    OFFSET(preserve_amount), AV_OPT_TYPE_DOUBLE, {.dbl=0},  0, 1, FLAGS },
     { NULL }
 };
 
 AVFILTER_DEFINE_CLASS(colorchannelmixer);
 
-static int query_formats(AVFilterContext *ctx)
-{
-    static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_RGB24,  AV_PIX_FMT_BGR24,
-        AV_PIX_FMT_RGBA,   AV_PIX_FMT_BGRA,
-        AV_PIX_FMT_ARGB,   AV_PIX_FMT_ABGR,
-        AV_PIX_FMT_0RGB,   AV_PIX_FMT_0BGR,
-        AV_PIX_FMT_RGB0,   AV_PIX_FMT_BGR0,
-        AV_PIX_FMT_RGB48,  AV_PIX_FMT_BGR48,
-        AV_PIX_FMT_RGBA64, AV_PIX_FMT_BGRA64,
-        AV_PIX_FMT_NONE
-    };
+static const enum AVPixelFormat pix_fmts[] = {
+    AV_PIX_FMT_RGB24,  AV_PIX_FMT_BGR24,
+    AV_PIX_FMT_RGBA,   AV_PIX_FMT_BGRA,
+    AV_PIX_FMT_ARGB,   AV_PIX_FMT_ABGR,
+    AV_PIX_FMT_0RGB,   AV_PIX_FMT_0BGR,
+    AV_PIX_FMT_RGB0,   AV_PIX_FMT_BGR0,
+    AV_PIX_FMT_RGB48,  AV_PIX_FMT_BGR48,
+    AV_PIX_FMT_RGBA64, AV_PIX_FMT_BGRA64,
+    AV_PIX_FMT_GBRP,   AV_PIX_FMT_GBRAP,
+    AV_PIX_FMT_GBRP9,
+    AV_PIX_FMT_GBRP10, AV_PIX_FMT_GBRAP10,
+    AV_PIX_FMT_GBRP12, AV_PIX_FMT_GBRAP12,
+    AV_PIX_FMT_GBRP14,
+    AV_PIX_FMT_GBRP16, AV_PIX_FMT_GBRAP16,
+    AV_PIX_FMT_GBRPF32, AV_PIX_FMT_GBRAPF32,
+    AV_PIX_FMT_NONE
+};
 
-    AVFilterFormats *fmts_list = ff_make_format_list(pix_fmts);
-    if (!fmts_list)
-        return AVERROR(ENOMEM);
-    return ff_set_common_formats(ctx, fmts_list);
+static int filter_slice_gbrp(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    return filter_slice_rgba_planar_8(ctx, arg, jobnr, nb_jobs, 0, 8, 0);
+}
+
+static int filter_slice_gbrap(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    return filter_slice_rgba_planar_8(ctx, arg, jobnr, nb_jobs, 1, 8, 0);
+}
+
+static int filter_slice_gbrp_pl(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    return filter_slice_rgba_planar_8(ctx, arg, jobnr, nb_jobs, 0, 8, 1);
+}
+
+static int filter_slice_gbrap_pl(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    return filter_slice_rgba_planar_8(ctx, arg, jobnr, nb_jobs, 1, 8, 1);
+}
+
+static int filter_slice_gbrp9(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    return filter_slice_rgba_planar_16(ctx, arg, jobnr, nb_jobs, 0, 9, 0);
+}
+
+static int filter_slice_gbrp10(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    return filter_slice_rgba_planar_16(ctx, arg, jobnr, nb_jobs, 0, 10, 0);
+}
+
+static int filter_slice_gbrap10(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    return filter_slice_rgba_planar_16(ctx, arg, jobnr, nb_jobs, 1, 10, 0);
+}
+
+static int filter_slice_gbrp12(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    return filter_slice_rgba_planar_16(ctx, arg, jobnr, nb_jobs, 0, 12, 0);
+}
+
+static int filter_slice_gbrap12(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    return filter_slice_rgba_planar_16(ctx, arg, jobnr, nb_jobs, 1, 12, 0);
+}
+
+static int filter_slice_gbrp14(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    return filter_slice_rgba_planar_16(ctx, arg, jobnr, nb_jobs, 0, 14, 0);
+}
+
+static int filter_slice_gbrp16(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    return filter_slice_rgba_planar_16(ctx, arg, jobnr, nb_jobs, 0, 16, 0);
+}
+
+static int filter_slice_gbrap16(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    return filter_slice_rgba_planar_16(ctx, arg, jobnr, nb_jobs, 1, 16, 0);
+}
+
+static int filter_slice_gbrp9_pl(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    return filter_slice_rgba_planar_16(ctx, arg, jobnr, nb_jobs, 0, 9, 1);
+}
+
+static int filter_slice_gbrp10_pl(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    return filter_slice_rgba_planar_16(ctx, arg, jobnr, nb_jobs, 0, 10, 1);
+}
+
+static int filter_slice_gbrap10_pl(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    return filter_slice_rgba_planar_16(ctx, arg, jobnr, nb_jobs, 1, 10, 1);
+}
+
+static int filter_slice_gbrp12_pl(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    return filter_slice_rgba_planar_16(ctx, arg, jobnr, nb_jobs, 0, 12, 1);
+}
+
+static int filter_slice_gbrap12_pl(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    return filter_slice_rgba_planar_16(ctx, arg, jobnr, nb_jobs, 1, 12, 1);
+}
+
+static int filter_slice_gbrp14_pl(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    return filter_slice_rgba_planar_16(ctx, arg, jobnr, nb_jobs, 0, 14, 1);
+}
+
+static int filter_slice_gbrp16_pl(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    return filter_slice_rgba_planar_16(ctx, arg, jobnr, nb_jobs, 0, 16, 1);
+}
+
+static int filter_slice_gbrap16_pl(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    return filter_slice_rgba_planar_16(ctx, arg, jobnr, nb_jobs, 1, 16, 1);
+}
+
+static int filter_slice_rgba64(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    return filter_slice_rgba_packed_16(ctx, arg, jobnr, nb_jobs, 1, 4, 0, 16);
+}
+
+static int filter_slice_rgb48(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    return filter_slice_rgba_packed_16(ctx, arg, jobnr, nb_jobs, 0, 3, 0, 16);
+}
+
+static int filter_slice_rgba64_pl(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    return filter_slice_rgba_packed_16(ctx, arg, jobnr, nb_jobs, 1, 4, 1, 16);
+}
+
+static int filter_slice_rgb48_pl(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    return filter_slice_rgba_packed_16(ctx, arg, jobnr, nb_jobs, 0, 3, 1, 16);
+}
+
+static int filter_slice_rgba(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    return filter_slice_rgba_packed_8(ctx, arg, jobnr, nb_jobs, 1, 4, 0, 8);
+}
+
+static int filter_slice_rgb24(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    return filter_slice_rgba_packed_8(ctx, arg, jobnr, nb_jobs, 0, 3, 0, 8);
+}
+
+static int filter_slice_rgb0(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    return filter_slice_rgba_packed_8(ctx, arg, jobnr, nb_jobs, -1, 4, 0, 8);
+}
+
+static int filter_slice_rgba_pl(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    return filter_slice_rgba_packed_8(ctx, arg, jobnr, nb_jobs, 1, 4, 1, 8);
+}
+
+static int filter_slice_rgb24_pl(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    return filter_slice_rgba_packed_8(ctx, arg, jobnr, nb_jobs, 0, 3, 1, 8);
+}
+
+static int filter_slice_rgb0_pl(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    return filter_slice_rgba_packed_8(ctx, arg, jobnr, nb_jobs, -1, 4, 1, 8);
+}
+
+static int filter_slice_gbrp32(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    return filter_slice_rgba_planar_32(ctx, arg, jobnr, nb_jobs, 0, 1, 0);
+}
+
+static int filter_slice_gbrap32(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    return filter_slice_rgba_planar_32(ctx, arg, jobnr, nb_jobs, 1, 1, 0);
+}
+
+static int filter_slice_gbrp32_pl(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    return filter_slice_rgba_planar_32(ctx, arg, jobnr, nb_jobs, 0, 1, 1);
+}
+
+static int filter_slice_gbrap32_pl(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    return filter_slice_rgba_planar_32(ctx, arg, jobnr, nb_jobs, 1, 1, 1);
 }
 
 static int config_output(AVFilterLink *outlink)
 {
     AVFilterContext *ctx = outlink->src;
     ColorChannelMixerContext *s = ctx->priv;
-    int i, j, size, *buffer;
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(outlink->format);
+    const int depth = desc->comp[0].depth;
+    int i, j, size, *buffer = s->buffer;
 
     ff_fill_rgba_map(s->rgba_map, outlink->format);
 
-    switch (outlink->format) {
-    case AV_PIX_FMT_RGB48:
-    case AV_PIX_FMT_BGR48:
-    case AV_PIX_FMT_RGBA64:
-    case AV_PIX_FMT_BGRA64:
-        size = 65536;
-        break;
-    default:
-        size = 256;
+    size = 1 << depth;
+    if (!s->buffer) {
+        s->buffer = buffer = av_malloc(16 * size * sizeof(*s->buffer));
+        if (!s->buffer)
+            return AVERROR(ENOMEM);
+
+        for (i = 0; i < 4; i++)
+            for (j = 0; j < 4; j++, buffer += size)
+                s->lut[i][j] = buffer;
     }
 
-    s->buffer = buffer = av_malloc(16 * size * sizeof(*s->buffer));
-    if (!s->buffer)
-        return AVERROR(ENOMEM);
-
-    for (i = 0; i < 4; i++)
-        for (j = 0; j < 4; j++, buffer += size)
-            s->lut[i][j] = buffer;
-
     for (i = 0; i < size; i++) {
-        s->lut[R][R][i] = round(i * s->rr);
-        s->lut[R][G][i] = round(i * s->rg);
-        s->lut[R][B][i] = round(i * s->rb);
-        s->lut[R][A][i] = round(i * s->ra);
+        s->lut[R][R][i] = lrint(i * s->rr);
+        s->lut[R][G][i] = lrint(i * s->rg);
+        s->lut[R][B][i] = lrint(i * s->rb);
+        s->lut[R][A][i] = lrint(i * s->ra);
 
-        s->lut[G][R][i] = round(i * s->gr);
-        s->lut[G][G][i] = round(i * s->gg);
-        s->lut[G][B][i] = round(i * s->gb);
-        s->lut[G][A][i] = round(i * s->ga);
+        s->lut[G][R][i] = lrint(i * s->gr);
+        s->lut[G][G][i] = lrint(i * s->gg);
+        s->lut[G][B][i] = lrint(i * s->gb);
+        s->lut[G][A][i] = lrint(i * s->ga);
 
-        s->lut[B][R][i] = round(i * s->br);
-        s->lut[B][G][i] = round(i * s->bg);
-        s->lut[B][B][i] = round(i * s->bb);
-        s->lut[B][A][i] = round(i * s->ba);
+        s->lut[B][R][i] = lrint(i * s->br);
+        s->lut[B][G][i] = lrint(i * s->bg);
+        s->lut[B][B][i] = lrint(i * s->bb);
+        s->lut[B][A][i] = lrint(i * s->ba);
 
-        s->lut[A][R][i] = round(i * s->ar);
-        s->lut[A][G][i] = round(i * s->ag);
-        s->lut[A][B][i] = round(i * s->ab);
-        s->lut[A][A][i] = round(i * s->aa);
+        s->lut[A][R][i] = lrint(i * s->ar);
+        s->lut[A][G][i] = lrint(i * s->ag);
+        s->lut[A][B][i] = lrint(i * s->ab);
+        s->lut[A][A][i] = lrint(i * s->aa);
+    }
+
+    switch (outlink->format) {
+    case AV_PIX_FMT_BGR24:
+    case AV_PIX_FMT_RGB24:
+        s->filter_slice[0] = filter_slice_rgb24;
+        s->filter_slice[1] = filter_slice_rgb24_pl;
+        break;
+    case AV_PIX_FMT_0BGR:
+    case AV_PIX_FMT_0RGB:
+    case AV_PIX_FMT_BGR0:
+    case AV_PIX_FMT_RGB0:
+        s->filter_slice[0] = filter_slice_rgb0;
+        s->filter_slice[1] = filter_slice_rgb0_pl;
+        break;
+    case AV_PIX_FMT_ABGR:
+    case AV_PIX_FMT_ARGB:
+    case AV_PIX_FMT_BGRA:
+    case AV_PIX_FMT_RGBA:
+        s->filter_slice[0] = filter_slice_rgba;
+        s->filter_slice[1] = filter_slice_rgba_pl;
+        break;
+    case AV_PIX_FMT_BGR48:
+    case AV_PIX_FMT_RGB48:
+        s->filter_slice[0] = filter_slice_rgb48;
+        s->filter_slice[1] = filter_slice_rgb48_pl;
+        break;
+    case AV_PIX_FMT_BGRA64:
+    case AV_PIX_FMT_RGBA64:
+        s->filter_slice[0] = filter_slice_rgba64;
+        s->filter_slice[1] = filter_slice_rgba64_pl;
+        break;
+    case AV_PIX_FMT_GBRP:
+        s->filter_slice[0] = filter_slice_gbrp;
+        s->filter_slice[1] = filter_slice_gbrp_pl;
+        break;
+    case AV_PIX_FMT_GBRAP:
+        s->filter_slice[0] = filter_slice_gbrap;
+        s->filter_slice[1] = filter_slice_gbrap_pl;
+        break;
+    case AV_PIX_FMT_GBRP9:
+        s->filter_slice[0] = filter_slice_gbrp9;
+        s->filter_slice[1] = filter_slice_gbrp9_pl;
+        break;
+    case AV_PIX_FMT_GBRP10:
+        s->filter_slice[0] = filter_slice_gbrp10;
+        s->filter_slice[1] = filter_slice_gbrp10_pl;
+        break;
+    case AV_PIX_FMT_GBRAP10:
+        s->filter_slice[0] = filter_slice_gbrap10;
+        s->filter_slice[1] = filter_slice_gbrap10_pl;
+        break;
+    case AV_PIX_FMT_GBRP12:
+        s->filter_slice[0] = filter_slice_gbrp12;
+        s->filter_slice[1] = filter_slice_gbrp12_pl;
+        break;
+    case AV_PIX_FMT_GBRAP12:
+        s->filter_slice[0] = filter_slice_gbrap12;
+        s->filter_slice[1] = filter_slice_gbrap12_pl;
+        break;
+    case AV_PIX_FMT_GBRP14:
+        s->filter_slice[0] = filter_slice_gbrp14;
+        s->filter_slice[1] = filter_slice_gbrp14_pl;
+        break;
+    case AV_PIX_FMT_GBRP16:
+        s->filter_slice[0] = filter_slice_gbrp16;
+        s->filter_slice[1] = filter_slice_gbrp16_pl;
+        break;
+    case AV_PIX_FMT_GBRAP16:
+        s->filter_slice[0] = filter_slice_gbrap16;
+        s->filter_slice[1] = filter_slice_gbrap16_pl;
+        break;
+    case AV_PIX_FMT_GBRPF32:
+        s->filter_slice[0] = filter_slice_gbrp32;
+        s->filter_slice[1] = filter_slice_gbrp32_pl;
+        break;
+    case AV_PIX_FMT_GBRAPF32:
+        s->filter_slice[0] = filter_slice_gbrap32;
+        s->filter_slice[1] = filter_slice_gbrap32_pl;
+        break;
     }
 
     return 0;
@@ -144,14 +434,9 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     AVFilterContext *ctx = inlink->dst;
     ColorChannelMixerContext *s = ctx->priv;
     AVFilterLink *outlink = ctx->outputs[0];
-    const uint8_t roffset = s->rgba_map[R];
-    const uint8_t goffset = s->rgba_map[G];
-    const uint8_t boffset = s->rgba_map[B];
-    const uint8_t aoffset = s->rgba_map[A];
-    const uint8_t *srcrow = in->data[0];
-    uint8_t *dstrow;
+    const int pc = s->preserve_color > 0;
+    ThreadData td;
     AVFrame *out;
-    int i, j;
 
     if (av_frame_is_writable(in)) {
         out = in;
@@ -164,164 +449,25 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
         av_frame_copy_props(out, in);
     }
 
-    dstrow = out->data[0];
-    switch (outlink->format) {
-    case AV_PIX_FMT_BGR24:
-    case AV_PIX_FMT_RGB24:
-        for (i = 0; i < outlink->h; i++) {
-            const uint8_t *src = srcrow;
-            uint8_t *dst = dstrow;
-
-            for (j = 0; j < outlink->w * 3; j += 3) {
-                const uint8_t rin = src[j + roffset];
-                const uint8_t gin = src[j + goffset];
-                const uint8_t bin = src[j + boffset];
-
-                dst[j + roffset] = av_clip_uint8(s->lut[R][R][rin] +
-                                                 s->lut[R][G][gin] +
-                                                 s->lut[R][B][bin]);
-                dst[j + goffset] = av_clip_uint8(s->lut[G][R][rin] +
-                                                 s->lut[G][G][gin] +
-                                                 s->lut[G][B][bin]);
-                dst[j + boffset] = av_clip_uint8(s->lut[B][R][rin] +
-                                                 s->lut[B][G][gin] +
-                                                 s->lut[B][B][bin]);
-            }
-
-            srcrow += in->linesize[0];
-            dstrow += out->linesize[0];
-        }
-        break;
-    case AV_PIX_FMT_0BGR:
-    case AV_PIX_FMT_0RGB:
-    case AV_PIX_FMT_BGR0:
-    case AV_PIX_FMT_RGB0:
-        for (i = 0; i < outlink->h; i++) {
-            const uint8_t *src = srcrow;
-            uint8_t *dst = dstrow;
-
-            for (j = 0; j < outlink->w * 4; j += 4) {
-                const uint8_t rin = src[j + roffset];
-                const uint8_t gin = src[j + goffset];
-                const uint8_t bin = src[j + boffset];
-
-                dst[j + roffset] = av_clip_uint8(s->lut[R][R][rin] +
-                                                 s->lut[R][G][gin] +
-                                                 s->lut[R][B][bin]);
-                dst[j + goffset] = av_clip_uint8(s->lut[G][R][rin] +
-                                                 s->lut[G][G][gin] +
-                                                 s->lut[G][B][bin]);
-                dst[j + boffset] = av_clip_uint8(s->lut[B][R][rin] +
-                                                 s->lut[B][G][gin] +
-                                                 s->lut[B][B][bin]);
-                if (in != out)
-                    dst[j + aoffset] = 0;
-            }
-
-            srcrow += in->linesize[0];
-            dstrow += out->linesize[0];
-        }
-        break;
-    case AV_PIX_FMT_ABGR:
-    case AV_PIX_FMT_ARGB:
-    case AV_PIX_FMT_BGRA:
-    case AV_PIX_FMT_RGBA:
-        for (i = 0; i < outlink->h; i++) {
-            const uint8_t *src = srcrow;
-            uint8_t *dst = dstrow;
-
-            for (j = 0; j < outlink->w * 4; j += 4) {
-                const uint8_t rin = src[j + roffset];
-                const uint8_t gin = src[j + goffset];
-                const uint8_t bin = src[j + boffset];
-                const uint8_t ain = src[j + aoffset];
-
-                dst[j + roffset] = av_clip_uint8(s->lut[R][R][rin] +
-                                                 s->lut[R][G][gin] +
-                                                 s->lut[R][B][bin] +
-                                                 s->lut[R][A][ain]);
-                dst[j + goffset] = av_clip_uint8(s->lut[G][R][rin] +
-                                                 s->lut[G][G][gin] +
-                                                 s->lut[G][B][bin] +
-                                                 s->lut[G][A][ain]);
-                dst[j + boffset] = av_clip_uint8(s->lut[B][R][rin] +
-                                                 s->lut[B][G][gin] +
-                                                 s->lut[B][B][bin] +
-                                                 s->lut[B][A][ain]);
-                dst[j + aoffset] = av_clip_uint8(s->lut[A][R][rin] +
-                                                 s->lut[A][G][gin] +
-                                                 s->lut[A][B][bin] +
-                                                 s->lut[A][A][ain]);
-            }
-
-            srcrow += in->linesize[0];
-            dstrow += out->linesize[0];
-        }
-        break;
-    case AV_PIX_FMT_BGR48:
-    case AV_PIX_FMT_RGB48:
-        for (i = 0; i < outlink->h; i++) {
-            const uint16_t *src = (const uint16_t *)srcrow;
-            uint16_t *dst = (uint16_t *)dstrow;
-
-            for (j = 0; j < outlink->w * 3; j += 3) {
-                const uint16_t rin = src[j + roffset];
-                const uint16_t gin = src[j + goffset];
-                const uint16_t bin = src[j + boffset];
-
-                dst[j + roffset] = av_clip_uint16(s->lut[R][R][rin] +
-                                                  s->lut[R][G][gin] +
-                                                  s->lut[R][B][bin]);
-                dst[j + goffset] = av_clip_uint16(s->lut[G][R][rin] +
-                                                  s->lut[G][G][gin] +
-                                                  s->lut[G][B][bin]);
-                dst[j + boffset] = av_clip_uint16(s->lut[B][R][rin] +
-                                                  s->lut[B][G][gin] +
-                                                  s->lut[B][B][bin]);
-            }
-
-            srcrow += in->linesize[0];
-            dstrow += out->linesize[0];
-        }
-        break;
-    case AV_PIX_FMT_BGRA64:
-    case AV_PIX_FMT_RGBA64:
-        for (i = 0; i < outlink->h; i++) {
-            const uint16_t *src = (const uint16_t *)srcrow;
-            uint16_t *dst = (uint16_t *)dstrow;
-
-            for (j = 0; j < outlink->w * 4; j += 4) {
-                const uint16_t rin = src[j + roffset];
-                const uint16_t gin = src[j + goffset];
-                const uint16_t bin = src[j + boffset];
-                const uint16_t ain = src[j + aoffset];
-
-                dst[j + roffset] = av_clip_uint16(s->lut[R][R][rin] +
-                                                  s->lut[R][G][gin] +
-                                                  s->lut[R][B][bin] +
-                                                  s->lut[R][A][ain]);
-                dst[j + goffset] = av_clip_uint16(s->lut[G][R][rin] +
-                                                  s->lut[G][G][gin] +
-                                                  s->lut[G][B][bin] +
-                                                  s->lut[G][A][ain]);
-                dst[j + boffset] = av_clip_uint16(s->lut[B][R][rin] +
-                                                  s->lut[B][G][gin] +
-                                                  s->lut[B][B][bin] +
-                                                  s->lut[B][A][ain]);
-                dst[j + aoffset] = av_clip_uint16(s->lut[A][R][rin] +
-                                                  s->lut[A][G][gin] +
-                                                  s->lut[A][B][bin] +
-                                                  s->lut[A][A][ain]);
-            }
-
-            srcrow += in->linesize[0];
-            dstrow += out->linesize[0];
-        }
-    }
+    td.in = in;
+    td.out = out;
+    ff_filter_execute(ctx, s->filter_slice[pc], &td, NULL,
+                      FFMIN(outlink->h, ff_filter_get_nb_threads(ctx)));
 
     if (in != out)
         av_frame_free(&in);
-    return ff_filter_frame(ctx->outputs[0], out);
+    return ff_filter_frame(outlink, out);
+}
+
+static int process_command(AVFilterContext *ctx, const char *cmd, const char *args,
+                           char *res, int res_len, int flags)
+{
+    int ret = ff_filter_process_command(ctx, cmd, args, res, res_len, flags);
+
+    if (ret < 0)
+        return ret;
+
+    return config_output(ctx->outputs[0]);
 }
 
 static av_cold void uninit(AVFilterContext *ctx)
@@ -337,7 +483,6 @@ static const AVFilterPad colorchannelmixer_inputs[] = {
         .type         = AVMEDIA_TYPE_VIDEO,
         .filter_frame = filter_frame,
     },
-    { NULL }
 };
 
 static const AVFilterPad colorchannelmixer_outputs[] = {
@@ -346,17 +491,17 @@ static const AVFilterPad colorchannelmixer_outputs[] = {
         .type         = AVMEDIA_TYPE_VIDEO,
         .config_props = config_output,
     },
-    { NULL }
 };
 
-AVFilter ff_vf_colorchannelmixer = {
-    .name          = "colorchannelmixer",
-    .description   = NULL_IF_CONFIG_SMALL("Adjust colors by mixing color channels."),
+const FFFilter ff_vf_colorchannelmixer = {
+    .p.name        = "colorchannelmixer",
+    .p.description = NULL_IF_CONFIG_SMALL("Adjust colors by mixing color channels."),
+    .p.priv_class  = &colorchannelmixer_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(ColorChannelMixerContext),
-    .priv_class    = &colorchannelmixer_class,
     .uninit        = uninit,
-    .query_formats = query_formats,
-    .inputs        = colorchannelmixer_inputs,
-    .outputs       = colorchannelmixer_outputs,
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
+    FILTER_INPUTS(colorchannelmixer_inputs),
+    FILTER_OUTPUTS(colorchannelmixer_outputs),
+    FILTER_PIXFMTS_ARRAY(pix_fmts),
+    .process_command = process_command,
 };

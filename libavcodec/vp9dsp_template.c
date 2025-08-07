@@ -30,7 +30,7 @@
 // FIXME see whether we can merge parts of this (perhaps at least 4x4 and 8x8)
 // back with h264pred.[ch]
 
-static void vert_4x4_c(uint8_t *_dst, ptrdiff_t stride,
+static void vert_4x4_c(uint8_t *restrict _dst, ptrdiff_t stride,
                        const uint8_t *left, const uint8_t *_top)
 {
     pixel *dst = (pixel *) _dst;
@@ -44,49 +44,73 @@ static void vert_4x4_c(uint8_t *_dst, ptrdiff_t stride,
     AV_WN4PA(dst + stride * 3, p4);
 }
 
-static void vert_8x8_c(uint8_t *_dst, ptrdiff_t stride,
+static void vert_8x8_c(uint8_t *restrict _dst, ptrdiff_t stride,
                        const uint8_t *left, const uint8_t *_top)
 {
     pixel *dst = (pixel *) _dst;
     const pixel *top = (const pixel *) _top;
+#if BIT_DEPTH == 8
+    uint64_t p8 = AV_RN64A(top);
+#else
     pixel4 p4a = AV_RN4PA(top + 0);
     pixel4 p4b = AV_RN4PA(top + 4);
+#endif
     int y;
 
     stride /= sizeof(pixel);
     for (y = 0; y < 8; y++) {
+#if BIT_DEPTH == 8
+        AV_WN64A(dst, p8);
+#else
         AV_WN4PA(dst + 0, p4a);
         AV_WN4PA(dst + 4, p4b);
+#endif
         dst += stride;
     }
 }
 
-static void vert_16x16_c(uint8_t *_dst, ptrdiff_t stride,
+static void vert_16x16_c(uint8_t *restrict _dst, ptrdiff_t stride,
                          const uint8_t *left, const uint8_t *_top)
 {
     pixel *dst = (pixel *) _dst;
     const pixel *top = (const pixel *) _top;
+#if BIT_DEPTH == 8
+    uint64_t p8a = AV_RN64A(top);
+    uint64_t p8b = AV_RN64A(top + 8);
+#else
     pixel4 p4a = AV_RN4PA(top +  0);
     pixel4 p4b = AV_RN4PA(top +  4);
     pixel4 p4c = AV_RN4PA(top +  8);
     pixel4 p4d = AV_RN4PA(top + 12);
+#endif
     int y;
 
     stride /= sizeof(pixel);
     for (y = 0; y < 16; y++) {
+#if BIT_DEPTH == 8
+        AV_WN64A(dst +  0, p8a);
+        AV_WN64A(dst +  8, p8b);
+#else
         AV_WN4PA(dst +  0, p4a);
         AV_WN4PA(dst +  4, p4b);
         AV_WN4PA(dst +  8, p4c);
         AV_WN4PA(dst + 12, p4d);
+#endif
         dst += stride;
     }
 }
 
-static void vert_32x32_c(uint8_t *_dst, ptrdiff_t stride,
+static void vert_32x32_c(uint8_t *restrict _dst, ptrdiff_t stride,
                          const uint8_t *left, const uint8_t *_top)
 {
     pixel *dst = (pixel *) _dst;
     const pixel *top = (const pixel *) _top;
+#if BIT_DEPTH == 8
+    uint64_t p8a = AV_RN64A(top);
+    uint64_t p8b = AV_RN64A(top + 8);
+    uint64_t p8c = AV_RN64A(top + 16);
+    uint64_t p8d = AV_RN64A(top + 24);
+#else
     pixel4 p4a = AV_RN4PA(top +  0);
     pixel4 p4b = AV_RN4PA(top +  4);
     pixel4 p4c = AV_RN4PA(top +  8);
@@ -95,10 +119,17 @@ static void vert_32x32_c(uint8_t *_dst, ptrdiff_t stride,
     pixel4 p4f = AV_RN4PA(top + 20);
     pixel4 p4g = AV_RN4PA(top + 24);
     pixel4 p4h = AV_RN4PA(top + 28);
+#endif
     int y;
 
     stride /= sizeof(pixel);
     for (y = 0; y < 32; y++) {
+#if BIT_DEPTH == 8
+        AV_WN64A(dst +  0, p8a);
+        AV_WN64A(dst +  8, p8b);
+        AV_WN64A(dst + 16, p8c);
+        AV_WN64A(dst + 24, p8d);
+#else
         AV_WN4PA(dst +  0, p4a);
         AV_WN4PA(dst +  4, p4b);
         AV_WN4PA(dst +  8, p4c);
@@ -107,6 +138,7 @@ static void vert_32x32_c(uint8_t *_dst, ptrdiff_t stride,
         AV_WN4PA(dst + 20, p4f);
         AV_WN4PA(dst + 24, p4g);
         AV_WN4PA(dst + 28, p4h);
+#endif
         dst += stride;
     }
 }
@@ -1078,12 +1110,12 @@ def_hor_up(32)
 #endif /* BIT_DEPTH != 12 */
 
 #if BIT_DEPTH != 8
-void vp9dsp_intrapred_init_10(VP9DSPContext *dsp);
+void ff_vp9dsp_intrapred_init_10(VP9DSPContext *dsp);
 #endif
 #if BIT_DEPTH != 10
 static
 #endif
-av_cold void FUNC(vp9dsp_intrapred_init)(VP9DSPContext *dsp)
+av_cold void FUNC(ff_vp9dsp_intrapred_init)(VP9DSPContext *dsp)
 {
 #define init_intra_pred_bd_aware(tx, sz) \
     dsp->intra_pred[tx][TM_VP8_PRED]          = tm_##sz##_c; \
@@ -1092,7 +1124,7 @@ av_cold void FUNC(vp9dsp_intrapred_init)(VP9DSPContext *dsp)
     dsp->intra_pred[tx][DC_129_PRED]          = dc_129_##sz##_c
 
 #if BIT_DEPTH == 12
-    vp9dsp_intrapred_init_10(dsp);
+    ff_vp9dsp_intrapred_init_10(dsp);
 #define init_intra_pred(tx, sz) \
     init_intra_pred_bd_aware(tx, sz)
 #else
@@ -1131,14 +1163,14 @@ static void type_a##_##type_b##_##sz##x##sz##_add_c(uint8_t *_dst, \
 \
     stride /= sizeof(pixel); \
     if (has_dconly && eob == 1) { \
-        const int t  = (((block[0] * 11585 + (1 << 13)) >> 14) \
-                                   * 11585 + (1 << 13)) >> 14; \
+        const int t  = ((((dctint) block[0] * 11585 + (1 << 13)) >> 14) \
+                                            * 11585 + (1 << 13)) >> 14; \
         block[0] = 0; \
         for (i = 0; i < sz; i++) { \
             for (j = 0; j < sz; j++) \
                 dst[j * stride] = av_clip_pixel(dst[j * stride] + \
                                                 (bits ? \
-                                                 (t + (1 << (bits - 1))) >> bits : \
+                                                 (int)(t + (1U << (bits - 1))) >> bits : \
                                                  t)); \
             dst++; \
         } \
@@ -1153,7 +1185,7 @@ static void type_a##_##type_b##_##sz##x##sz##_add_c(uint8_t *_dst, \
         for (j = 0; j < sz; j++) \
             dst[j * stride] = av_clip_pixel(dst[j * stride] + \
                                             (bits ? \
-                                             (out[j] + (1 << (bits - 1))) >> bits : \
+                                             (int)(out[j] + (1U << (bits - 1))) >> bits : \
                                              out[j])); \
         dst++; \
     } \
@@ -1186,7 +1218,7 @@ static av_always_inline void idct4_1d(const dctcoef *in, ptrdiff_t stride,
 static av_always_inline void iadst4_1d(const dctcoef *in, ptrdiff_t stride,
                                        dctcoef *out, int pass)
 {
-    int t0, t1, t2, t3;
+    dctint t0, t1, t2, t3;
 
     t0 =  5283 * IN(0) + 15212 * IN(2) +  9929 * IN(3);
     t1 =  9929 * IN(0) -  5283 * IN(2) - 15212 * IN(3);
@@ -1260,25 +1292,25 @@ static av_always_inline void iadst8_1d(const dctcoef *in, ptrdiff_t stride,
     t6 = (t2a - t6a + (1 << 13)) >> 14;
     t7 = (t3a - t7a + (1 << 13)) >> 14;
 
-    t4a = 15137 * t4 +  6270 * t5;
-    t5a =  6270 * t4 - 15137 * t5;
-    t6a = 15137 * t7 -  6270 * t6;
-    t7a =  6270 * t7 + 15137 * t6;
+    t4a = 15137U * t4 +  6270U * t5;
+    t5a =  6270U * t4 - 15137U * t5;
+    t6a = 15137U * t7 -  6270U * t6;
+    t7a =  6270U * t7 + 15137U * t6;
 
     out[0] =   t0 + t2;
     out[7] = -(t1 + t3);
     t2     =   t0 - t2;
     t3     =   t1 - t3;
 
-    out[1] = -((t4a + t6a + (1 << 13)) >> 14);
-    out[6] =   (t5a + t7a + (1 << 13)) >> 14;
-    t6     =   (t4a - t6a + (1 << 13)) >> 14;
-    t7     =   (t5a - t7a + (1 << 13)) >> 14;
+    out[1] = -((dctint)((1U << 13) + t4a + t6a) >> 14);
+    out[6] =   (dctint)((1U << 13) + t5a + t7a) >> 14;
+    t6     =   (dctint)((1U << 13) + t4a - t6a) >> 14;
+    t7     =   (dctint)((1U << 13) + t5a - t7a) >> 14;
 
-    out[3] = -(((t2 + t3) * 11585 + (1 << 13)) >> 14);
-    out[4] =   ((t2 - t3) * 11585 + (1 << 13)) >> 14;
-    out[2] =   ((t6 + t7) * 11585 + (1 << 13)) >> 14;
-    out[5] = -(((t6 - t7) * 11585 + (1 << 13)) >> 14);
+    out[3] = -((dctint)((t2 + t3) * 11585U + (1 << 13)) >> 14);
+    out[4] =   (dctint)((t2 - t3) * 11585U + (1 << 13)) >> 14;
+    out[2] =   (dctint)((t6 + t7) * 11585U + (1 << 13)) >> 14;
+    out[5] = -((dctint)((t6 - t7) * 11585U + (1 << 13)) >> 14);
 }
 
 itxfm_wrap(8, 5)
@@ -1290,22 +1322,22 @@ static av_always_inline void idct16_1d(const dctcoef *in, ptrdiff_t stride,
     dctint t0a, t1a, t2a, t3a, t4a, t5a, t6a, t7a;
     dctint t8a, t9a, t10a, t11a, t12a, t13a, t14a, t15a;
 
-    t0a  = ((IN(0) + IN(8)) * 11585 + (1 << 13)) >> 14;
-    t1a  = ((IN(0) - IN(8)) * 11585 + (1 << 13)) >> 14;
-    t2a  = (IN(4)  *  6270 - IN(12) * 15137 + (1 << 13)) >> 14;
-    t3a  = (IN(4)  * 15137 + IN(12) *  6270 + (1 << 13)) >> 14;
-    t4a  = (IN(2)  *  3196 - IN(14) * 16069 + (1 << 13)) >> 14;
-    t7a  = (IN(2)  * 16069 + IN(14) *  3196 + (1 << 13)) >> 14;
-    t5a  = (IN(10) * 13623 - IN(6)  *  9102 + (1 << 13)) >> 14;
-    t6a  = (IN(10) *  9102 + IN(6)  * 13623 + (1 << 13)) >> 14;
-    t8a  = (IN(1)  *  1606 - IN(15) * 16305 + (1 << 13)) >> 14;
-    t15a = (IN(1)  * 16305 + IN(15) *  1606 + (1 << 13)) >> 14;
-    t9a  = (IN(9)  * 12665 - IN(7)  * 10394 + (1 << 13)) >> 14;
-    t14a = (IN(9)  * 10394 + IN(7)  * 12665 + (1 << 13)) >> 14;
-    t10a = (IN(5)  *  7723 - IN(11) * 14449 + (1 << 13)) >> 14;
-    t13a = (IN(5)  * 14449 + IN(11) *  7723 + (1 << 13)) >> 14;
-    t11a = (IN(13) * 15679 - IN(3)  *  4756 + (1 << 13)) >> 14;
-    t12a = (IN(13) *  4756 + IN(3)  * 15679 + (1 << 13)) >> 14;
+    t0a  = (dctint)((IN(0) + IN(8)) * 11585U + (1 << 13)) >> 14;
+    t1a  = (dctint)((IN(0) - IN(8)) * 11585U + (1 << 13)) >> 14;
+    t2a  = (dctint)(IN(4)  *  6270U - IN(12) * 15137U + (1 << 13)) >> 14;
+    t3a  = (dctint)(IN(4)  * 15137U + IN(12) *  6270U + (1 << 13)) >> 14;
+    t4a  = (dctint)(IN(2)  *  3196U - IN(14) * 16069U + (1 << 13)) >> 14;
+    t7a  = (dctint)(IN(2)  * 16069U + IN(14) *  3196U + (1 << 13)) >> 14;
+    t5a  = (dctint)(IN(10) * 13623U - IN(6)  *  9102U + (1 << 13)) >> 14;
+    t6a  = (dctint)(IN(10) *  9102U + IN(6)  * 13623U + (1 << 13)) >> 14;
+    t8a  = (dctint)(IN(1)  *  1606U - IN(15) * 16305U + (1 << 13)) >> 14;
+    t15a = (dctint)(IN(1)  * 16305U + IN(15) *  1606U + (1 << 13)) >> 14;
+    t9a  = (dctint)(IN(9)  * 12665U - IN(7)  * 10394U + (1 << 13)) >> 14;
+    t14a = (dctint)(IN(9)  * 10394U + IN(7)  * 12665U + (1 << 13)) >> 14;
+    t10a = (dctint)(IN(5)  *  7723U - IN(11) * 14449U + (1 << 13)) >> 14;
+    t13a = (dctint)(IN(5)  * 14449U + IN(11) *  7723U + (1 << 13)) >> 14;
+    t11a = (dctint)(IN(13) * 15679U - IN(3)  *  4756U + (1 << 13)) >> 14;
+    t12a = (dctint)(IN(13) *  4756U + IN(3)  * 15679U + (1 << 13)) >> 14;
 
     t0  = t0a  + t3a;
     t1  = t1a  + t2a;
@@ -1324,12 +1356,12 @@ static av_always_inline void idct16_1d(const dctcoef *in, ptrdiff_t stride,
     t14 = t15a - t14a;
     t15 = t15a + t14a;
 
-    t5a  = ((t6 - t5) * 11585 + (1 << 13)) >> 14;
-    t6a  = ((t6 + t5) * 11585 + (1 << 13)) >> 14;
-    t9a  = (  t14 *  6270 - t9  * 15137  + (1 << 13)) >> 14;
-    t14a = (  t14 * 15137 + t9  *  6270  + (1 << 13)) >> 14;
-    t10a = (-(t13 * 15137 + t10 *  6270) + (1 << 13)) >> 14;
-    t13a = (  t13 *  6270 - t10 * 15137  + (1 << 13)) >> 14;
+    t5a  = (dctint)((t6 - t5) * 11585U + (1 << 13)) >> 14;
+    t6a  = (dctint)((t6 + t5) * 11585U + (1 << 13)) >> 14;
+    t9a  = (dctint)(  t14 *  6270U - t9  * 15137U  + (1 << 13)) >> 14;
+    t14a = (dctint)(  t14 * 15137U + t9  *  6270U  + (1 << 13)) >> 14;
+    t10a = (dctint)(-(t13 * 15137U + t10 *  6270U) + (1 << 13)) >> 14;
+    t13a = (dctint)(  t13 *  6270U - t10 * 15137U  + (1 << 13)) >> 14;
 
     t0a  = t0   + t7;
     t1a  = t1   + t6a;
@@ -1348,10 +1380,10 @@ static av_always_inline void idct16_1d(const dctcoef *in, ptrdiff_t stride,
     t14  = t14a + t13a;
     t15a = t15  + t12;
 
-    t10a = ((t13  - t10)  * 11585 + (1 << 13)) >> 14;
-    t13a = ((t13  + t10)  * 11585 + (1 << 13)) >> 14;
-    t11  = ((t12a - t11a) * 11585 + (1 << 13)) >> 14;
-    t12  = ((t12a + t11a) * 11585 + (1 << 13)) >> 14;
+    t10a = (dctint)((t13  - t10)  * 11585U + (1 << 13)) >> 14;
+    t13a = (dctint)((t13  + t10)  * 11585U + (1 << 13)) >> 14;
+    t11  = (dctint)((t12a - t11a) * 11585U + (1 << 13)) >> 14;
+    t12  = (dctint)((t12a + t11a) * 11585U + (1 << 13)) >> 14;
 
     out[ 0] = t0a + t15a;
     out[ 1] = t1a + t14;
@@ -1378,48 +1410,48 @@ static av_always_inline void iadst16_1d(const dctcoef *in, ptrdiff_t stride,
     dctint t0a, t1a, t2a, t3a, t4a, t5a, t6a, t7a;
     dctint t8a, t9a, t10a, t11a, t12a, t13a, t14a, t15a;
 
-    t0  = IN(15) * 16364 + IN(0)  *   804;
-    t1  = IN(15) *   804 - IN(0)  * 16364;
-    t2  = IN(13) * 15893 + IN(2)  *  3981;
-    t3  = IN(13) *  3981 - IN(2)  * 15893;
-    t4  = IN(11) * 14811 + IN(4)  *  7005;
-    t5  = IN(11) *  7005 - IN(4)  * 14811;
-    t6  = IN(9)  * 13160 + IN(6)  *  9760;
-    t7  = IN(9)  *  9760 - IN(6)  * 13160;
-    t8  = IN(7)  * 11003 + IN(8)  * 12140;
-    t9  = IN(7)  * 12140 - IN(8)  * 11003;
-    t10 = IN(5)  *  8423 + IN(10) * 14053;
-    t11 = IN(5)  * 14053 - IN(10) *  8423;
-    t12 = IN(3)  *  5520 + IN(12) * 15426;
-    t13 = IN(3)  * 15426 - IN(12) *  5520;
-    t14 = IN(1)  *  2404 + IN(14) * 16207;
-    t15 = IN(1)  * 16207 - IN(14) *  2404;
+    t0  = IN(15) * 16364U + IN(0)  *   804U;
+    t1  = IN(15) *   804U - IN(0)  * 16364U;
+    t2  = IN(13) * 15893U + IN(2)  *  3981U;
+    t3  = IN(13) *  3981U - IN(2)  * 15893U;
+    t4  = IN(11) * 14811U + IN(4)  *  7005U;
+    t5  = IN(11) *  7005U - IN(4)  * 14811U;
+    t6  = IN(9)  * 13160U + IN(6)  *  9760U;
+    t7  = IN(9)  *  9760U - IN(6)  * 13160U;
+    t8  = IN(7)  * 11003U + IN(8)  * 12140U;
+    t9  = IN(7)  * 12140U - IN(8)  * 11003U;
+    t10 = IN(5)  *  8423U + IN(10) * 14053U;
+    t11 = IN(5)  * 14053U - IN(10) *  8423U;
+    t12 = IN(3)  *  5520U + IN(12) * 15426U;
+    t13 = IN(3)  * 15426U - IN(12) *  5520U;
+    t14 = IN(1)  *  2404U + IN(14) * 16207U;
+    t15 = IN(1)  * 16207U - IN(14) *  2404U;
 
-    t0a  = (t0 + t8  + (1 << 13)) >> 14;
-    t1a  = (t1 + t9  + (1 << 13)) >> 14;
-    t2a  = (t2 + t10 + (1 << 13)) >> 14;
-    t3a  = (t3 + t11 + (1 << 13)) >> 14;
-    t4a  = (t4 + t12 + (1 << 13)) >> 14;
-    t5a  = (t5 + t13 + (1 << 13)) >> 14;
-    t6a  = (t6 + t14 + (1 << 13)) >> 14;
-    t7a  = (t7 + t15 + (1 << 13)) >> 14;
-    t8a  = (t0 - t8  + (1 << 13)) >> 14;
-    t9a  = (t1 - t9  + (1 << 13)) >> 14;
-    t10a = (t2 - t10 + (1 << 13)) >> 14;
-    t11a = (t3 - t11 + (1 << 13)) >> 14;
-    t12a = (t4 - t12 + (1 << 13)) >> 14;
-    t13a = (t5 - t13 + (1 << 13)) >> 14;
-    t14a = (t6 - t14 + (1 << 13)) >> 14;
-    t15a = (t7 - t15 + (1 << 13)) >> 14;
+    t0a  = (dctint)((1U << 13) + t0 + t8 ) >> 14;
+    t1a  = (dctint)((1U << 13) + t1 + t9 ) >> 14;
+    t2a  = (dctint)((1U << 13) + t2 + t10) >> 14;
+    t3a  = (dctint)((1U << 13) + t3 + t11) >> 14;
+    t4a  = (dctint)((1U << 13) + t4 + t12) >> 14;
+    t5a  = (dctint)((1U << 13) + t5 + t13) >> 14;
+    t6a  = (dctint)((1U << 13) + t6 + t14) >> 14;
+    t7a  = (dctint)((1U << 13) + t7 + t15) >> 14;
+    t8a  = (dctint)((1U << 13) + t0 - t8 ) >> 14;
+    t9a  = (dctint)((1U << 13) + t1 - t9 ) >> 14;
+    t10a = (dctint)((1U << 13) + t2 - t10) >> 14;
+    t11a = (dctint)((1U << 13) + t3 - t11) >> 14;
+    t12a = (dctint)((1U << 13) + t4 - t12) >> 14;
+    t13a = (dctint)((1U << 13) + t5 - t13) >> 14;
+    t14a = (dctint)((1U << 13) + t6 - t14) >> 14;
+    t15a = (dctint)((1U << 13) + t7 - t15) >> 14;
 
-    t8   = t8a  * 16069 + t9a  *  3196;
-    t9   = t8a  *  3196 - t9a  * 16069;
-    t10  = t10a *  9102 + t11a * 13623;
-    t11  = t10a * 13623 - t11a *  9102;
-    t12  = t13a * 16069 - t12a *  3196;
-    t13  = t13a *  3196 + t12a * 16069;
-    t14  = t15a *  9102 - t14a * 13623;
-    t15  = t15a * 13623 + t14a *  9102;
+    t8   = t8a  * 16069U + t9a  *  3196U;
+    t9   = t8a  *  3196U - t9a  * 16069U;
+    t10  = t10a *  9102U + t11a * 13623U;
+    t11  = t10a * 13623U - t11a *  9102U;
+    t12  = t13a * 16069U - t12a *  3196U;
+    t13  = t13a *  3196U + t12a * 16069U;
+    t14  = t15a *  9102U - t14a * 13623U;
+    t15  = t15a * 13623U + t14a *  9102U;
 
     t0   = t0a + t4a;
     t1   = t1a + t5a;
@@ -1429,49 +1461,49 @@ static av_always_inline void iadst16_1d(const dctcoef *in, ptrdiff_t stride,
     t5   = t1a - t5a;
     t6   = t2a - t6a;
     t7   = t3a - t7a;
-    t8a  = (t8  + t12 + (1 << 13)) >> 14;
-    t9a  = (t9  + t13 + (1 << 13)) >> 14;
-    t10a = (t10 + t14 + (1 << 13)) >> 14;
-    t11a = (t11 + t15 + (1 << 13)) >> 14;
-    t12a = (t8  - t12 + (1 << 13)) >> 14;
-    t13a = (t9  - t13 + (1 << 13)) >> 14;
-    t14a = (t10 - t14 + (1 << 13)) >> 14;
-    t15a = (t11 - t15 + (1 << 13)) >> 14;
+    t8a  = (dctint)((1U << 13) + t8  + t12) >> 14;
+    t9a  = (dctint)((1U << 13) + t9  + t13) >> 14;
+    t10a = (dctint)((1U << 13) + t10 + t14) >> 14;
+    t11a = (dctint)((1U << 13) + t11 + t15) >> 14;
+    t12a = (dctint)((1U << 13) + t8  - t12) >> 14;
+    t13a = (dctint)((1U << 13) + t9  - t13) >> 14;
+    t14a = (dctint)((1U << 13) + t10 - t14) >> 14;
+    t15a = (dctint)((1U << 13) + t11 - t15) >> 14;
 
-    t4a  = t4 * 15137 + t5 *  6270;
-    t5a  = t4 *  6270 - t5 * 15137;
-    t6a  = t7 * 15137 - t6 *  6270;
-    t7a  = t7 *  6270 + t6 * 15137;
-    t12  = t12a * 15137 + t13a *  6270;
-    t13  = t12a *  6270 - t13a * 15137;
-    t14  = t15a * 15137 - t14a *  6270;
-    t15  = t15a *  6270 + t14a * 15137;
+    t4a  = t4 * 15137U + t5 *  6270U;
+    t5a  = t4 *  6270U - t5 * 15137U;
+    t6a  = t7 * 15137U - t6 *  6270U;
+    t7a  = t7 *  6270U + t6 * 15137U;
+    t12  = t12a * 15137U + t13a *  6270U;
+    t13  = t12a *  6270U - t13a * 15137U;
+    t14  = t15a * 15137U - t14a *  6270U;
+    t15  = t15a *  6270U + t14a * 15137U;
 
     out[ 0] =   t0 + t2;
     out[15] = -(t1 + t3);
     t2a     =   t0 - t2;
     t3a     =   t1 - t3;
-    out[ 3] = -((t4a + t6a + (1 << 13)) >> 14);
-    out[12] =   (t5a + t7a + (1 << 13)) >> 14;
-    t6      =   (t4a - t6a + (1 << 13)) >> 14;
-    t7      =   (t5a - t7a + (1 << 13)) >> 14;
+    out[ 3] = -((dctint)((1U << 13) + t4a + t6a) >> 14);
+    out[12] =   (dctint)((1U << 13) + t5a + t7a) >> 14;
+    t6      =   (dctint)((1U << 13) + t4a - t6a) >> 14;
+    t7      =   (dctint)((1U << 13) + t5a - t7a) >> 14;
     out[ 1] = -(t8a + t10a);
     out[14] =   t9a + t11a;
     t10     =   t8a - t10a;
     t11     =   t9a - t11a;
-    out[ 2] =   (t12 + t14 + (1 << 13)) >> 14;
-    out[13] = -((t13 + t15 + (1 << 13)) >> 14);
-    t14a    =   (t12 - t14 + (1 << 13)) >> 14;
-    t15a    =   (t13 - t15 + (1 << 13)) >> 14;
+    out[ 2] =   (dctint)((1U << 13) + t12 + t14) >> 14;
+    out[13] = -((dctint)((1U << 13) + t13 + t15) >> 14);
+    t14a    =   (dctint)((1U << 13) + t12 - t14) >> 14;
+    t15a    =   (dctint)((1U << 13) + t13 - t15) >> 14;
 
-    out[ 7] = ((t2a  + t3a)  * -11585 + (1 << 13)) >> 14;
-    out[ 8] = ((t2a  - t3a)  *  11585 + (1 << 13)) >> 14;
-    out[ 4] = ((t7   + t6)   *  11585 + (1 << 13)) >> 14;
-    out[11] = ((t7   - t6)   *  11585 + (1 << 13)) >> 14;
-    out[ 6] = ((t11  + t10)  *  11585 + (1 << 13)) >> 14;
-    out[ 9] = ((t11  - t10)  *  11585 + (1 << 13)) >> 14;
-    out[ 5] = ((t14a + t15a) * -11585 + (1 << 13)) >> 14;
-    out[10] = ((t14a - t15a) *  11585 + (1 << 13)) >> 14;
+    out[ 7] = (dctint)(-(t2a  + t3a)  * 11585U  + (1 << 13)) >> 14;
+    out[ 8] = (dctint)( (t2a  - t3a)  * 11585U  + (1 << 13)) >> 14;
+    out[ 4] = (dctint)( (t7   + t6)   * 11585U  + (1 << 13)) >> 14;
+    out[11] = (dctint)( (t7   - t6)   * 11585U  + (1 << 13)) >> 14;
+    out[ 6] = (dctint)( (t11  + t10)  * 11585U  + (1 << 13)) >> 14;
+    out[ 9] = (dctint)( (t11  - t10)  * 11585U  + (1 << 13)) >> 14;
+    out[ 5] = (dctint)(-(t14a + t15a) * 11585U  + (1 << 13)) >> 14;
+    out[10] = (dctint)( (t14a - t15a) * 11585U  + (1 << 13)) >> 14;
 }
 
 itxfm_wrap(16, 6)
@@ -1479,38 +1511,38 @@ itxfm_wrap(16, 6)
 static av_always_inline void idct32_1d(const dctcoef *in, ptrdiff_t stride,
                                        dctcoef *out, int pass)
 {
-    dctint t0a  = ((IN(0) + IN(16)) * 11585 + (1 << 13)) >> 14;
-    dctint t1a  = ((IN(0) - IN(16)) * 11585 + (1 << 13)) >> 14;
-    dctint t2a  = (IN( 8) *  6270 - IN(24) * 15137 + (1 << 13)) >> 14;
-    dctint t3a  = (IN( 8) * 15137 + IN(24) *  6270 + (1 << 13)) >> 14;
-    dctint t4a  = (IN( 4) *  3196 - IN(28) * 16069 + (1 << 13)) >> 14;
-    dctint t7a  = (IN( 4) * 16069 + IN(28) *  3196 + (1 << 13)) >> 14;
-    dctint t5a  = (IN(20) * 13623 - IN(12) *  9102 + (1 << 13)) >> 14;
-    dctint t6a  = (IN(20) *  9102 + IN(12) * 13623 + (1 << 13)) >> 14;
-    dctint t8a  = (IN( 2) *  1606 - IN(30) * 16305 + (1 << 13)) >> 14;
-    dctint t15a = (IN( 2) * 16305 + IN(30) *  1606 + (1 << 13)) >> 14;
-    dctint t9a  = (IN(18) * 12665 - IN(14) * 10394 + (1 << 13)) >> 14;
-    dctint t14a = (IN(18) * 10394 + IN(14) * 12665 + (1 << 13)) >> 14;
-    dctint t10a = (IN(10) *  7723 - IN(22) * 14449 + (1 << 13)) >> 14;
-    dctint t13a = (IN(10) * 14449 + IN(22) *  7723 + (1 << 13)) >> 14;
-    dctint t11a = (IN(26) * 15679 - IN( 6) *  4756 + (1 << 13)) >> 14;
-    dctint t12a = (IN(26) *  4756 + IN( 6) * 15679 + (1 << 13)) >> 14;
-    dctint t16a = (IN( 1) *   804 - IN(31) * 16364 + (1 << 13)) >> 14;
-    dctint t31a = (IN( 1) * 16364 + IN(31) *   804 + (1 << 13)) >> 14;
-    dctint t17a = (IN(17) * 12140 - IN(15) * 11003 + (1 << 13)) >> 14;
-    dctint t30a = (IN(17) * 11003 + IN(15) * 12140 + (1 << 13)) >> 14;
-    dctint t18a = (IN( 9) *  7005 - IN(23) * 14811 + (1 << 13)) >> 14;
-    dctint t29a = (IN( 9) * 14811 + IN(23) *  7005 + (1 << 13)) >> 14;
-    dctint t19a = (IN(25) * 15426 - IN( 7) *  5520 + (1 << 13)) >> 14;
-    dctint t28a = (IN(25) *  5520 + IN( 7) * 15426 + (1 << 13)) >> 14;
-    dctint t20a = (IN( 5) *  3981 - IN(27) * 15893 + (1 << 13)) >> 14;
-    dctint t27a = (IN( 5) * 15893 + IN(27) *  3981 + (1 << 13)) >> 14;
-    dctint t21a = (IN(21) * 14053 - IN(11) *  8423 + (1 << 13)) >> 14;
-    dctint t26a = (IN(21) *  8423 + IN(11) * 14053 + (1 << 13)) >> 14;
-    dctint t22a = (IN(13) *  9760 - IN(19) * 13160 + (1 << 13)) >> 14;
-    dctint t25a = (IN(13) * 13160 + IN(19) *  9760 + (1 << 13)) >> 14;
-    dctint t23a = (IN(29) * 16207 - IN( 3) *  2404 + (1 << 13)) >> 14;
-    dctint t24a = (IN(29) *  2404 + IN( 3) * 16207 + (1 << 13)) >> 14;
+    dctint t0a  = (dctint)((IN(0) + IN(16)) * 11585U         + (1 << 13)) >> 14;
+    dctint t1a  = (dctint)((IN(0) - IN(16)) * 11585U         + (1 << 13)) >> 14;
+    dctint t2a  = (dctint)(IN( 8) *  6270U - IN(24) * 15137U + (1 << 13)) >> 14;
+    dctint t3a  = (dctint)(IN( 8) * 15137U + IN(24) *  6270U + (1 << 13)) >> 14;
+    dctint t4a  = (dctint)(IN( 4) *  3196U - IN(28) * 16069U + (1 << 13)) >> 14;
+    dctint t7a  = (dctint)(IN( 4) * 16069U + IN(28) *  3196U + (1 << 13)) >> 14;
+    dctint t5a  = (dctint)(IN(20) * 13623U - IN(12) *  9102U + (1 << 13)) >> 14;
+    dctint t6a  = (dctint)(IN(20) *  9102U + IN(12) * 13623U + (1 << 13)) >> 14;
+    dctint t8a  = (dctint)(IN( 2) *  1606U - IN(30) * 16305U + (1 << 13)) >> 14;
+    dctint t15a = (dctint)(IN( 2) * 16305U + IN(30) *  1606U + (1 << 13)) >> 14;
+    dctint t9a  = (dctint)(IN(18) * 12665U - IN(14) * 10394U + (1 << 13)) >> 14;
+    dctint t14a = (dctint)(IN(18) * 10394U + IN(14) * 12665U + (1 << 13)) >> 14;
+    dctint t10a = (dctint)(IN(10) *  7723U - IN(22) * 14449U + (1 << 13)) >> 14;
+    dctint t13a = (dctint)(IN(10) * 14449U + IN(22) *  7723U + (1 << 13)) >> 14;
+    dctint t11a = (dctint)(IN(26) * 15679U - IN( 6) *  4756U + (1 << 13)) >> 14;
+    dctint t12a = (dctint)(IN(26) *  4756U + IN( 6) * 15679U + (1 << 13)) >> 14;
+    dctint t16a = (dctint)(IN( 1) *   804U - IN(31) * 16364U + (1 << 13)) >> 14;
+    dctint t31a = (dctint)(IN( 1) * 16364U + IN(31) *   804U + (1 << 13)) >> 14;
+    dctint t17a = (dctint)(IN(17) * 12140U - IN(15) * 11003U + (1 << 13)) >> 14;
+    dctint t30a = (dctint)(IN(17) * 11003U + IN(15) * 12140U + (1 << 13)) >> 14;
+    dctint t18a = (dctint)(IN( 9) *  7005U - IN(23) * 14811U + (1 << 13)) >> 14;
+    dctint t29a = (dctint)(IN( 9) * 14811U + IN(23) *  7005U + (1 << 13)) >> 14;
+    dctint t19a = (dctint)(IN(25) * 15426U - IN( 7) *  5520U + (1 << 13)) >> 14;
+    dctint t28a = (dctint)(IN(25) *  5520U + IN( 7) * 15426U + (1 << 13)) >> 14;
+    dctint t20a = (dctint)(IN( 5) *  3981U - IN(27) * 15893U + (1 << 13)) >> 14;
+    dctint t27a = (dctint)(IN( 5) * 15893U + IN(27) *  3981U + (1 << 13)) >> 14;
+    dctint t21a = (dctint)(IN(21) * 14053U - IN(11) *  8423U + (1 << 13)) >> 14;
+    dctint t26a = (dctint)(IN(21) *  8423U + IN(11) * 14053U + (1 << 13)) >> 14;
+    dctint t22a = (dctint)(IN(13) *  9760U - IN(19) * 13160U + (1 << 13)) >> 14;
+    dctint t25a = (dctint)(IN(13) * 13160U + IN(19) *  9760U + (1 << 13)) >> 14;
+    dctint t23a = (dctint)(IN(29) * 16207U - IN( 3) *  2404U + (1 << 13)) >> 14;
+    dctint t24a = (dctint)(IN(29) *  2404U + IN( 3) * 16207U + (1 << 13)) >> 14;
 
     dctint t0  = t0a  + t3a;
     dctint t1  = t1a  + t2a;
@@ -1545,20 +1577,20 @@ static av_always_inline void idct32_1d(const dctcoef *in, ptrdiff_t stride,
     dctint t30 = t31a - t30a;
     dctint t31 = t31a + t30a;
 
-    t5a = ((t6 - t5) * 11585 + (1 << 13)) >> 14;
-    t6a = ((t6 + t5) * 11585 + (1 << 13)) >> 14;
-    t9a  = (  t14 *  6270 - t9  * 15137  + (1 << 13)) >> 14;
-    t14a = (  t14 * 15137 + t9  *  6270  + (1 << 13)) >> 14;
-    t10a = (-(t13 * 15137 + t10 *  6270) + (1 << 13)) >> 14;
-    t13a = (  t13 *  6270 - t10 * 15137  + (1 << 13)) >> 14;
-    t17a = (  t30 *  3196 - t17 * 16069  + (1 << 13)) >> 14;
-    t30a = (  t30 * 16069 + t17 *  3196  + (1 << 13)) >> 14;
-    t18a = (-(t29 * 16069 + t18 *  3196) + (1 << 13)) >> 14;
-    t29a = (  t29 *  3196 - t18 * 16069  + (1 << 13)) >> 14;
-    t21a = (  t26 * 13623 - t21 *  9102  + (1 << 13)) >> 14;
-    t26a = (  t26 *  9102 + t21 * 13623  + (1 << 13)) >> 14;
-    t22a = (-(t25 *  9102 + t22 * 13623) + (1 << 13)) >> 14;
-    t25a = (  t25 * 13623 - t22 *  9102  + (1 << 13)) >> 14;
+    t5a  = (dctint)((t6 - t5) * 11585U             + (1 << 13)) >> 14;
+    t6a  = (dctint)((t6 + t5) * 11585U             + (1 << 13)) >> 14;
+    t9a  = (dctint)(  t14 *  6270U - t9  * 15137U  + (1 << 13)) >> 14;
+    t14a = (dctint)(  t14 * 15137U + t9  *  6270U  + (1 << 13)) >> 14;
+    t10a = (dctint)(-(t13 * 15137U + t10 *  6270U) + (1 << 13)) >> 14;
+    t13a = (dctint)(  t13 *  6270U - t10 * 15137U  + (1 << 13)) >> 14;
+    t17a = (dctint)(  t30 *  3196U - t17 * 16069U  + (1 << 13)) >> 14;
+    t30a = (dctint)(  t30 * 16069U + t17 *  3196U  + (1 << 13)) >> 14;
+    t18a = (dctint)(-(t29 * 16069U + t18 *  3196U) + (1 << 13)) >> 14;
+    t29a = (dctint)(  t29 *  3196U - t18 * 16069U  + (1 << 13)) >> 14;
+    t21a = (dctint)(  t26 * 13623U - t21 *  9102U  + (1 << 13)) >> 14;
+    t26a = (dctint)(  t26 *  9102U + t21 * 13623U  + (1 << 13)) >> 14;
+    t22a = (dctint)(-(t25 *  9102U + t22 * 13623U) + (1 << 13)) >> 14;
+    t25a = (dctint)(  t25 * 13623U - t22 *  9102U  + (1 << 13)) >> 14;
 
     t0a  = t0   + t7;
     t1a  = t1   + t6a;
@@ -1593,18 +1625,18 @@ static av_always_inline void idct32_1d(const dctcoef *in, ptrdiff_t stride,
     t30  = t30a + t29a;
     t31a = t31  + t28;
 
-    t10a = ((t13  - t10)  * 11585 + (1 << 13)) >> 14;
-    t13a = ((t13  + t10)  * 11585 + (1 << 13)) >> 14;
-    t11  = ((t12a - t11a) * 11585 + (1 << 13)) >> 14;
-    t12  = ((t12a + t11a) * 11585 + (1 << 13)) >> 14;
-    t18a = (  t29  *  6270 - t18  * 15137  + (1 << 13)) >> 14;
-    t29a = (  t29  * 15137 + t18  *  6270  + (1 << 13)) >> 14;
-    t19  = (  t28a *  6270 - t19a * 15137  + (1 << 13)) >> 14;
-    t28  = (  t28a * 15137 + t19a *  6270  + (1 << 13)) >> 14;
-    t20  = (-(t27a * 15137 + t20a *  6270) + (1 << 13)) >> 14;
-    t27  = (  t27a *  6270 - t20a * 15137  + (1 << 13)) >> 14;
-    t21a = (-(t26  * 15137 + t21  *  6270) + (1 << 13)) >> 14;
-    t26a = (  t26  *  6270 - t21  * 15137  + (1 << 13)) >> 14;
+    t10a = (dctint)((t13  - t10)  * 11585U           + (1 << 13)) >> 14;
+    t13a = (dctint)((t13  + t10)  * 11585U           + (1 << 13)) >> 14;
+    t11  = (dctint)((t12a - t11a) * 11585U           + (1 << 13)) >> 14;
+    t12  = (dctint)((t12a + t11a) * 11585U           + (1 << 13)) >> 14;
+    t18a = (dctint)(  t29  *  6270U - t18  * 15137U  + (1 << 13)) >> 14;
+    t29a = (dctint)(  t29  * 15137U + t18  *  6270U  + (1 << 13)) >> 14;
+    t19  = (dctint)(  t28a *  6270U - t19a * 15137U  + (1 << 13)) >> 14;
+    t28  = (dctint)(  t28a * 15137U + t19a *  6270U  + (1 << 13)) >> 14;
+    t20  = (dctint)(-(t27a * 15137U + t20a *  6270U) + (1 << 13)) >> 14;
+    t27  = (dctint)(  t27a *  6270U - t20a * 15137U  + (1 << 13)) >> 14;
+    t21a = (dctint)(-(t26  * 15137U + t21  *  6270U) + (1 << 13)) >> 14;
+    t26a = (dctint)(  t26  *  6270U - t21  * 15137U  + (1 << 13)) >> 14;
 
     t0   = t0a + t15a;
     t1   = t1a + t14;
@@ -1639,14 +1671,14 @@ static av_always_inline void idct32_1d(const dctcoef *in, ptrdiff_t stride,
     t30a = t30  + t25;
     t31  = t31a + t24a;
 
-    t20  = ((t27a - t20a) * 11585 + (1 << 13)) >> 14;
-    t27  = ((t27a + t20a) * 11585 + (1 << 13)) >> 14;
-    t21a = ((t26  - t21 ) * 11585 + (1 << 13)) >> 14;
-    t26a = ((t26  + t21 ) * 11585 + (1 << 13)) >> 14;
-    t22  = ((t25a - t22a) * 11585 + (1 << 13)) >> 14;
-    t25  = ((t25a + t22a) * 11585 + (1 << 13)) >> 14;
-    t23a = ((t24  - t23 ) * 11585 + (1 << 13)) >> 14;
-    t24a = ((t24  + t23 ) * 11585 + (1 << 13)) >> 14;
+    t20  = (dctint)((t27a - t20a) * 11585U + (1 << 13)) >> 14;
+    t27  = (dctint)((t27a + t20a) * 11585U + (1 << 13)) >> 14;
+    t21a = (dctint)((t26  - t21 ) * 11585U + (1 << 13)) >> 14;
+    t26a = (dctint)((t26  + t21 ) * 11585U + (1 << 13)) >> 14;
+    t22  = (dctint)((t25a - t22a) * 11585U + (1 << 13)) >> 14;
+    t25  = (dctint)((t25a + t22a) * 11585U + (1 << 13)) >> 14;
+    t23a = (dctint)((t24  - t23 ) * 11585U + (1 << 13)) >> 14;
+    t24a = (dctint)((t24  + t23 ) * 11585U + (1 << 13)) >> 14;
 
     out[ 0] = t0   + t31;
     out[ 1] = t1   + t30a;
@@ -1936,9 +1968,9 @@ static av_cold void vp9dsp_loopfilter_init(VP9DSPContext *dsp)
 
 #if BIT_DEPTH != 12
 
-static av_always_inline void copy_c(uint8_t *dst, ptrdiff_t dst_stride,
-                                    const uint8_t *src, ptrdiff_t src_stride,
-                                    int w, int h)
+static av_always_inline void copy_c(uint8_t *restrict dst, ptrdiff_t dst_stride,
+                                    const uint8_t *restrict src,
+                                    ptrdiff_t src_stride, int w, int h)
 {
     do {
         memcpy(dst, src, w * sizeof(pixel));
@@ -1948,9 +1980,9 @@ static av_always_inline void copy_c(uint8_t *dst, ptrdiff_t dst_stride,
     } while (--h);
 }
 
-static av_always_inline void avg_c(uint8_t *_dst, ptrdiff_t dst_stride,
-                                   const uint8_t *_src, ptrdiff_t src_stride,
-                                   int w, int h)
+static av_always_inline void avg_c(uint8_t *restrict _dst, ptrdiff_t dst_stride,
+                                   const uint8_t *restrict _src,
+                                   ptrdiff_t src_stride, int w, int h)
 {
     pixel *dst = (pixel *) _dst;
     const pixel *src = (const pixel *) _src;
@@ -1990,61 +2022,6 @@ copy_avg_fn(4)
 #undef copy_avg_fn
 
 #endif /* BIT_DEPTH != 12 */
-
-static const int16_t vp9_subpel_filters[3][16][8] = {
-    [FILTER_8TAP_REGULAR] = {
-        {  0,  0,   0, 128,   0,   0,  0,  0 },
-        {  0,  1,  -5, 126,   8,  -3,  1,  0 },
-        { -1,  3, -10, 122,  18,  -6,  2,  0 },
-        { -1,  4, -13, 118,  27,  -9,  3, -1 },
-        { -1,  4, -16, 112,  37, -11,  4, -1 },
-        { -1,  5, -18, 105,  48, -14,  4, -1 },
-        { -1,  5, -19,  97,  58, -16,  5, -1 },
-        { -1,  6, -19,  88,  68, -18,  5, -1 },
-        { -1,  6, -19,  78,  78, -19,  6, -1 },
-        { -1,  5, -18,  68,  88, -19,  6, -1 },
-        { -1,  5, -16,  58,  97, -19,  5, -1 },
-        { -1,  4, -14,  48, 105, -18,  5, -1 },
-        { -1,  4, -11,  37, 112, -16,  4, -1 },
-        { -1,  3,  -9,  27, 118, -13,  4, -1 },
-        {  0,  2,  -6,  18, 122, -10,  3, -1 },
-        {  0,  1,  -3,   8, 126,  -5,  1,  0 },
-    }, [FILTER_8TAP_SHARP] = {
-        {  0,  0,   0, 128,   0,   0,  0,  0 },
-        { -1,  3,  -7, 127,   8,  -3,  1,  0 },
-        { -2,  5, -13, 125,  17,  -6,  3, -1 },
-        { -3,  7, -17, 121,  27, -10,  5, -2 },
-        { -4,  9, -20, 115,  37, -13,  6, -2 },
-        { -4, 10, -23, 108,  48, -16,  8, -3 },
-        { -4, 10, -24, 100,  59, -19,  9, -3 },
-        { -4, 11, -24,  90,  70, -21, 10, -4 },
-        { -4, 11, -23,  80,  80, -23, 11, -4 },
-        { -4, 10, -21,  70,  90, -24, 11, -4 },
-        { -3,  9, -19,  59, 100, -24, 10, -4 },
-        { -3,  8, -16,  48, 108, -23, 10, -4 },
-        { -2,  6, -13,  37, 115, -20,  9, -4 },
-        { -2,  5, -10,  27, 121, -17,  7, -3 },
-        { -1,  3,  -6,  17, 125, -13,  5, -2 },
-        {  0,  1,  -3,   8, 127,  -7,  3, -1 },
-    }, [FILTER_8TAP_SMOOTH] = {
-        {  0,  0,   0, 128,   0,   0,  0,  0 },
-        { -3, -1,  32,  64,  38,   1, -3,  0 },
-        { -2, -2,  29,  63,  41,   2, -3,  0 },
-        { -2, -2,  26,  63,  43,   4, -4,  0 },
-        { -2, -3,  24,  62,  46,   5, -4,  0 },
-        { -2, -3,  21,  60,  49,   7, -4,  0 },
-        { -1, -4,  18,  59,  51,   9, -4,  0 },
-        { -1, -4,  16,  57,  53,  12, -4, -1 },
-        { -1, -4,  14,  55,  55,  14, -4, -1 },
-        { -1, -4,  12,  53,  57,  16, -4, -1 },
-        {  0, -4,   9,  51,  59,  18, -4, -1 },
-        {  0, -4,   7,  49,  60,  21, -3, -2 },
-        {  0, -4,   5,  46,  62,  24, -3, -2 },
-        {  0, -4,   4,  43,  63,  26, -2, -2 },
-        {  0, -3,   2,  41,  63,  29, -2, -2 },
-        {  0, -3,   1,  38,  64,  32, -1, -3 },
-    }
-};
 
 #define FILTER_8TAP(src, x, F, stride) \
     av_clip_pixel((F[0] * src[x + -3 * stride] + \
@@ -2155,7 +2132,7 @@ static void avg##_8tap_##type##_##sz##dir##_c(uint8_t *dst, ptrdiff_t dst_stride
                                               int h, int mx, int my) \
 { \
     avg##_8tap_1d_##dir##_c(dst, dst_stride, src, src_stride, sz, h, \
-                            vp9_subpel_filters[type_idx][dir_m]); \
+                            ff_vp9_subpel_filters[type_idx][dir_m]); \
 }
 
 #define filter_fn_2d(sz, type, type_idx, avg) \
@@ -2164,8 +2141,8 @@ static void avg##_8tap_##type##_##sz##hv_c(uint8_t *dst, ptrdiff_t dst_stride, \
                                            int h, int mx, int my) \
 { \
     avg##_8tap_2d_hv_c(dst, dst_stride, src, src_stride, sz, h, \
-                       vp9_subpel_filters[type_idx][mx], \
-                       vp9_subpel_filters[type_idx][my]); \
+                       ff_vp9_subpel_filters[type_idx][mx], \
+                       ff_vp9_subpel_filters[type_idx][my]); \
 }
 
 #if BIT_DEPTH != 12
@@ -2317,15 +2294,15 @@ filter_fn_set(avg)
 #undef bilinf_fn_2d
 
 #if BIT_DEPTH != 8
-void vp9dsp_mc_init_10(VP9DSPContext *dsp);
+void ff_vp9dsp_mc_init_10(VP9DSPContext *dsp);
 #endif
 #if BIT_DEPTH != 10
 static
 #endif
-av_cold void FUNC(vp9dsp_mc_init)(VP9DSPContext *dsp)
+av_cold void FUNC(ff_vp9dsp_mc_init)(VP9DSPContext *dsp)
 {
 #if BIT_DEPTH == 12
-    vp9dsp_mc_init_10(dsp);
+    ff_vp9dsp_mc_init_10(dsp);
 #else /* BIT_DEPTH == 12 */
 
 #define init_fpel(idx1, idx2, sz, type) \
@@ -2454,7 +2431,7 @@ static void avg##_scaled_##type##_##sz##_c(uint8_t *dst, ptrdiff_t dst_stride, \
                                            int h, int mx, int my, int dx, int dy) \
 { \
     avg##_scaled_8tap_c(dst, dst_stride, src, src_stride, sz, h, mx, my, dx, dy, \
-                        vp9_subpel_filters[type_idx]); \
+                        ff_vp9_subpel_filters[type_idx]); \
 }
 
 #if BIT_DEPTH != 12
@@ -2555,12 +2532,12 @@ scaled_filter_fn_set(avg)
 #undef scaled_bilinf_fn
 
 #if BIT_DEPTH != 8
-void vp9dsp_scaled_mc_init_10(VP9DSPContext *dsp);
+void ff_vp9dsp_scaled_mc_init_10(VP9DSPContext *dsp);
 #endif
 #if BIT_DEPTH != 10
 static
 #endif
-av_cold void FUNC(vp9dsp_scaled_mc_init)(VP9DSPContext *dsp)
+av_cold void FUNC(ff_vp9dsp_scaled_mc_init)(VP9DSPContext *dsp)
 {
 #define init_scaled_bd_aware(idx1, idx2, sz, type) \
     dsp->smc[idx1][FILTER_8TAP_SMOOTH ][idx2] = type##_scaled_smooth_##sz##_c; \
@@ -2568,7 +2545,7 @@ av_cold void FUNC(vp9dsp_scaled_mc_init)(VP9DSPContext *dsp)
     dsp->smc[idx1][FILTER_8TAP_SHARP  ][idx2] = type##_scaled_sharp_##sz##_c
 
 #if BIT_DEPTH == 12
-    vp9dsp_scaled_mc_init_10(dsp);
+    ff_vp9dsp_scaled_mc_init_10(dsp);
 #define init_scaled(a,b,c,d) init_scaled_bd_aware(a,b,c,d)
 #else
 #define init_scaled(idx1, idx2, sz, type) \
@@ -2593,9 +2570,9 @@ av_cold void FUNC(vp9dsp_scaled_mc_init)(VP9DSPContext *dsp)
 
 av_cold void FUNC(ff_vp9dsp_init)(VP9DSPContext *dsp)
 {
-    FUNC(vp9dsp_intrapred_init)(dsp);
+    FUNC(ff_vp9dsp_intrapred_init)(dsp);
     vp9dsp_itxfm_init(dsp);
     vp9dsp_loopfilter_init(dsp);
-    FUNC(vp9dsp_mc_init)(dsp);
-    FUNC(vp9dsp_scaled_mc_init)(dsp);
+    FUNC(ff_vp9dsp_mc_init)(dsp);
+    FUNC(ff_vp9dsp_scaled_mc_init)(dsp);
 }

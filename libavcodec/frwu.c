@@ -22,7 +22,8 @@
 
 #include "avcodec.h"
 #include "bytestream.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include "libavutil/opt.h"
 
 typedef struct {
@@ -41,12 +42,11 @@ static av_cold int decode_init(AVCodecContext *avctx)
     return 0;
 }
 
-static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
-                        AVPacket *avpkt)
+static int decode_frame(AVCodecContext *avctx, AVFrame *pic,
+                        int *got_frame, AVPacket *avpkt)
 {
     FRWUContext *s = avctx->priv_data;
     int field, ret;
-    AVFrame *pic = data;
     const uint8_t *buf = avpkt->data;
     const uint8_t *buf_end = buf + avpkt->size;
 
@@ -61,9 +61,6 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
 
     if ((ret = ff_get_buffer(avctx, pic, 0)) < 0)
         return ret;
-
-    pic->pict_type = AV_PICTURE_TYPE_I;
-    pic->key_frame = 1;
 
     for (field = 0; field < 2; field++) {
         int i;
@@ -103,7 +100,7 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
 }
 
 static const AVOption frwu_options[] = {
-    {"change_field_order", "Change field order", offsetof(FRWUContext, change_field_order), FF_OPT_TYPE_INT,
+    {"change_field_order", "Change field order", offsetof(FRWUContext, change_field_order), AV_OPT_TYPE_BOOL,
      {.i64 = 0}, 0, 1, AV_OPT_FLAG_DECODING_PARAM | AV_OPT_FLAG_VIDEO_PARAM},
     {NULL}
 };
@@ -115,14 +112,14 @@ static const AVClass frwu_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-AVCodec ff_frwu_decoder = {
-    .name           = "frwu",
-    .long_name      = NULL_IF_CONFIG_SMALL("Forward Uncompressed"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_FRWU,
+const FFCodec ff_frwu_decoder = {
+    .p.name         = "frwu",
+    CODEC_LONG_NAME("Forward Uncompressed"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_FRWU,
     .priv_data_size = sizeof(FRWUContext),
     .init           = decode_init,
-    .decode         = decode_frame,
-    .capabilities   = CODEC_CAP_DR1,
-    .priv_class     = &frwu_class,
+    FF_CODEC_DECODE_CB(decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1,
+    .p.priv_class   = &frwu_class,
 };

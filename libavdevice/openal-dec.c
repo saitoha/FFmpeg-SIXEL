@@ -26,6 +26,7 @@
 
 #include "libavutil/opt.h"
 #include "libavutil/time.h"
+#include "libavformat/demux.h"
 #include "libavformat/internal.h"
 #include "avdevice.h"
 
@@ -60,9 +61,9 @@ typedef struct {
  * @param al_fmt the AL_FORMAT value to find information about.
  * @return A pointer to a structure containing information about the AL_FORMAT value.
  */
-static inline al_format_info* get_al_format_info(ALCenum al_fmt)
+static const inline al_format_info* get_al_format_info(ALCenum al_fmt)
 {
-    static al_format_info info_table[] = {
+    static const al_format_info info_table[] = {
         [AL_FORMAT_MONO8-LOWEST_AL_FORMAT]    = {AL_FORMAT_MONO8, AV_CODEC_ID_PCM_U8, 1},
         [AL_FORMAT_MONO16-LOWEST_AL_FORMAT]   = {AL_FORMAT_MONO16, AV_NE (AV_CODEC_ID_PCM_S16BE, AV_CODEC_ID_PCM_S16LE), 1},
         [AL_FORMAT_STEREO8-LOWEST_AL_FORMAT]  = {AL_FORMAT_STEREO8, AV_CODEC_ID_PCM_U8, 2},
@@ -128,7 +129,7 @@ static int read_header(AVFormatContext *ctx)
     int error = 0;
     const char *error_msg;
     AVStream *st = NULL;
-    AVCodecContext *codec = NULL;
+    AVCodecParameters *par = NULL;
 
     if (ad->list_devices) {
         print_al_capture_devices(ctx);
@@ -139,7 +140,7 @@ static int read_header(AVFormatContext *ctx)
 
     /* Open device for capture */
     ad->device =
-        alcCaptureOpenDevice(ctx->filename[0] ? ctx->filename : NULL,
+        alcCaptureOpenDevice(ctx->url[0] ? ctx->url : NULL,
                              ad->sample_rate,
                              ad->sample_format,
                              ad->sample_rate); /* Maximum 1 second of sample data to be read at once */
@@ -156,11 +157,11 @@ static int read_header(AVFormatContext *ctx)
     avpriv_set_pts_info(st, 64, 1, 1000000);
 
     /* Set codec parameters */
-    codec = st->codec;
-    codec->codec_type = AVMEDIA_TYPE_AUDIO;
-    codec->sample_rate = ad->sample_rate;
-    codec->channels = get_al_format_info(ad->sample_format)->channels;
-    codec->codec_id = get_al_format_info(ad->sample_format)->codec_id;
+    par = st->codecpar;
+    par->codec_type = AVMEDIA_TYPE_AUDIO;
+    par->sample_rate = ad->sample_rate;
+    par->ch_layout.nb_channels = get_al_format_info(ad->sample_format)->channels;
+    par->codec_id = get_al_format_info(ad->sample_format)->codec_id;
 
     /* This is needed to read the audio data */
     ad->sample_step = (av_get_bits_per_sample(get_al_format_info(ad->sample_format)->codec_id) *
@@ -187,9 +188,16 @@ static int read_packet(AVFormatContext* ctx, AVPacket *pkt)
     const char *error_msg;
     ALCint nb_samples;
 
-    /* Get number of samples available */
-    alcGetIntegerv(ad->device, ALC_CAPTURE_SAMPLES, (ALCsizei) sizeof(ALCint), &nb_samples);
-    if (error = al_get_error(ad->device, &error_msg)) goto fail;
+    for (;;) {
+        /* Get number of samples available */
+        alcGetIntegerv(ad->device, ALC_CAPTURE_SAMPLES, (ALCsizei) sizeof(ALCint), &nb_samples);
+        if (error = al_get_error(ad->device, &error_msg)) goto fail;
+        if (nb_samples > 0)
+            break;
+        if (ctx->flags & AVFMT_FLAG_NONBLOCK)
+            return AVERROR(EAGAIN);
+        av_usleep(1000);
+    }
 
     /* Create a packet of appropriate size */
     if ((error = av_new_packet(pkt, nb_samples*ad->sample_step)) < 0)
@@ -204,7 +212,7 @@ static int read_packet(AVFormatContext* ctx, AVPacket *pkt)
 fail:
     /* Handle failure */
     if (pkt->data)
-        av_destruct_packet(pkt);
+        av_packet_unref(pkt);
     if (error_msg)
         av_log(ctx, AV_LOG_ERROR, "Error: %s\n", error_msg);
     return error;
@@ -227,28 +235,28 @@ static const AVOption options[] = {
     {"channels", "set number of channels",     OFFSET(channels),     AV_OPT_TYPE_INT, {.i64=2},     1, 2,      AV_OPT_FLAG_DECODING_PARAM },
     {"sample_rate", "set sample rate",         OFFSET(sample_rate),  AV_OPT_TYPE_INT, {.i64=44100}, 1, 192000, AV_OPT_FLAG_DECODING_PARAM },
     {"sample_size", "set sample size",         OFFSET(sample_size),  AV_OPT_TYPE_INT, {.i64=16},    8, 16,     AV_OPT_FLAG_DECODING_PARAM },
-    {"list_devices", "list available devices", OFFSET(list_devices), AV_OPT_TYPE_INT, {.i64=0},     0, 1,      AV_OPT_FLAG_DECODING_PARAM, "list_devices"  },
-    {"true",  "", 0, AV_OPT_TYPE_CONST, {.i64=1}, 0, 0, AV_OPT_FLAG_DECODING_PARAM, "list_devices" },
-    {"false", "", 0, AV_OPT_TYPE_CONST, {.i64=0}, 0, 0, AV_OPT_FLAG_DECODING_PARAM, "list_devices" },
+    {"list_devices", "list available devices", OFFSET(list_devices), AV_OPT_TYPE_INT, {.i64=0},     0, 1,      AV_OPT_FLAG_DECODING_PARAM, .unit = "list_devices"  },
+    {"true",  "", 0, AV_OPT_TYPE_CONST, {.i64=1}, 0, 0, AV_OPT_FLAG_DECODING_PARAM, .unit = "list_devices" },
+    {"false", "", 0, AV_OPT_TYPE_CONST, {.i64=0}, 0, 0, AV_OPT_FLAG_DECODING_PARAM, .unit = "list_devices" },
     {NULL},
 };
 
 static const AVClass class = {
-    .class_name = "openal",
+    .class_name = "openal indev",
     .item_name = av_default_item_name,
     .option = options,
     .version = LIBAVUTIL_VERSION_INT,
     .category = AV_CLASS_CATEGORY_DEVICE_AUDIO_INPUT,
 };
 
-AVInputFormat ff_openal_demuxer = {
-    .name = "openal",
-    .long_name = NULL_IF_CONFIG_SMALL("OpenAL audio capture device"),
+const FFInputFormat ff_openal_demuxer = {
+    .p.name         = "openal",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("OpenAL audio capture device"),
+    .p.flags        = AVFMT_NOFILE,
+    .p.priv_class   = &class,
     .priv_data_size = sizeof(al_data),
     .read_probe = NULL,
     .read_header = read_header,
     .read_packet = read_packet,
     .read_close = read_close,
-    .flags = AVFMT_NOFILE,
-    .priv_class = &class
 };

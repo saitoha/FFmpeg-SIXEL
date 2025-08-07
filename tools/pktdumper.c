@@ -37,6 +37,7 @@
 
 #define FILENAME_BUF_SIZE 4096
 #define PKTFILESUFF "_%08" PRId64 "_%02d_%010" PRId64 "_%06d_%c.bin"
+#define EXTRADATAFILESUFF "_extradata_%02d_%06d.bin"
 
 static int usage(int ret)
 {
@@ -52,9 +53,10 @@ static int usage(int ret)
 int main(int argc, char **argv)
 {
     char fntemplate[FILENAME_BUF_SIZE];
+    char fntemplate2[FILENAME_BUF_SIZE];
     char pktfilename[FILENAME_BUF_SIZE];
     AVFormatContext *fctx = NULL;
-    AVPacket pkt;
+    AVPacket *pkt;
     int64_t pktnum  = 0;
     int64_t maxpkts = 0;
     int donotquit   = 0;
@@ -86,11 +88,6 @@ int main(int argc, char **argv)
         fprintf(stderr, "filename too long\n");
         return usage(1);
     }
-    strcat(fntemplate, PKTFILESUFF);
-    printf("FNTEMPLATE: '%s'\n", fntemplate);
-
-    // register all file formats
-    av_register_all();
 
     err = avformat_open_input(&fctx, argv[1], NULL, NULL);
     if (err < 0) {
@@ -104,30 +101,59 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    av_init_packet(&pkt);
+    pkt = av_packet_alloc();
+    if (!pkt) {
+        fprintf(stderr, "av_packet_alloc: error %d\n", AVERROR(ENOMEM));
+        return 1;
+    }
 
-    while ((err = av_read_frame(fctx, &pkt)) >= 0) {
+    strcpy(fntemplate2, fntemplate);
+    strcat(fntemplate2, EXTRADATAFILESUFF);
+
+    for (int i = 0; i < fctx->nb_streams; i++) {
+        AVCodecParameters * par = fctx->streams[i]->codecpar;
+        int fd;
+        if (par->extradata_size) {
+            snprintf(pktfilename, sizeof(pktfilename), fntemplate2, i, par->extradata_size);
+            printf(EXTRADATAFILESUFF "\n", i, par->extradata_size);
+            if (!nowrite) {
+                fd  = open(pktfilename, O_WRONLY | O_CREAT, 0644);
+                err = write(fd, par->extradata, par->extradata_size);
+                if (err < 0) {
+                    fprintf(stderr, "write: error %d\n", err);
+                    return 1;
+                }
+                close(fd);
+            }
+        }
+    }
+
+    strcat(fntemplate, PKTFILESUFF);
+    printf("FNTEMPLATE: '%s'\n", fntemplate);
+
+    while ((err = av_read_frame(fctx, pkt)) >= 0) {
         int fd;
         snprintf(pktfilename, sizeof(pktfilename), fntemplate, pktnum,
-                 pkt.stream_index, pkt.pts, pkt.size,
-                 (pkt.flags & AV_PKT_FLAG_KEY) ? 'K' : '_');
-        printf(PKTFILESUFF "\n", pktnum, pkt.stream_index, pkt.pts, pkt.size,
-               (pkt.flags & AV_PKT_FLAG_KEY) ? 'K' : '_');
+                 pkt->stream_index, pkt->pts, pkt->size,
+                 (pkt->flags & AV_PKT_FLAG_KEY) ? 'K' : '_');
+        printf(PKTFILESUFF "\n", pktnum, pkt->stream_index, pkt->pts, pkt->size,
+               (pkt->flags & AV_PKT_FLAG_KEY) ? 'K' : '_');
         if (!nowrite) {
             fd  = open(pktfilename, O_WRONLY | O_CREAT, 0644);
-            err = write(fd, pkt.data, pkt.size);
+            err = write(fd, pkt->data, pkt->size);
             if (err < 0) {
                 fprintf(stderr, "write: error %d\n", err);
                 return 1;
             }
             close(fd);
         }
-        av_free_packet(&pkt);
+        av_packet_unref(pkt);
         pktnum++;
         if (maxpkts && (pktnum >= maxpkts))
             break;
     }
 
+    av_packet_free(&pkt);
     avformat_close_input(&fctx);
 
     while (donotquit)

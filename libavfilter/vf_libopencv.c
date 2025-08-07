@@ -23,15 +23,22 @@
  * libopencv wrapper functions
  */
 
+#include "config.h"
+#if HAVE_OPENCV2_CORE_CORE_C_H
+#include <opencv2/core/core_c.h>
+#include <opencv2/imgproc/imgproc_c.h>
+#else
 #include <opencv/cv.h>
 #include <opencv/cxcore.h>
+#endif
 #include "libavutil/avstring.h"
 #include "libavutil/common.h"
 #include "libavutil/file.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "avfilter.h"
+#include "filters.h"
 #include "formats.h"
-#include "internal.h"
 #include "video.h"
 
 static void fill_iplimage_from_frame(IplImage *img, const AVFrame *frame, enum AVPixelFormat pixfmt)
@@ -56,17 +63,6 @@ static void fill_frame_from_iplimage(AVFrame *frame, const IplImage *img, enum A
 {
     frame->linesize[0] = img->widthStep;
     frame->data[0]     = img->imageData;
-}
-
-static int query_formats(AVFilterContext *ctx)
-{
-    static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_BGR24, AV_PIX_FMT_BGRA, AV_PIX_FMT_GRAY8, AV_PIX_FMT_NONE
-    };
-    AVFilterFormats *fmts_list = ff_make_format_list(pix_fmts);
-    if (!fmts_list)
-        return AVERROR(ENOMEM);
-    return ff_set_common_formats(ctx, fmts_list);
 }
 
 typedef struct OCVContext {
@@ -151,7 +147,8 @@ static int read_shape_from_file(int *cols, int *rows, int **values, const char *
         if (buf[i] == '\n') {
             if (*rows == INT_MAX) {
                 av_log(log_ctx, AV_LOG_ERROR, "Overflow on the number of rows in the file\n");
-                return AVERROR_INVALIDDATA;
+                ret = AVERROR_INVALIDDATA;
+                goto end;
             }
             ++(*rows);
             *cols = FFMAX(*cols, w);
@@ -165,10 +162,13 @@ static int read_shape_from_file(int *cols, int *rows, int **values, const char *
     if (*rows > (SIZE_MAX / sizeof(int) / *cols)) {
         av_log(log_ctx, AV_LOG_ERROR, "File with size %dx%d is too big\n",
                *rows, *cols);
-        return AVERROR_INVALIDDATA;
+        ret = AVERROR_INVALIDDATA;
+        goto end;
     }
-    if (!(*values = av_mallocz_array(sizeof(int) * *rows, *cols)))
-        return AVERROR(ENOMEM);
+    if (!(*values = av_calloc(sizeof(int) * *rows, *cols))) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
 
     /* fill *values */
     p    = buf;
@@ -182,6 +182,8 @@ static int read_shape_from_file(int *cols, int *rows, int **values, const char *
                 (*values)[*cols*i + j] = !!av_isgraph(*(p++));
         }
     }
+
+end:
     av_file_unmap(buf, size);
 
 #ifdef DEBUG
@@ -404,7 +406,6 @@ static const AVFilterPad avfilter_vf_ocv_inputs[] = {
         .type         = AVMEDIA_TYPE_VIDEO,
         .filter_frame = filter_frame,
     },
-    { NULL }
 };
 
 static const AVFilterPad avfilter_vf_ocv_outputs[] = {
@@ -412,17 +413,16 @@ static const AVFilterPad avfilter_vf_ocv_outputs[] = {
         .name = "default",
         .type = AVMEDIA_TYPE_VIDEO,
     },
-    { NULL }
 };
 
-AVFilter ff_vf_ocv = {
-    .name          = "ocv",
-    .description   = NULL_IF_CONFIG_SMALL("Apply transform using libopencv."),
+const FFFilter ff_vf_ocv = {
+    .p.name        = "ocv",
+    .p.description = NULL_IF_CONFIG_SMALL("Apply transform using libopencv."),
+    .p.priv_class  = &ocv_class,
     .priv_size     = sizeof(OCVContext),
-    .priv_class    = &ocv_class,
-    .query_formats = query_formats,
     .init          = init,
     .uninit        = uninit,
-    .inputs        = avfilter_vf_ocv_inputs,
-    .outputs       = avfilter_vf_ocv_outputs,
+    FILTER_INPUTS(avfilter_vf_ocv_inputs),
+    FILTER_OUTPUTS(avfilter_vf_ocv_outputs),
+    FILTER_PIXFMTS(AV_PIX_FMT_BGR24, AV_PIX_FMT_BGRA, AV_PIX_FMT_GRAY8),
 };

@@ -23,6 +23,7 @@
 
 #include "config.h"
 
+#include "libavutil/attributes.h"
 #include "libavutil/cpu.h"
 #if   ARCH_AARCH64
 #   include "libavutil/aarch64/cpu.h"
@@ -31,6 +32,7 @@
 #endif
 
 #include "libavcodec/mpegvideo.h"
+#include "libavcodec/mpegvideo_unquantize.h"
 
 static void inline ff_dct_unquantize_h263_neon(int qscale, int qadd, int nCoeffs,
                                                int16_t *block)
@@ -123,7 +125,7 @@ static void dct_unquantize_h263_intra_neon(MpegEncContext *s, int16_t *block,
 }
 
 
-av_cold void ff_mpv_common_init_neon(MpegEncContext *s)
+av_cold void ff_mpv_unquantize_init_neon(MPVUnquantDSPContext *s, int bitexact)
 {
     int cpu_flags = av_get_cpu_flags();
 

@@ -21,40 +21,28 @@
  */
 
 #include "avcodec.h"
-#include "internal.h"
-
-static av_cold int yuv4_encode_init(AVCodecContext *avctx)
-{
-    avctx->coded_frame = av_frame_alloc();
-
-    if (!avctx->coded_frame) {
-        av_log(avctx, AV_LOG_ERROR, "Could not allocate frame.\n");
-        return AVERROR(ENOMEM);
-    }
-
-    return 0;
-}
+#include "codec_internal.h"
+#include "encode.h"
 
 static int yuv4_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
                              const AVFrame *pic, int *got_packet)
 {
     uint8_t *dst;
-    uint8_t *y, *u, *v;
-    int i, j, ret;
+    const uint8_t *y, *u, *v;
+    int ret;
 
-    if ((ret = ff_alloc_packet2(avctx, pkt, 6 * (avctx->width + 1 >> 1) * (avctx->height + 1 >> 1))) < 0)
+    ret = ff_get_encode_buffer(avctx, pkt, 6 * ((avctx->width  + 1) / 2)
+                                             * ((avctx->height + 1) / 2), 0);
+    if (ret < 0)
         return ret;
     dst = pkt->data;
-
-    avctx->coded_frame->key_frame = 1;
-    avctx->coded_frame->pict_type = AV_PICTURE_TYPE_I;
 
     y = pic->data[0];
     u = pic->data[1];
     v = pic->data[2];
 
-    for (i = 0; i < avctx->height + 1 >> 1; i++) {
-        for (j = 0; j < avctx->width + 1 >> 1; j++) {
+    for (int i = 0; i < avctx->height / 2; i++) {
+        for (int j = 0; j < (avctx->width + 1) / 2; j++) {
             *dst++ = u[j] ^ 0x80;
             *dst++ = v[j] ^ 0x80;
             *dst++ = y[                   2 * j    ];
@@ -67,25 +55,27 @@ static int yuv4_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
         v +=     pic->linesize[2];
     }
 
-    pkt->flags |= AV_PKT_FLAG_KEY;
+    if (avctx->height & 1) {
+        for (int j = 0; j < (avctx->width + 1) / 2; j++) {
+            *dst++ = u[j] ^ 0x80;
+            *dst++ = v[j] ^ 0x80;
+            *dst++ = y[2 * j    ];
+            *dst++ = y[2 * j + 1];
+            *dst++ = y[2 * j    ];
+            *dst++ = y[2 * j + 1];
+        }
+    }
+
     *got_packet = 1;
     return 0;
 }
 
-static av_cold int yuv4_encode_close(AVCodecContext *avctx)
-{
-    av_frame_free(&avctx->coded_frame);
-
-    return 0;
-}
-
-AVCodec ff_yuv4_encoder = {
-    .name         = "yuv4",
-    .long_name    = NULL_IF_CONFIG_SMALL("Uncompressed packed 4:2:0"),
-    .type         = AVMEDIA_TYPE_VIDEO,
-    .id           = AV_CODEC_ID_YUV4,
-    .init         = yuv4_encode_init,
-    .encode2      = yuv4_encode_frame,
-    .close        = yuv4_encode_close,
-    .pix_fmts     = (const enum AVPixelFormat[]){ AV_PIX_FMT_YUV420P, AV_PIX_FMT_NONE },
+const FFCodec ff_yuv4_encoder = {
+    .p.name         = "yuv4",
+    CODEC_LONG_NAME("Uncompressed packed 4:2:0"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_YUV4,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
+    CODEC_PIXFMTS(AV_PIX_FMT_YUV420P),
+    FF_CODEC_ENCODE_CB(yuv4_encode_frame),
 };

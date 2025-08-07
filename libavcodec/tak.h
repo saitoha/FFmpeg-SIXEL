@@ -29,9 +29,7 @@
 
 #include <stdint.h>
 
-#define BITSTREAM_READER_LE
 #include "get_bits.h"
-#include "avcodec.h"
 
 #define TAK_FORMAT_DATA_TYPE_BITS               3
 #define TAK_FORMAT_SAMPLE_RATE_BITS            18
@@ -45,7 +43,6 @@
 #define TAK_LAST_FRAME_SIZE_BITS               24
 #define TAK_ENCODER_CODEC_BITS                  6
 #define TAK_ENCODER_PROFILE_BITS                4
-#define TAK_ENCODER_VERSION_BITS               24
 #define TAK_SAMPLE_RATE_MIN                  6000
 #define TAK_CHANNELS_MIN                        1
 #define TAK_BPS_MIN                             8
@@ -144,20 +141,22 @@ int ff_tak_check_crc(const uint8_t *buf, unsigned int buf_size);
 
 /**
  * Parse the Streaminfo metadata block.
- * @param[in]  gb pointer to GetBitContext
  * @param[out] s  storage for parsed information
+ * @param[in]  buf   input buffer
+ * @param[in]  size  size of input buffer in bytes
+ * @return non-zero on error, 0 if OK
  */
-void avpriv_tak_parse_streaminfo(GetBitContext *gb, TAKStreamInfo *s);
+int avpriv_tak_parse_streaminfo(TAKStreamInfo *s, const uint8_t *buf, int size);
 
 /**
  * Validate and decode a frame header.
- * @param      avctx             AVCodecContext to use as av_log() context
+ * @param      logctx            for use as av_log() context
  * @param[in]  gb                GetBitContext from which to read frame header
  * @param[out] s                 frame information
  * @param      log_level_offset  log level offset, can be used to silence
  *                               error messages.
  * @return non-zero on error, 0 if OK
  */
-int ff_tak_decode_frame_header(AVCodecContext *avctx, GetBitContext *gb,
+int ff_tak_decode_frame_header(void *logctx, GetBitContext *gb,
                                TAKStreamInfo *s, int log_level_offset);
 #endif /* AVCODEC_TAK_H */

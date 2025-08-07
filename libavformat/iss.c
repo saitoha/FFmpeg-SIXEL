@@ -28,6 +28,7 @@
 
 #include "libavutil/channel_layout.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 #include "libavutil/avstring.h"
 
@@ -58,7 +59,7 @@ static void get_token(AVIOContext *s, char *buf, int maxlen)
     buf[i] = 0; /* Ensure null terminated, but may be truncated */
 }
 
-static int iss_probe(AVProbeData *p)
+static int iss_probe(const AVProbeData *p)
 {
     if (strncmp(p->buf, ISS_SIG, ISS_SIG_LEN))
         return 0;
@@ -107,23 +108,24 @@ static av_cold int iss_read_header(AVFormatContext *s)
     st = avformat_new_stream(s, NULL);
     if (!st)
         return AVERROR(ENOMEM);
-    st->codec->codec_type = AVMEDIA_TYPE_AUDIO;
-    st->codec->codec_id = AV_CODEC_ID_ADPCM_IMA_ISS;
+    st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
+    st->codecpar->codec_id = AV_CODEC_ID_ADPCM_IMA_ISS;
+
     if (stereo) {
-        st->codec->channels       = 2;
-        st->codec->channel_layout = AV_CH_LAYOUT_STEREO;
+        st->codecpar->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
     } else {
-        st->codec->channels       = 1;
-        st->codec->channel_layout = AV_CH_LAYOUT_MONO;
+        st->codecpar->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
     }
-    st->codec->sample_rate = 44100;
+
+    st->codecpar->sample_rate = 44100;
     if(rate_divisor > 0)
-         st->codec->sample_rate /= rate_divisor;
-    st->codec->bits_per_coded_sample = 4;
-    st->codec->bit_rate = st->codec->channels * st->codec->sample_rate
-                                      * st->codec->bits_per_coded_sample;
-    st->codec->block_align = iss->packet_size;
-    avpriv_set_pts_info(st, 32, 1, st->codec->sample_rate);
+         st->codecpar->sample_rate /= rate_divisor;
+    st->codecpar->bits_per_coded_sample = 4;
+    st->codecpar->bit_rate = st->codecpar->ch_layout.nb_channels *
+                             st->codecpar->sample_rate *
+                             st->codecpar->bits_per_coded_sample;
+    st->codecpar->block_align = iss->packet_size;
+    avpriv_set_pts_info(st, 32, 1, st->codecpar->sample_rate);
 
     return 0;
 }
@@ -138,14 +140,14 @@ static int iss_read_packet(AVFormatContext *s, AVPacket *pkt)
 
     pkt->stream_index = 0;
     pkt->pts = avio_tell(s->pb) - iss->sample_start_pos;
-    if(s->streams[0]->codec->channels > 0)
-        pkt->pts /= s->streams[0]->codec->channels*2;
+    if (s->streams[0]->codecpar->ch_layout.nb_channels > 0)
+        pkt->pts /= s->streams[0]->codecpar->ch_layout.nb_channels * 2;
     return 0;
 }
 
-AVInputFormat ff_iss_demuxer = {
-    .name           = "iss",
-    .long_name      = NULL_IF_CONFIG_SMALL("Funcom ISS"),
+const FFInputFormat ff_iss_demuxer = {
+    .p.name         = "iss",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Funcom ISS"),
     .priv_data_size = sizeof(IssDemuxContext),
     .read_probe     = iss_probe,
     .read_header    = iss_read_header,

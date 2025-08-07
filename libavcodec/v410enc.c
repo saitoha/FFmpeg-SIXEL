@@ -23,6 +23,8 @@
 #include "libavutil/common.h"
 #include "libavutil/intreadwrite.h"
 #include "avcodec.h"
+#include "codec_internal.h"
+#include "encode.h"
 #include "internal.h"
 
 static av_cold int v410_encode_init(AVCodecContext *avctx)
@@ -32,12 +34,10 @@ static av_cold int v410_encode_init(AVCodecContext *avctx)
         return AVERROR_INVALIDDATA;
     }
 
-    avctx->coded_frame = av_frame_alloc();
+    avctx->bits_per_coded_sample = 32;
+    avctx->bit_rate = ff_guess_coded_bitrate(avctx);
 
-    if (!avctx->coded_frame) {
-        av_log(avctx, AV_LOG_ERROR, "Could not allocate frame.\n");
-        return AVERROR(ENOMEM);
-    }
+    av_log(avctx, AV_LOG_WARNING, "This encoder is deprecated and will be removed.\n");
 
     return 0;
 }
@@ -46,16 +46,14 @@ static int v410_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
                              const AVFrame *pic, int *got_packet)
 {
     uint8_t *dst;
-    uint16_t *y, *u, *v;
+    const uint16_t *y, *u, *v;
     uint32_t val;
     int i, j, ret;
 
-    if ((ret = ff_alloc_packet2(avctx, pkt, avctx->width * avctx->height * 4)) < 0)
+    ret = ff_get_encode_buffer(avctx, pkt, avctx->width * avctx->height * 4, 0);
+    if (ret < 0)
         return ret;
     dst = pkt->data;
-
-    avctx->coded_frame->key_frame = 1;
-    avctx->coded_frame->pict_type = AV_PICTURE_TYPE_I;
 
     y = (uint16_t *)pic->data[0];
     u = (uint16_t *)pic->data[1];
@@ -74,25 +72,17 @@ static int v410_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
         v += pic->linesize[2] >> 1;
     }
 
-    pkt->flags |= AV_PKT_FLAG_KEY;
     *got_packet = 1;
     return 0;
 }
 
-static av_cold int v410_encode_close(AVCodecContext *avctx)
-{
-    av_frame_free(&avctx->coded_frame);
-
-    return 0;
-}
-
-AVCodec ff_v410_encoder = {
-    .name         = "v410",
-    .long_name    = NULL_IF_CONFIG_SMALL("Uncompressed 4:4:4 10-bit"),
-    .type         = AVMEDIA_TYPE_VIDEO,
-    .id           = AV_CODEC_ID_V410,
+const FFCodec ff_v410_encoder = {
+    .p.name       = "v410",
+    CODEC_LONG_NAME("Uncompressed 4:4:4 10-bit"),
+    .p.type       = AVMEDIA_TYPE_VIDEO,
+    .p.id         = AV_CODEC_ID_V410,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
     .init         = v410_encode_init,
-    .encode2      = v410_encode_frame,
-    .close        = v410_encode_close,
-    .pix_fmts     = (const enum AVPixelFormat[]){ AV_PIX_FMT_YUV444P10, AV_PIX_FMT_NONE },
+    FF_CODEC_ENCODE_CB(v410_encode_frame),
+    CODEC_PIXFMTS(AV_PIX_FMT_YUV444P10),
 };

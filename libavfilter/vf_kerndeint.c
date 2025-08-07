@@ -28,14 +28,15 @@
 
 #include "libavutil/imgutils.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 
 #include "avfilter.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
+#include "video.h"
 
-typedef struct {
+typedef struct KerndeintContext {
     const AVClass *class;
     int           frame; ///< frame count, starting from 0
     int           thresh, map, order, sharp, twoway;
@@ -50,10 +51,10 @@ typedef struct {
 #define FLAGS AV_OPT_FLAG_VIDEO_PARAM|AV_OPT_FLAG_FILTERING_PARAM
 static const AVOption kerndeint_options[] = {
     { "thresh", "set the threshold", OFFSET(thresh), AV_OPT_TYPE_INT, {.i64=10}, 0, 255, FLAGS },
-    { "map",    "set the map", OFFSET(map), AV_OPT_TYPE_INT, {.i64=0}, 0, 1, FLAGS },
-    { "order",  "set the order", OFFSET(order), AV_OPT_TYPE_INT, {.i64=0}, 0, 1, FLAGS },
-    { "sharp",  "enable sharpening", OFFSET(sharp), AV_OPT_TYPE_INT, {.i64=0}, 0, 1, FLAGS },
-    { "twoway", "enable twoway", OFFSET(twoway), AV_OPT_TYPE_INT, {.i64=0}, 0, 1, FLAGS },
+    { "map",    "set the map",    OFFSET(map),    AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS },
+    { "order",  "set the order",  OFFSET(order),  AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS },
+    { "sharp",  "set sharpening", OFFSET(sharp),  AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS },
+    { "twoway", "set twoway",     OFFSET(twoway), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS },
     { NULL }
 };
 
@@ -66,23 +67,15 @@ static av_cold void uninit(AVFilterContext *ctx)
     av_freep(&kerndeint->tmp_data[0]);
 }
 
-static int query_formats(AVFilterContext *ctx)
-{
-    static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_YUV420P,
-        AV_PIX_FMT_YUYV422,
-        AV_PIX_FMT_ARGB, AV_PIX_FMT_0RGB,
-        AV_PIX_FMT_ABGR, AV_PIX_FMT_0BGR,
-        AV_PIX_FMT_RGBA, AV_PIX_FMT_RGB0,
-        AV_PIX_FMT_BGRA, AV_PIX_FMT_BGR0,
-        AV_PIX_FMT_NONE
-    };
-
-    AVFilterFormats *fmts_list = ff_make_format_list(pix_fmts);
-    if (!fmts_list)
-        return AVERROR(ENOMEM);
-    return ff_set_common_formats(ctx, fmts_list);
-}
+static const enum AVPixelFormat pix_fmts[] = {
+    AV_PIX_FMT_YUV420P,
+    AV_PIX_FMT_YUYV422,
+    AV_PIX_FMT_ARGB, AV_PIX_FMT_0RGB,
+    AV_PIX_FMT_ABGR, AV_PIX_FMT_0BGR,
+    AV_PIX_FMT_RGBA, AV_PIX_FMT_RGB0,
+    AV_PIX_FMT_BGRA, AV_PIX_FMT_BGR0,
+    AV_PIX_FMT_NONE
+};
 
 static int config_props(AVFilterLink *inlink)
 {
@@ -149,10 +142,10 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *inpic)
         return AVERROR(ENOMEM);
     }
     av_frame_copy_props(outpic, inpic);
-    outpic->interlaced_frame = 0;
+    outpic->flags &= ~AV_FRAME_FLAG_INTERLACED;
 
     for (plane = 0; plane < 4 && inpic->data[plane] && inpic->linesize[plane]; plane++) {
-        h = plane == 0 ? inlink->h : FF_CEIL_RSHIFT(inlink->h, kerndeint->vsub);
+        h = plane == 0 ? inlink->h : AV_CEIL_RSHIFT(inlink->h, kerndeint->vsub);
         bwidth = kerndeint->tmp_bwidth[plane];
 
         srcp_saved        = inpic->data[plane];
@@ -295,25 +288,16 @@ static const AVFilterPad kerndeint_inputs[] = {
         .filter_frame = filter_frame,
         .config_props = config_props,
     },
-    { NULL }
-};
-
-static const AVFilterPad kerndeint_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-    { NULL }
 };
 
 
-AVFilter ff_vf_kerndeint = {
-    .name          = "kerndeint",
-    .description   = NULL_IF_CONFIG_SMALL("Apply kernel deinterlacing to the input."),
+const FFFilter ff_vf_kerndeint = {
+    .p.name        = "kerndeint",
+    .p.description = NULL_IF_CONFIG_SMALL("Apply kernel deinterlacing to the input."),
+    .p.priv_class  = &kerndeint_class,
     .priv_size     = sizeof(KerndeintContext),
-    .priv_class    = &kerndeint_class,
     .uninit        = uninit,
-    .query_formats = query_formats,
-    .inputs        = kerndeint_inputs,
-    .outputs       = kerndeint_outputs,
+    FILTER_INPUTS(kerndeint_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_PIXFMTS_ARRAY(pix_fmts),
 };

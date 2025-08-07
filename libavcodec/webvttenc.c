@@ -22,10 +22,10 @@
 
 #include <stdarg.h>
 #include "avcodec.h"
-#include "libavutil/avstring.h"
 #include "libavutil/bprint.h"
 #include "ass_split.h"
 #include "ass.h"
+#include "codec_internal.h"
 
 #define WEBVTT_STACK_SIZE 64
 typedef struct {
@@ -38,10 +38,7 @@ typedef struct {
     int stack_ptr;
 } WebVTTContext;
 
-#ifdef __GNUC__
-__attribute__ ((__format__ (__printf__, 2, 3)))
-#endif
-static void webvtt_print(WebVTTContext *s, const char *str, ...)
+static av_printf_format(2, 3) void webvtt_print(WebVTTContext *s, const char *str, ...)
 {
     va_list vargs;
     va_start(vargs, str);
@@ -159,33 +156,33 @@ static int webvtt_encode_frame(AVCodecContext *avctx,
 {
     WebVTTContext *s = avctx->priv_data;
     ASSDialog *dialog;
-    int i, num;
+    int i;
 
-    av_bprint_clear(&s->buffer);
+    av_bprint_init_for_buffer(&s->buffer, buf, bufsize);
 
     for (i=0; i<sub->num_rects; i++) {
+        const char *ass = sub->rects[i]->ass;
+
         if (sub->rects[i]->type != SUBTITLE_ASS) {
             av_log(avctx, AV_LOG_ERROR, "Only SUBTITLE_ASS type supported.\n");
-            return AVERROR(ENOSYS);
+            return AVERROR(EINVAL);
         }
 
-        dialog = ff_ass_split_dialog(s->ass_ctx, sub->rects[i]->ass, 0, &num);
-        for (; dialog && num--; dialog++) {
-            webvtt_style_apply(s, dialog->style);
-            ff_ass_split_override_codes(&webvtt_callbacks, s, dialog->text);
-        }
+        dialog = ff_ass_split_dialog(s->ass_ctx, ass);
+        if (!dialog)
+            return AVERROR(ENOMEM);
+        webvtt_style_apply(s, dialog->style);
+        ff_ass_split_override_codes(&webvtt_callbacks, s, dialog->text);
+        ff_ass_free_dialog(&dialog);
     }
 
-    if (!av_bprint_is_complete(&s->buffer))
-        return AVERROR(ENOMEM);
     if (!s->buffer.len)
         return 0;
 
-    if (s->buffer.len > bufsize) {
+    if (!av_bprint_is_complete(&s->buffer)) {
         av_log(avctx, AV_LOG_ERROR, "Buffer too small for ASS event.\n");
-        return -1;
+        return AVERROR_BUFFER_TOO_SMALL;
     }
-    memcpy(buf, s->buffer.str, s->buffer.len);
 
     return s->buffer.len;
 }
@@ -194,7 +191,6 @@ static int webvtt_encode_close(AVCodecContext *avctx)
 {
     WebVTTContext *s = avctx->priv_data;
     ff_ass_split_free(s->ass_ctx);
-    av_bprint_finalize(&s->buffer, NULL);
     return 0;
 }
 
@@ -203,17 +199,16 @@ static av_cold int webvtt_encode_init(AVCodecContext *avctx)
     WebVTTContext *s = avctx->priv_data;
     s->avctx = avctx;
     s->ass_ctx = ff_ass_split(avctx->subtitle_header);
-    av_bprint_init(&s->buffer, 0, AV_BPRINT_SIZE_UNLIMITED);
     return s->ass_ctx ? 0 : AVERROR_INVALIDDATA;
 }
 
-AVCodec ff_webvtt_encoder = {
-    .name           = "webvtt",
-    .long_name      = NULL_IF_CONFIG_SMALL("WebVTT subtitle"),
-    .type           = AVMEDIA_TYPE_SUBTITLE,
-    .id             = AV_CODEC_ID_WEBVTT,
+const FFCodec ff_webvtt_encoder = {
+    .p.name         = "webvtt",
+    CODEC_LONG_NAME("WebVTT subtitle"),
+    .p.type         = AVMEDIA_TYPE_SUBTITLE,
+    .p.id           = AV_CODEC_ID_WEBVTT,
     .priv_data_size = sizeof(WebVTTContext),
     .init           = webvtt_encode_init,
-    .encode_sub     = webvtt_encode_frame,
+    FF_CODEC_ENCODE_SUB_CB(webvtt_encode_frame),
     .close          = webvtt_encode_close,
 };

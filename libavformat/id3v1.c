@@ -20,7 +20,6 @@
  */
 
 #include "id3v1.h"
-#include "libavcodec/avcodec.h"
 #include "libavutil/dict.h"
 
 /* See Genre List at http://id3.org/id3v2.3.0 */
@@ -92,7 +91,7 @@ const char * const ff_id3v1_genre_str[ID3v1_GENRE_MAX + 1] = {
      [64] = "Native American",
      [65] = "Cabaret",
      [66] = "New Wave",
-     [67] = "Psychadelic", /* sic, the misspelling is used in the specification */
+     [67] = "Psychedelic",
      [68] = "Rave",
      [69] = "Showtunes",
      [70] = "Trailer",
@@ -110,7 +109,7 @@ const char * const ff_id3v1_genre_str[ID3v1_GENRE_MAX + 1] = {
      [82] = "National Folk",
      [83] = "Swing",
      [84] = "Fast Fusion",
-     [85] = "Bebob",
+     [85] = "Bebop",
      [86] = "Latin",
      [87] = "Revival",
      [88] = "Celtic",
@@ -148,20 +147,20 @@ const char * const ff_id3v1_genre_str[ID3v1_GENRE_MAX + 1] = {
     [120] = "Duet",
     [121] = "Punk Rock",
     [122] = "Drum Solo",
-    [123] = "A capella",
+    [123] = "A Cappella",
     [124] = "Euro-House",
     [125] = "Dance Hall",
     [126] = "Goa",
     [127] = "Drum & Bass",
     [128] = "Club-House",
-    [129] = "Hardcore",
+    [129] = "Hardcore Techno",
     [130] = "Terror",
     [131] = "Indie",
     [132] = "BritPop",
     [133] = "Negerpunk",
     [134] = "Polsk Punk",
     [135] = "Beat",
-    [136] = "Christian Gangsta",
+    [136] = "Christian Gangsta Rap",
     [137] = "Heavy Metal",
     [138] = "Black Metal",
     [139] = "Crossover",
@@ -171,8 +170,52 @@ const char * const ff_id3v1_genre_str[ID3v1_GENRE_MAX + 1] = {
     [143] = "Salsa",
     [144] = "Thrash Metal",
     [145] = "Anime",
-    [146] = "JPop",
-    [147] = "SynthPop",
+    [146] = "Jpop",
+    [147] = "Synthpop",
+    [148] = "Abstract",
+    [149] = "Art Rock",
+    [150] = "Baroque",
+    [151] = "Bhangra",
+    [152] = "Big Beat",
+    [153] = "Breakbeat",
+    [154] = "Chillout",
+    [155] = "Downtempo",
+    [156] = "Dub",
+    [157] = "EBM",
+    [158] = "Eclectic",
+    [159] = "Electro",
+    [160] = "Electroclash",
+    [161] = "Emo",
+    [162] = "Experimental",
+    [163] = "Garage",
+    [164] = "Global",
+    [165] = "IDM",
+    [166] = "Illbient",
+    [167] = "Industro-Goth",
+    [168] = "Jam Band",
+    [169] = "Krautrock",
+    [170] = "Leftfield",
+    [171] = "Lounge",
+    [172] = "Math Rock",
+    [173] = "New Romantic",
+    [174] = "Nu-Breakz",
+    [175] = "Post-Punk",
+    [176] = "Post-Rock",
+    [177] = "Psytrance",
+    [178] = "Shoegaze",
+    [179] = "Space Rock",
+    [180] = "Trop Rock",
+    [181] = "World Music",
+    [182] = "Neoclassical",
+    [183] = "Audiobook",
+    [184] = "Audio Theatre",
+    [185] = "Neue Deutsche Welle",
+    [186] = "Podcast",
+    [187] = "Indie Rock",
+    [188] = "G-Funk",
+    [189] = "Dubstep",
+    [190] = "Garage Rock",
+    [191] = "Psybient"
 };
 
 static void get_string(AVFormatContext *s, const char *key,
@@ -238,7 +281,7 @@ void ff_id3v1_read(AVFormatContext *s)
     uint8_t buf[ID3v1_TAG_SIZE];
     int64_t filesize, position = avio_tell(s->pb);
 
-    if (s->pb->seekable) {
+    if (s->pb->seekable & AVIO_SEEKABLE_NORMAL) {
         /* XXX: change that */
         filesize = avio_size(s->pb);
         if (filesize > 128) {

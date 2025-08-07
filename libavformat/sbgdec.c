@@ -22,11 +22,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include "libavutil/bprint.h"
+#include "libavutil/channel_layout.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/log.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/time_internal.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
 #define SBG_SCALE (1 << 16)
@@ -181,6 +185,7 @@ static int str_to_time(const char *str, int64_t *rtime)
     char *end;
     int hours, minutes;
     double seconds = 0;
+    int64_t ts = 0;
 
     if (*cur < '0' || *cur > '9')
         return 0;
@@ -196,8 +201,9 @@ static int str_to_time(const char *str, int64_t *rtime)
         seconds = strtod(cur + 1, &end);
         if (end > cur + 1)
             cur = end;
+        ts = av_clipd(seconds * AV_TIME_BASE, INT64_MIN/2, INT64_MAX/2);
     }
-    *rtime = (hours * 3600 + minutes * 60 + seconds) * AV_TIME_BASE;
+    *rtime = av_sat_add64((hours * 3600LL + minutes * 60LL) * AV_TIME_BASE, ts);
     return cur - str;
 }
 
@@ -382,7 +388,7 @@ static int parse_options(struct sbg_parser *p)
                 case 'L':
                     FORWARD_ERROR(parse_optarg(p, opt, &oarg));
                     r = str_to_time(oarg.s, &p->scs.opt_duration);
-                    if (oarg.e != oarg.s + r) {
+                    if (oarg.e != oarg.s + r || p->scs.opt_duration < 0) {
                         snprintf(p->err_msg, sizeof(p->err_msg),
                                  "syntax error for option -L");
                         return AVERROR_INVALIDDATA;
@@ -474,6 +480,8 @@ static int parse_timestamp(struct sbg_parser *p,
     while (lex_char(p, '+')) {
         if (!lex_time(p, &dt))
             return AVERROR_INVALIDDATA;
+        if (av_sat_add64(rel, dt) - dt != rel)
+            return AVERROR_INVALIDDATA;
         rel += dt;
         r = 1;
     }
@@ -536,6 +544,9 @@ static int parse_time_sequence(struct sbg_parser *p, int inblock)
         return AVERROR_INVALIDDATA;
     }
     ts.type = p->current_time.type;
+
+    if (av_sat_add64(p->current_time.t, rel_ts) != p->current_time.t + (uint64_t)rel_ts)
+        return AVERROR_INVALIDDATA;
     ts.t    = p->current_time.t + rel_ts;
     r = parse_fade(p, &fade);
     if (r < 0)
@@ -851,40 +862,23 @@ fail:
     return r;
 }
 
-static int read_whole_file(AVIOContext *io, int max_size, char **rbuf)
+static int read_whole_file(AVIOContext *io, int max_size, AVBPrint *rbuf)
 {
-    char *buf = NULL;
-    int size = 0, bufsize = 0, r;
-
-    while (1) {
-        if (bufsize - size < 1024) {
-            bufsize = FFMIN(FFMAX(2 * bufsize, 8192), max_size);
-            if (bufsize - size < 2) {
-                size = AVERROR(EFBIG);
-                goto fail;
-            }
-            buf = av_realloc_f(buf, bufsize, 1);
-            if (!buf) {
-                size = AVERROR(ENOMEM);
-                goto fail;
-            }
-        }
-        r = avio_read(io, buf, bufsize - size - 1);
-        if (r == AVERROR_EOF)
-            break;
-        if (r < 0)
-            goto fail;
-        size += r;
-    }
-    buf[size] = 0;
-    *rbuf = buf;
-    return size;
-fail:
-    av_free(buf);
-    return size;
+    int ret = avio_read_to_bprint(io, rbuf, max_size);
+    if (ret < 0)
+        return ret;
+    if (!av_bprint_is_complete(rbuf))
+        return AVERROR(ENOMEM);
+    /* Check if we have read the whole file. AVIOContext.eof_reached is only
+     * set after a read failed due to EOF, so this check is incorrect in case
+     * max_size equals the actual file size, but checking for that would
+     * require attempting to read beyond max_size. */
+    if (!io->eof_reached)
+        return AVERROR(EFBIG);
+    return 0;
 }
 
-static void expand_timestamps(void *log, struct sbg_script *s)
+static int expand_timestamps(void *log, struct sbg_script *s)
 {
     int i, nb_rel = 0;
     int64_t now, cur_ts, delta = 0;
@@ -927,15 +921,21 @@ static void expand_timestamps(void *log, struct sbg_script *s)
         }
     }
     if (s->start_ts == AV_NOPTS_VALUE)
-        s->start_ts = s->opt_start_at_first ? s->tseq[0].ts.t : now;
+        s->start_ts = (s->opt_start_at_first && s->tseq) ? s->tseq[0].ts.t : now;
+    if (s->start_ts > INT64_MAX - s->opt_duration)
+        return AVERROR_INVALIDDATA;
+
     s->end_ts = s->opt_duration ? s->start_ts + s->opt_duration :
                 AV_NOPTS_VALUE; /* may be overridden later by -E option */
     cur_ts = now;
     for (i = 0; i < s->nb_tseq; i++) {
+        if (av_sat_add64(s->tseq[i].ts.t, delta) != s->tseq[i].ts.t + (uint64_t)delta)
+            return AVERROR_INVALIDDATA;
         if (s->tseq[i].ts.t + delta < cur_ts)
             delta += DAY_TS;
         cur_ts = s->tseq[i].ts.t += delta;
     }
+    return 0;
 }
 
 static int expand_tseq(void *log, struct sbg_script *s, int *nb_ev_max,
@@ -951,6 +951,9 @@ static int expand_tseq(void *log, struct sbg_script *s, int *nb_ev_max,
                tseq->name_len, tseq->name);
         return AVERROR(EINVAL);
     }
+    if (t0 + (uint64_t)tseq->ts.t != av_sat_add64(t0, tseq->ts.t))
+        return AVERROR(EINVAL);
+
     t0 += tseq->ts.t;
     for (i = 0; i < s->nb_def; i++) {
         if (s->def[i].name_len == tseq->name_len &&
@@ -973,6 +976,8 @@ static int expand_tseq(void *log, struct sbg_script *s, int *nb_ev_max,
     } else {
         ev = alloc_array_elem((void **)&s->events, sizeof(*ev),
                               &s->nb_events, nb_ev_max);
+        if (!ev)
+            return AVERROR(ENOMEM);
         ev->ts          = tseq->ts.t;
         ev->elements    = def->elements;
         ev->nb_elements = def->nb_elements;
@@ -986,7 +991,9 @@ static int expand_script(void *log, struct sbg_script *s)
 {
     int i, r, nb_events_max = 0;
 
-    expand_timestamps(log, s);
+    r = expand_timestamps(log, s);
+    if (r < 0)
+        return r;
     for (i = 0; i < s->nb_tseq; i++) {
         r = expand_tseq(log, s, &nb_events_max, 0, &s->tseq[i]);
         if (r < 0)
@@ -1268,7 +1275,10 @@ static int generate_intervals(void *log, struct sbg_script *s, int sample_rate,
     /* SBaGen handles the time before and after the extremal events,
        and the corresponding transitions, as if the sequence were cyclic
        with a 24-hours period. */
-    period = s->events[s->nb_events - 1].ts - s->events[0].ts;
+    period = s->events[s->nb_events - 1].ts - (uint64_t)s->events[0].ts;
+    if (period < 0)
+        return AVERROR_INVALIDDATA;
+
     period = (period + (DAY_TS - 1)) / DAY_TS * DAY_TS;
     period = FFMAX(period, DAY_TS);
 
@@ -1277,6 +1287,10 @@ static int generate_intervals(void *log, struct sbg_script *s, int sample_rate,
         ev1 = &s->events[i];
         ev2 = &s->events[(i + 1) % s->nb_events];
         ev1->ts_int   = ev1->ts;
+
+        if (!ev1->fade.slide && ev1 >= ev2 && ev2->ts > INT64_MAX - period)
+            return AVERROR_INVALIDDATA;
+
         ev1->ts_trans = ev1->fade.slide ? ev1->ts
                                         : ev2->ts + (ev1 < ev2 ? 0 : period);
     }
@@ -1292,6 +1306,8 @@ static int generate_intervals(void *log, struct sbg_script *s, int sample_rate,
 
     /* Pseudo event before the first one */
     ev0 = s->events[s->nb_events - 1];
+    if (av_sat_sub64(ev0.ts_int, period) != (uint64_t)ev0.ts_int - period)
+        return AVERROR_INVALIDDATA;
     ev0.ts_int   -= period;
     ev0.ts_trans -= period;
     ev0.ts_next  -= period;
@@ -1322,10 +1338,10 @@ static int generate_intervals(void *log, struct sbg_script *s, int sample_rate,
     return 0;
 }
 
-static int encode_intervals(struct sbg_script *s, AVCodecContext *avc,
+static int encode_intervals(struct sbg_script *s, AVCodecParameters *par,
                             struct ws_intervals *inter)
 {
-    int i, edata_size = 4;
+    int i, edata_size = 4, ret;
     uint8_t *edata;
 
     for (i = 0; i < inter->nb_inter; i++) {
@@ -1334,9 +1350,9 @@ static int encode_intervals(struct sbg_script *s, AVCodecContext *avc,
         if (edata_size < 0)
             return AVERROR(ENOMEM);
     }
-    if (ff_alloc_extradata(avc, edata_size))
-        return AVERROR(ENOMEM);
-    edata = avc->extradata;
+    if ((ret = ff_alloc_extradata(par, edata_size)) < 0)
+        return ret;
+    edata = par->extradata;
 
 #define ADD_EDATA32(v) do { AV_WL32(edata, (v)); edata += 4; } while(0)
 #define ADD_EDATA64(v) do { AV_WL64(edata, (v)); edata += 8; } while(0)
@@ -1360,12 +1376,12 @@ static int encode_intervals(struct sbg_script *s, AVCodecContext *avc,
                 break;
         }
     }
-    if (edata != avc->extradata + edata_size)
+    if (edata != par->extradata + edata_size)
         return AVERROR_BUG;
     return 0;
 }
 
-static av_cold int sbg_read_probe(AVProbeData *p)
+static av_cold int sbg_read_probe(const AVProbeData *p)
 {
     int r, score;
     struct sbg_script script = { 0 };
@@ -1380,18 +1396,21 @@ static av_cold int sbg_read_probe(AVProbeData *p)
 static av_cold int sbg_read_header(AVFormatContext *avf)
 {
     struct sbg_demuxer *sbg = avf->priv_data;
+    AVBPrint bprint;
     int r;
-    char *buf = NULL;
     struct sbg_script script = { 0 };
     AVStream *st;
+    FFStream *sti;
     struct ws_intervals inter = { 0 };
 
-    r = read_whole_file(avf->pb, sbg->max_file_size, &buf);
+    av_bprint_init(&bprint, 0, sbg->max_file_size + 1U);
+    r = read_whole_file(avf->pb, sbg->max_file_size, &bprint);
     if (r < 0)
-        goto fail;
-    r = parse_script(avf, buf, r, &script);
+        goto fail2;
+
+    r = parse_script(avf, bprint.str, bprint.len, &script);
     if (r < 0)
-        goto fail;
+        goto fail2;
     if (!sbg->sample_rate)
         sbg->sample_rate = script.sample_rate;
     else
@@ -1403,30 +1422,44 @@ static av_cold int sbg_read_header(AVFormatContext *avf)
                "-m is ignored and mix channels will be silent.\n");
     r = expand_script(avf, &script);
     if (r < 0)
-        goto fail;
-    av_freep(&buf);
+        goto fail2;
+    av_bprint_finalize(&bprint, NULL);
     r = generate_intervals(avf, &script, sbg->sample_rate, &inter);
     if (r < 0)
         goto fail;
 
+    if (script.end_ts != AV_NOPTS_VALUE && script.end_ts < script.start_ts) {
+        r = AVERROR_INVALIDDATA;
+        goto fail;
+    }
+
     st = avformat_new_stream(avf, NULL);
-    if (!st)
-        return AVERROR(ENOMEM);
-    st->codec->codec_type     = AVMEDIA_TYPE_AUDIO;
-    st->codec->codec_id       = AV_CODEC_ID_FFWAVESYNTH;
-    st->codec->channels       = 2;
-    st->codec->channel_layout = AV_CH_LAYOUT_STEREO;
-    st->codec->sample_rate    = sbg->sample_rate;
-    st->codec->frame_size     = sbg->frame_size;
-    avpriv_set_pts_info(st, 64, 1, st->codec->sample_rate);
-    st->probe_packets = 0;
+    if (!st) {
+        r = AVERROR(ENOMEM);
+        goto fail;
+    }
+    sti = ffstream(st);
+    st->codecpar->codec_type     = AVMEDIA_TYPE_AUDIO;
+    st->codecpar->codec_id       = AV_CODEC_ID_FFWAVESYNTH;
+    st->codecpar->ch_layout      = (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
+    st->codecpar->sample_rate    = sbg->sample_rate;
+    st->codecpar->frame_size     = sbg->frame_size;
+    avpriv_set_pts_info(st, 64, 1, st->codecpar->sample_rate);
+    sti->probe_packets = 0;
     st->start_time    = av_rescale(script.start_ts,
                                    sbg->sample_rate, AV_TIME_BASE);
     st->duration      = script.end_ts == AV_NOPTS_VALUE ? AV_NOPTS_VALUE :
                         av_rescale(script.end_ts - script.start_ts,
                                    sbg->sample_rate, AV_TIME_BASE);
-    st->cur_dts       = st->start_time;
-    r = encode_intervals(&script, st->codec, &inter);
+
+    if (st->duration != AV_NOPTS_VALUE && (
+        st->duration < 0 || st->start_time > INT64_MAX - st->duration)) {
+        r = AVERROR_INVALIDDATA;
+        goto fail;
+    }
+
+    sti->cur_dts      = st->start_time;
+    r = encode_intervals(&script, st->codecpar, &inter);
     if (r < 0)
         goto fail;
 
@@ -1434,26 +1467,28 @@ static av_cold int sbg_read_header(AVFormatContext *avf)
     free_script(&script);
     return 0;
 
+fail2:
+    av_bprint_finalize(&bprint, NULL);
 fail:
     av_free(inter.inter);
     free_script(&script);
-    av_free(buf);
     return r;
 }
 
 static int sbg_read_packet(AVFormatContext *avf, AVPacket *packet)
 {
     int64_t ts, end_ts;
+    int ret;
 
-    ts = avf->streams[0]->cur_dts;
-    end_ts = ts + avf->streams[0]->codec->frame_size;
+    ts = ffstream(avf->streams[0])->cur_dts;
+    end_ts = av_sat_add64(ts, avf->streams[0]->codecpar->frame_size);
     if (avf->streams[0]->duration != AV_NOPTS_VALUE)
         end_ts = FFMIN(avf->streams[0]->start_time + avf->streams[0]->duration,
                        end_ts);
     if (end_ts <= ts)
         return AVERROR_EOF;
-    if (av_new_packet(packet, 12) < 0)
-        return AVERROR(ENOMEM);
+    if ((ret = av_new_packet(packet, 12)) < 0)
+        return ret;
     packet->dts = packet->pts = ts;
     packet->duration = end_ts - ts;
     AV_WL64(packet->data + 0, ts);
@@ -1468,7 +1503,7 @@ static int sbg_read_seek2(AVFormatContext *avf, int stream_index,
         return AVERROR(EINVAL);
     if (stream_index < 0)
         ts = av_rescale_q(ts, AV_TIME_BASE_Q, avf->streams[0]->time_base);
-    avf->streams[0]->cur_dts = ts;
+    ffstream(avf->streams[0])->cur_dts = ts;
     return 0;
 }
 
@@ -1498,15 +1533,15 @@ static const AVClass sbg_demuxer_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-AVInputFormat ff_sbg_demuxer = {
-    .name           = "sbg",
-    .long_name      = NULL_IF_CONFIG_SMALL("SBaGen binaural beats script"),
+const FFInputFormat ff_sbg_demuxer = {
+    .p.name         = "sbg",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("SBaGen binaural beats script"),
+    .p.extensions   = "sbg",
+    .p.priv_class   = &sbg_demuxer_class,
     .priv_data_size = sizeof(struct sbg_demuxer),
     .read_probe     = sbg_read_probe,
     .read_header    = sbg_read_header,
     .read_packet    = sbg_read_packet,
     .read_seek      = sbg_read_seek,
     .read_seek2     = sbg_read_seek2,
-    .extensions     = "sbg",
-    .priv_class     = &sbg_demuxer_class,
 };

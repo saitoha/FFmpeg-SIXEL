@@ -25,6 +25,7 @@
 
 #include "libavutil/intreadwrite.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
 #define BLOCK_SIZE    18
@@ -34,34 +35,48 @@ typedef struct ADXDemuxerContext {
     int header_size;
 } ADXDemuxerContext;
 
+static int adx_probe(const AVProbeData *p)
+{
+    int offset;
+    if (AV_RB16(p->buf) != 0x8000)
+        return 0;
+    offset = AV_RB16(&p->buf[2]);
+    if (   offset < 8
+        || offset > p->buf_size - 4
+        || memcmp(p->buf + offset - 2, "(c)CRI", 6))
+        return 0;
+    return AVPROBE_SCORE_MAX * 3 / 4;
+}
+
 static int adx_read_packet(AVFormatContext *s, AVPacket *pkt)
 {
     ADXDemuxerContext *c = s->priv_data;
-    AVCodecContext *avctx = s->streams[0]->codec;
+    AVCodecParameters *par = s->streams[0]->codecpar;
     int ret, size;
 
-    if (avctx->channels <= 0) {
-        av_log(s, AV_LOG_ERROR, "invalid number of channels %d\n", avctx->channels);
-        return AVERROR_INVALIDDATA;
-    }
+    if (avio_feof(s->pb))
+        return AVERROR_EOF;
 
-    size = BLOCK_SIZE * avctx->channels;
+    size = BLOCK_SIZE * par->ch_layout.nb_channels;
 
     pkt->pos = avio_tell(s->pb);
     pkt->stream_index = 0;
 
-    ret = av_get_packet(s->pb, pkt, size);
-    if (ret != size) {
-        av_free_packet(pkt);
-        return ret < 0 ? ret : AVERROR(EIO);
+    ret = av_get_packet(s->pb, pkt, size * 128);
+    if (ret < 0)
+        return ret;
+    if ((ret % size) && ret >= size) {
+        size = ret - (ret % size);
+        av_shrink_packet(pkt, size);
+        pkt->flags &= ~AV_PKT_FLAG_CORRUPT;
+    } else if (ret < size) {
+        return AVERROR(EIO);
+    } else {
+        size = ret;
     }
-    if (AV_RB16(pkt->data) & 0x8000) {
-        av_free_packet(pkt);
-        return AVERROR_EOF;
-    }
-    pkt->size     = size;
-    pkt->duration = 1;
-    pkt->pts      = (pkt->pos - c->header_size) / size;
+
+    pkt->duration = size / (BLOCK_SIZE * par->ch_layout.nb_channels);
+    pkt->pts      = (pkt->pos - c->header_size) / (BLOCK_SIZE * par->ch_layout.nb_channels);
 
     return 0;
 }
@@ -69,48 +84,58 @@ static int adx_read_packet(AVFormatContext *s, AVPacket *pkt)
 static int adx_read_header(AVFormatContext *s)
 {
     ADXDemuxerContext *c = s->priv_data;
-    AVCodecContext *avctx;
+    AVCodecParameters *par;
+    int ret;
+    int channels;
 
     AVStream *st = avformat_new_stream(s, NULL);
     if (!st)
         return AVERROR(ENOMEM);
-    avctx = s->streams[0]->codec;
+    par = s->streams[0]->codecpar;
 
     if (avio_rb16(s->pb) != 0x8000)
         return AVERROR_INVALIDDATA;
     c->header_size = avio_rb16(s->pb) + 4;
     avio_seek(s->pb, -4, SEEK_CUR);
 
-    if (ff_get_extradata(avctx, s->pb, c->header_size) < 0)
-        return AVERROR(ENOMEM);
+    if ((ret = ff_get_extradata(s, par, s->pb, c->header_size)) < 0)
+        return ret;
 
-    if (avctx->extradata_size < 12) {
+    if (par->extradata_size < 12) {
         av_log(s, AV_LOG_ERROR, "Invalid extradata size.\n");
         return AVERROR_INVALIDDATA;
     }
-    avctx->channels    = AV_RB8(avctx->extradata + 7);
-    avctx->sample_rate = AV_RB32(avctx->extradata + 8);
+    channels = AV_RB8 (par->extradata + 7);
+    par->sample_rate = AV_RB32(par->extradata + 8);
 
-    if (avctx->channels <= 0) {
-        av_log(s, AV_LOG_ERROR, "invalid number of channels %d\n", avctx->channels);
+    if (channels <= 0) {
+        av_log(s, AV_LOG_ERROR, "invalid number of channels %d\n", channels);
         return AVERROR_INVALIDDATA;
     }
 
-    st->codec->codec_type  = AVMEDIA_TYPE_AUDIO;
-    st->codec->codec_id    = s->iformat->raw_codec_id;
+    if (par->sample_rate <= 0) {
+        av_log(s, AV_LOG_ERROR, "Invalid sample rate %d\n", par->sample_rate);
+        return AVERROR_INVALIDDATA;
+    }
 
-    avpriv_set_pts_info(st, 64, BLOCK_SAMPLES, avctx->sample_rate);
+    par->ch_layout.nb_channels = channels;
+    par->codec_type  = AVMEDIA_TYPE_AUDIO;
+    par->codec_id    = AV_CODEC_ID_ADPCM_ADX;
+    par->bit_rate    = (int64_t)par->sample_rate * par->ch_layout.nb_channels * BLOCK_SIZE * 8LL / BLOCK_SAMPLES;
+
+    avpriv_set_pts_info(st, 64, BLOCK_SAMPLES, par->sample_rate);
 
     return 0;
 }
 
-AVInputFormat ff_adx_demuxer = {
-    .name           = "adx",
-    .long_name      = NULL_IF_CONFIG_SMALL("CRI ADX"),
+const FFInputFormat ff_adx_demuxer = {
+    .p.name         = "adx",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("CRI ADX"),
+    .p.extensions   = "adx",
+    .p.flags        = AVFMT_GENERIC_INDEX,
+    .read_probe     = adx_probe,
     .priv_data_size = sizeof(ADXDemuxerContext),
     .read_header    = adx_read_header,
     .read_packet    = adx_read_packet,
-    .extensions     = "adx",
     .raw_codec_id   = AV_CODEC_ID_ADPCM_ADX,
-    .flags          = AVFMT_GENERIC_INDEX,
 };

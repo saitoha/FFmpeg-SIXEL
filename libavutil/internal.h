@@ -30,25 +30,18 @@
 #    define NDEBUG
 #endif
 
+// This can be enabled to allow detection of additional integer overflows with ubsan
+//#define CHECKED
+
 #include <limits.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <assert.h>
+#include <stdio.h>
 #include "config.h"
 #include "attributes.h"
-#include "timer.h"
-#include "cpu.h"
-#include "dict.h"
-#include "pixfmt.h"
-#include "version.h"
-
-#if ARCH_X86
-#   include "x86/emms.h"
-#endif
-
-#ifndef emms_c
-#   define emms_c() while(0)
-#endif
+#include "libm.h"
+#include "macros.h"
 
 #ifndef attribute_align_arg
 #if ARCH_X86_32 && AV_GCC_VERSION_AT_LEAST(4,2)
@@ -58,10 +51,10 @@
 #endif
 #endif
 
-#if defined(_MSC_VER) && CONFIG_SHARED
-#    define av_export __declspec(dllimport)
+#if defined(_WIN32) && CONFIG_SHARED && !defined(BUILDING_avutil)
+#    define av_export_avutil __declspec(dllimport)
 #else
-#    define av_export
+#    define av_export_avutil
 #endif
 
 #if HAVE_PRAGMA_DEPRECATED
@@ -72,8 +65,8 @@
 #        define FF_DISABLE_DEPRECATION_WARNINGS __pragma(warning(push)) __pragma(warning(disable:4996))
 #        define FF_ENABLE_DEPRECATION_WARNINGS  __pragma(warning(pop))
 #    else
-#        define FF_DISABLE_DEPRECATION_WARNINGS _Pragma("GCC diagnostic ignored \"-Wdeprecated-declarations\"")
-#        define FF_ENABLE_DEPRECATION_WARNINGS  _Pragma("GCC diagnostic warning \"-Wdeprecated-declarations\"")
+#        define FF_DISABLE_DEPRECATION_WARNINGS _Pragma("GCC diagnostic push") _Pragma("GCC diagnostic ignored \"-Wdeprecated-declarations\"")
+#        define FF_ENABLE_DEPRECATION_WARNINGS  _Pragma("GCC diagnostic pop")
 #    endif
 #else
 #    define FF_DISABLE_DEPRECATION_WARNINGS
@@ -81,142 +74,24 @@
 #endif
 
 
-#define FF_MEMORY_POISON 0x2a
+#define FF_ALLOC_TYPED_ARRAY(p, nelem)  (p = av_malloc_array(nelem, sizeof(*p)))
+#define FF_ALLOCZ_TYPED_ARRAY(p, nelem) (p = av_calloc(nelem, sizeof(*p)))
 
-#define MAKE_ACCESSORS(str, name, type, field) \
-    type av_##name##_get_##field(const str *s) { return s->field; } \
-    void av_##name##_set_##field(str *s, type v) { s->field = v; }
+#define FF_PTR_ADD(ptr, off) ((off) ? (ptr) + (off) : (ptr))
 
-// Some broken preprocessors need a second expansion
-// to be forced to tokenize __VA_ARGS__
-#define E1(x) x
-
-/* Check if the hard coded offset of a struct member still matches reality.
- * Induce a compilation failure if not.
+/**
+ * Access a field in a structure by its offset.
  */
-#define AV_CHECK_OFFSET(s, m, o) struct check_##o {    \
-        int x_##o[offsetof(s, m) == o? 1: -1];         \
-    }
-
-#define LOCAL_ALIGNED_A(a, t, v, s, o, ...)             \
-    uint8_t la_##v[sizeof(t s o) + (a)];                \
-    t (*v) o = (void *)FFALIGN((uintptr_t)la_##v, a)
-
-#define LOCAL_ALIGNED_D(a, t, v, s, o, ...)             \
-    DECLARE_ALIGNED(a, t, la_##v) s o;                  \
-    t (*v) o = la_##v
-
-#define LOCAL_ALIGNED(a, t, v, ...) E1(LOCAL_ALIGNED_A(a, t, v, __VA_ARGS__,,))
-
-#if HAVE_LOCAL_ALIGNED_8
-#   define LOCAL_ALIGNED_8(t, v, ...) E1(LOCAL_ALIGNED_D(8, t, v, __VA_ARGS__,,))
-#else
-#   define LOCAL_ALIGNED_8(t, v, ...) LOCAL_ALIGNED(8, t, v, __VA_ARGS__)
-#endif
-
-#if HAVE_LOCAL_ALIGNED_16
-#   define LOCAL_ALIGNED_16(t, v, ...) E1(LOCAL_ALIGNED_D(16, t, v, __VA_ARGS__,,))
-#else
-#   define LOCAL_ALIGNED_16(t, v, ...) LOCAL_ALIGNED(16, t, v, __VA_ARGS__)
-#endif
-
-#if HAVE_LOCAL_ALIGNED_32
-#   define LOCAL_ALIGNED_32(t, v, ...) E1(LOCAL_ALIGNED_D(32, t, v, __VA_ARGS__,,))
-#else
-#   define LOCAL_ALIGNED_32(t, v, ...) LOCAL_ALIGNED(32, t, v, __VA_ARGS__)
-#endif
-
-#define FF_ALLOC_OR_GOTO(ctx, p, size, label)\
-{\
-    p = av_malloc(size);\
-    if (!(p) && (size) != 0) {\
-        av_log(ctx, AV_LOG_ERROR, "Cannot allocate memory.\n");\
-        goto label;\
-    }\
-}
-
-#define FF_ALLOCZ_OR_GOTO(ctx, p, size, label)\
-{\
-    p = av_mallocz(size);\
-    if (!(p) && (size) != 0) {\
-        av_log(ctx, AV_LOG_ERROR, "Cannot allocate memory.\n");\
-        goto label;\
-    }\
-}
-
-#define FF_ALLOC_ARRAY_OR_GOTO(ctx, p, nelem, elsize, label)\
-{\
-    p = av_malloc_array(nelem, elsize);\
-    if (!p) {\
-        av_log(ctx, AV_LOG_ERROR, "Cannot allocate memory.\n");\
-        goto label;\
-    }\
-}
-
-#define FF_ALLOCZ_ARRAY_OR_GOTO(ctx, p, nelem, elsize, label)\
-{\
-    p = av_mallocz_array(nelem, elsize);\
-    if (!p) {\
-        av_log(ctx, AV_LOG_ERROR, "Cannot allocate memory.\n");\
-        goto label;\
-    }\
-}
-
-#include "libm.h"
-
-#if defined(_MSC_VER) && _MSC_VER < 1900
-#pragma comment(linker, "/include:"EXTERN_PREFIX"avpriv_strtod")
-#pragma comment(linker, "/include:"EXTERN_PREFIX"avpriv_snprintf")
-#endif
+#define FF_FIELD_AT(type, off, obj) (*(type *)((char *)&(obj) + (off)))
 
 /**
  * Return NULL if CONFIG_SMALL is true, otherwise the argument
- * without modification. Used to disable the definition of strings
- * (for example AVCodec long_names).
+ * without modification. Used to disable the definition of strings.
  */
 #if CONFIG_SMALL
 #   define NULL_IF_CONFIG_SMALL(x) NULL
 #else
 #   define NULL_IF_CONFIG_SMALL(x) x
-#endif
-
-/**
- * Define a function with only the non-default version specified.
- *
- * On systems with ELF shared libraries, all symbols exported from
- * FFmpeg libraries are tagged with the name and major version of the
- * library to which they belong.  If a function is moved from one
- * library to another, a wrapper must be retained in the original
- * location to preserve binary compatibility.
- *
- * Functions defined with this macro will never be used to resolve
- * symbols by the build-time linker.
- *
- * @param type return type of function
- * @param name name of function
- * @param args argument list of function
- * @param ver  version tag to assign function
- */
-#if HAVE_SYMVER_ASM_LABEL
-#   define FF_SYMVER(type, name, args, ver)                     \
-    type ff_##name args __asm__ (EXTERN_PREFIX #name "@" ver);  \
-    type ff_##name args
-#elif HAVE_SYMVER_GNU_ASM
-#   define FF_SYMVER(type, name, args, ver)                             \
-    __asm__ (".symver ff_" #name "," EXTERN_PREFIX #name "@" ver);      \
-    type ff_##name args;                                                \
-    type ff_##name args
-#endif
-
-/**
- * Return NULL if a threading library has not been enabled.
- * Used to disable threading functions in AVCodec definitions
- * when not needed.
- */
-#if HAVE_THREADS
-#   define ONLY_IF_THREADS_ENABLED(x) x
-#else
-#   define ONLY_IF_THREADS_ENABLED(x) NULL
 #endif
 
 /**
@@ -241,7 +116,12 @@ void avpriv_request_sample(void *avc,
                            const char *msg, ...) av_printf_format(2, 3);
 
 #if HAVE_LIBC_MSVCRT
-#define avpriv_open ff_open
+#include <crtversion.h>
+#if defined(_VC_CRT_MAJOR_VERSION) && _VC_CRT_MAJOR_VERSION < 14
+#pragma comment(linker, "/include:" EXTERN_PREFIX "avpriv_strtod")
+#pragma comment(linker, "/include:" EXTERN_PREFIX "avpriv_snprintf")
+#endif
+
 #define PTRDIFF_SPECIFIER "Id"
 #define SIZE_SPECIFIER "Iu"
 #else
@@ -249,12 +129,27 @@ void avpriv_request_sample(void *avc,
 #define SIZE_SPECIFIER "zu"
 #endif
 
-/**
- * A wrapper for open() setting O_CLOEXEC.
- */
-int avpriv_open(const char *filename, int flags, ...);
+#ifdef DEBUG
+#   define ff_dlog(ctx, ...) av_log(ctx, AV_LOG_DEBUG, __VA_ARGS__)
+#else
+#   define ff_dlog(ctx, ...) do { if (0) av_log(ctx, AV_LOG_DEBUG, __VA_ARGS__); } while (0)
+#endif
 
-int avpriv_set_systematic_pal2(uint32_t pal[256], enum AVPixelFormat pix_fmt);
+#ifdef TRACE
+#   define ff_tlog(ctx, ...) av_log(ctx, AV_LOG_TRACE, __VA_ARGS__)
+#else
+#   define ff_tlog(ctx, ...) do { } while(0)
+#endif
+
+// For debugging we use signed operations so overflows can be detected (by ubsan)
+// For production we use unsigned so there are no undefined operations
+#ifdef CHECKED
+#define SUINT   int
+#define SUINT32 int32_t
+#else
+#define SUINT   unsigned
+#define SUINT32 uint32_t
+#endif
 
 static av_always_inline av_const int avpriv_mirror(int x, int w)
 {
@@ -268,11 +163,5 @@ static av_always_inline av_const int avpriv_mirror(int x, int w)
     }
     return x;
 }
-
-#if FF_API_GET_CHANNEL_LAYOUT_COMPAT
-uint64_t ff_get_channel_layout(const char *name, int compat);
-#endif
-
-void ff_check_pixfmt_descriptors(void);
 
 #endif /* AVUTIL_INTERNAL_H */

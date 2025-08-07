@@ -64,16 +64,12 @@ typedef union {
 
 #include "config.h"
 
-#if   ARCH_ARM
-#   include "arm/intreadwrite.h"
-#elif ARCH_AVR32
-#   include "avr32/intreadwrite.h"
+#if ARCH_AARCH64
+#   include "aarch64/intreadwrite.h"
 #elif ARCH_MIPS
 #   include "mips/intreadwrite.h"
 #elif ARCH_PPC
 #   include "ppc/intreadwrite.h"
-#elif ARCH_TOMI
-#   include "tomi/intreadwrite.h"
 #elif ARCH_X86
 #   include "x86/intreadwrite.h"
 #endif
@@ -215,7 +211,7 @@ typedef union {
  * by per-arch headers.
  */
 
-#if defined(__GNUC__) && !defined(__TI_COMPILER_VERSION__)
+#if defined(__GNUC__) || defined(__clang__)
 
 union unaligned_64 { uint64_t l; } __attribute__((packed)) av_alias;
 union unaligned_32 { uint32_t l; } __attribute__((packed)) av_alias;
@@ -224,7 +220,7 @@ union unaligned_16 { uint16_t l; } __attribute__((packed)) av_alias;
 #   define AV_RN(s, p) (((const union unaligned_##s *) (p))->l)
 #   define AV_WN(s, p, v) ((((union unaligned_##s *) (p))->l) = (v))
 
-#elif defined(__DECC)
+#elif defined(_MSC_VER) && (defined(_M_ARM) || defined(_M_X64) || defined(_M_ARM64)) && AV_HAVE_FAST_UNALIGNED
 
 #   define AV_RN(s, p) (*((const __unaligned uint##s##_t*)(p)))
 #   define AV_WN(s, p, v) (*((__unaligned uint##s##_t*)(p)) = (v))
@@ -242,8 +238,8 @@ union unaligned_16 { uint16_t l; } __attribute__((packed)) av_alias;
       ((const uint8_t*)(x))[1])
 #endif
 #ifndef AV_WB16
-#   define AV_WB16(p, darg) do {                \
-        unsigned d = (darg);                    \
+#   define AV_WB16(p, val) do {                 \
+        uint16_t d = (val);                     \
         ((uint8_t*)(p))[1] = (d);               \
         ((uint8_t*)(p))[0] = (d)>>8;            \
     } while(0)
@@ -255,8 +251,8 @@ union unaligned_16 { uint16_t l; } __attribute__((packed)) av_alias;
       ((const uint8_t*)(x))[0])
 #endif
 #ifndef AV_WL16
-#   define AV_WL16(p, darg) do {                \
-        unsigned d = (darg);                    \
+#   define AV_WL16(p, val) do {                 \
+        uint16_t d = (val);                     \
         ((uint8_t*)(p))[0] = (d);               \
         ((uint8_t*)(p))[1] = (d)>>8;            \
     } while(0)
@@ -270,8 +266,8 @@ union unaligned_16 { uint16_t l; } __attribute__((packed)) av_alias;
                 ((const uint8_t*)(x))[3])
 #endif
 #ifndef AV_WB32
-#   define AV_WB32(p, darg) do {                \
-        unsigned d = (darg);                    \
+#   define AV_WB32(p, val) do {                 \
+        uint32_t d = (val);                     \
         ((uint8_t*)(p))[3] = (d);               \
         ((uint8_t*)(p))[2] = (d)>>8;            \
         ((uint8_t*)(p))[1] = (d)>>16;           \
@@ -287,8 +283,8 @@ union unaligned_16 { uint16_t l; } __attribute__((packed)) av_alias;
                 ((const uint8_t*)(x))[0])
 #endif
 #ifndef AV_WL32
-#   define AV_WL32(p, darg) do {                \
-        unsigned d = (darg);                    \
+#   define AV_WL32(p, val) do {                 \
+        uint32_t d = (val);                     \
         ((uint8_t*)(p))[0] = (d);               \
         ((uint8_t*)(p))[1] = (d)>>8;            \
         ((uint8_t*)(p))[2] = (d)>>16;           \
@@ -308,8 +304,8 @@ union unaligned_16 { uint16_t l; } __attribute__((packed)) av_alias;
       (uint64_t)((const uint8_t*)(x))[7])
 #endif
 #ifndef AV_WB64
-#   define AV_WB64(p, darg) do {                \
-        uint64_t d = (darg);                    \
+#   define AV_WB64(p, val) do {                 \
+        uint64_t d = (val);                     \
         ((uint8_t*)(p))[7] = (d);               \
         ((uint8_t*)(p))[6] = (d)>>8;            \
         ((uint8_t*)(p))[5] = (d)>>16;           \
@@ -333,8 +329,8 @@ union unaligned_16 { uint16_t l; } __attribute__((packed)) av_alias;
       (uint64_t)((const uint8_t*)(x))[0])
 #endif
 #ifndef AV_WL64
-#   define AV_WL64(p, darg) do {                \
-        uint64_t d = (darg);                    \
+#   define AV_WL64(p, val) do {                 \
+        uint64_t d = (val);                     \
         ((uint8_t*)(p))[0] = (d);               \
         ((uint8_t*)(p))[1] = (d)>>8;            \
         ((uint8_t*)(p))[2] = (d)>>16;           \
@@ -542,6 +538,60 @@ union unaligned_16 { uint16_t l; } __attribute__((packed)) av_alias;
 #   define AV_WN64A(p, v) AV_WNA(64, p, v)
 #endif
 
+#if AV_HAVE_BIGENDIAN
+#   define AV_RLA(s, p)    av_bswap##s(AV_RN##s##A(p))
+#   define AV_WLA(s, p, v) AV_WN##s##A(p, av_bswap##s(v))
+#   define AV_RBA(s, p)    AV_RN##s##A(p)
+#   define AV_WBA(s, p, v) AV_WN##s##A(p, v)
+#else
+#   define AV_RLA(s, p)    AV_RN##s##A(p)
+#   define AV_WLA(s, p, v) AV_WN##s##A(p, v)
+#   define AV_RBA(s, p)    av_bswap##s(AV_RN##s##A(p))
+#   define AV_WBA(s, p, v) AV_WN##s##A(p, av_bswap##s(v))
+#endif
+
+#ifndef AV_RL16A
+#   define AV_RL16A(p) AV_RLA(16, p)
+#endif
+#ifndef AV_WL16A
+#   define AV_WL16A(p, v) AV_WLA(16, p, v)
+#endif
+
+#ifndef AV_RB16A
+#   define AV_RB16A(p) AV_RBA(16, p)
+#endif
+#ifndef AV_WB16A
+#   define AV_WB16A(p, v) AV_WBA(16, p, v)
+#endif
+
+#ifndef AV_RL32A
+#   define AV_RL32A(p) AV_RLA(32, p)
+#endif
+#ifndef AV_WL32A
+#   define AV_WL32A(p, v) AV_WLA(32, p, v)
+#endif
+
+#ifndef AV_RB32A
+#   define AV_RB32A(p) AV_RBA(32, p)
+#endif
+#ifndef AV_WB32A
+#   define AV_WB32A(p, v) AV_WBA(32, p, v)
+#endif
+
+#ifndef AV_RL64A
+#   define AV_RL64A(p) AV_RLA(64, p)
+#endif
+#ifndef AV_WL64A
+#   define AV_WL64A(p, v) AV_WLA(64, p, v)
+#endif
+
+#ifndef AV_RB64A
+#   define AV_RB64A(p) AV_RBA(64, p)
+#endif
+#ifndef AV_WB64A
+#   define AV_WB64A(p, v) AV_WBA(64, p, v)
+#endif
+
 /*
  * The AV_COPYxxU macros are suitable for copying data to/from unaligned
  * memory locations.
@@ -570,9 +620,7 @@ union unaligned_16 { uint16_t l; } __attribute__((packed)) av_alias;
 #endif
 
 /* Parameters for AV_COPY*, AV_SWAP*, AV_ZERO* must be
- * naturally aligned. They may be implemented using MMX,
- * so emms_c() must be called before using any float code
- * afterwards.
+ * naturally aligned.
  */
 
 #define AV_COPY(n, d, s) \

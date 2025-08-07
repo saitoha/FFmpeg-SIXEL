@@ -20,9 +20,9 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "avcodec.h"
+#include "config.h"
+#include "libavutil/attributes.h"
 #include "fmtconvert.h"
-#include "libavutil/common.h"
 
 static void int32_to_float_fmul_scalar_c(float *dst, const int32_t *src,
                                          float mul, int len)
@@ -41,44 +41,23 @@ static void int32_to_float_fmul_array8_c(FmtConvertContext *c, float *dst,
         c->int32_to_float_fmul_scalar(&dst[i], &src[i], *mul++, 8);
 }
 
-av_cold void ff_fmt_convert_init(FmtConvertContext *c, AVCodecContext *avctx)
+av_cold void ff_fmt_convert_init(FmtConvertContext *c)
 {
     c->int32_to_float_fmul_scalar = int32_to_float_fmul_scalar_c;
     c->int32_to_float_fmul_array8 = int32_to_float_fmul_array8_c;
 
-    if (ARCH_ARM) ff_fmt_convert_init_arm(c, avctx);
-    if (ARCH_PPC) ff_fmt_convert_init_ppc(c, avctx);
-    if (ARCH_X86) ff_fmt_convert_init_x86(c, avctx);
-    if (HAVE_MIPSFPU) ff_fmt_convert_init_mips(c);
-}
-
-/* ffdshow custom code */
-void float_interleave(float *dst, const float **src, long len, int channels)
-{
-    int i,j,c;
-    if(channels==2){
-        for(i=0; i<len; i++){
-            dst[2*i]   = src[0][i] / 32768.0f;
-            dst[2*i+1] = src[1][i] / 32768.0f;
-        }
-    }else{
-        for(c=0; c<channels; c++)
-            for(i=0, j=c; i<len; i++, j+=channels)
-                dst[j] = src[c][i] / 32768.0f;
-    }
-}
-
-void float_interleave_noscale(float *dst, const float **src, long len, int channels)
-{
-    int i,j,c;
-    if(channels==2){
-        for(i=0; i<len; i++){
-            dst[2*i]   = src[0][i];
-            dst[2*i+1] = src[1][i];
-        }
-    }else{
-        for(c=0; c<channels; c++)
-            for(i=0, j=c; i<len; i++, j+=channels)
-                dst[j] = src[c][i];
-    }
+#if ARCH_AARCH64
+    ff_fmt_convert_init_aarch64(c);
+#elif ARCH_ARM
+    ff_fmt_convert_init_arm(c);
+#elif ARCH_PPC
+    ff_fmt_convert_init_ppc(c);
+#elif ARCH_RISCV
+    ff_fmt_convert_init_riscv(c);
+#elif ARCH_X86
+    ff_fmt_convert_init_x86(c);
+#endif
+#if HAVE_MIPSFPU
+    ff_fmt_convert_init_mips(c);
+#endif
 }

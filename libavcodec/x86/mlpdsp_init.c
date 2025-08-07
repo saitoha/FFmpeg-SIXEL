@@ -19,8 +19,11 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <stdint.h>
+#include "config.h"
 #include "libavutil/attributes.h"
 #include "libavutil/cpu.h"
+#include "libavutil/macros.h"
 #include "libavutil/x86/asm.h"
 #include "libavutil/x86/cpu.h"
 #include "libavcodec/mlpdsp.h"
@@ -61,13 +64,13 @@ extern char ff_mlp_iirorder_1;
 extern char ff_mlp_iirorder_0;
 
 static const void * const firtable[9] = { &ff_mlp_firorder_0, &ff_mlp_firorder_1,
-                                   &ff_mlp_firorder_2, &ff_mlp_firorder_3,
-                                   &ff_mlp_firorder_4, &ff_mlp_firorder_5,
-                                   &ff_mlp_firorder_6, &ff_mlp_firorder_7,
-                                   &ff_mlp_firorder_8 };
+                                          &ff_mlp_firorder_2, &ff_mlp_firorder_3,
+                                          &ff_mlp_firorder_4, &ff_mlp_firorder_5,
+                                          &ff_mlp_firorder_6, &ff_mlp_firorder_7,
+                                          &ff_mlp_firorder_8 };
 static const void * const iirtable[5] = { &ff_mlp_iirorder_0, &ff_mlp_iirorder_1,
-                                   &ff_mlp_iirorder_2, &ff_mlp_iirorder_3,
-                                   &ff_mlp_iirorder_4 };
+                                          &ff_mlp_iirorder_2, &ff_mlp_iirorder_3,
+                                          &ff_mlp_iirorder_4 };
 
 #if ARCH_X86_64
 
@@ -199,6 +202,6 @@ av_cold void ff_mlpdsp_init_x86(MLPDSPContext *c)
 #endif
     if (ARCH_X86_64 && EXTERNAL_SSE4(cpu_flags))
         c->mlp_rematrix_channel = ff_mlp_rematrix_channel_sse4;
-    if (ARCH_X86_64 && EXTERNAL_AVX2(cpu_flags) && cpu_flags & AV_CPU_FLAG_BMI2)
+    if (ARCH_X86_64 && EXTERNAL_AVX2_FAST(cpu_flags) && cpu_flags & AV_CPU_FLAG_BMI2)
         c->mlp_rematrix_channel = ff_mlp_rematrix_channel_avx2_bmi2;
 }

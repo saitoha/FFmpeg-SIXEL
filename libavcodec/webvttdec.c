@@ -21,29 +21,54 @@
 /**
  * @file
  * WebVTT subtitle decoder
- * @see http://dev.w3.org/html5/webvtt/
+ * @see https://www.w3.org/TR/webvtt1/
  * @todo need to support extended markups and cue settings
  */
 
 #include "avcodec.h"
 #include "ass.h"
+#include "codec_internal.h"
 #include "libavutil/bprint.h"
 
 static const struct {
     const char *from;
     const char *to;
 } webvtt_tag_replace[] = {
-    {"<i>", "{\\i1}"}, {"</i>", "{\\i0}"},
-    {"<b>", "{\\b1}"}, {"</b>", "{\\b0}"},
-    {"<u>", "{\\u1}"}, {"</u>", "{\\u0}"},
-    {"{", "\\{"}, {"}", "\\}"}, // escape to avoid ASS markup conflicts
+    {"{", "\\{{}"}, {"\\", "\\\xe2\x81\xa0"}, // escape to avoid ASS markup conflicts
+    {"&gt;", ">"}, {"&lt;", "<"},
+    {"&lrm;", "\xe2\x80\x8e"}, {"&rlm;", "\xe2\x80\x8f"},
+    {"&amp;", "&"}, {"&nbsp;", "\\h"},
+};
+static const struct {
+    const char from[6];
+    const char to[6];
+} webvtt_valid_tags[] = {
+    {"i", "{\\i1}"}, {"/i", "{\\i0}"},
+    {"b", "{\\b1}"}, {"/b", "{\\b0}"},
+    {"u", "{\\u1}"}, {"/u", "{\\u0}"},
 };
 
 static int webvtt_event_to_ass(AVBPrint *buf, const char *p)
 {
-    int i, skip = 0;
+    int i, again = 0;
 
     while (*p) {
+        if (*p == '<') {
+            const char *tag_end = strchr(p, '>');
+            ptrdiff_t len;
+            if (!tag_end)
+                break;
+            len = tag_end - p + 1;
+            for (i = 0; i < FF_ARRAY_ELEMS(webvtt_valid_tags); i++) {
+                const char *from = webvtt_valid_tags[i].from;
+                if(!strncmp(p + 1, from, strlen(from))) {
+                    av_bprintf(buf, "%s", webvtt_valid_tags[i].to);
+                    break;
+                }
+            }
+            p += len;
+            again = 1;
+        }
 
         for (i = 0; i < FF_ARRAY_ELEMS(webvtt_tag_replace); i++) {
             const char *from = webvtt_tag_replace[i].from;
@@ -51,40 +76,35 @@ static int webvtt_event_to_ass(AVBPrint *buf, const char *p)
             if (!strncmp(p, from, len)) {
                 av_bprintf(buf, "%s", webvtt_tag_replace[i].to);
                 p += len;
+                again = 1;
                 break;
             }
         }
-        if (!*p)
-            break;
 
-        if (*p == '<')
-            skip = 1;
-        else if (*p == '>')
-            skip = 0;
-        else if (p[0] == '\n' && p[1])
+        if (again) {
+            again = 0;
+            continue;
+        }
+        if (p[0] == '\n' && p[1])
             av_bprintf(buf, "\\N");
-        else if (!skip && *p != '\r')
+        else if (*p != '\r')
             av_bprint_chars(buf, *p, 1);
         p++;
     }
     return 0;
 }
 
-static int webvtt_decode_frame(AVCodecContext *avctx,
-                               void *data, int *got_sub_ptr, AVPacket *avpkt)
+static int webvtt_decode_frame(AVCodecContext *avctx, AVSubtitle *sub,
+                               int *got_sub_ptr, const AVPacket *avpkt)
 {
     int ret = 0;
-    AVSubtitle *sub = data;
     const char *ptr = avpkt->data;
+    FFASSDecoderContext *s = avctx->priv_data;
     AVBPrint buf;
 
     av_bprint_init(&buf, 0, AV_BPRINT_SIZE_UNLIMITED);
-    if (ptr && avpkt->size > 0 && !webvtt_event_to_ass(&buf, ptr)) {
-        int ts_start     = av_rescale_q(avpkt->pts, avctx->time_base, (AVRational){1,100});
-        int ts_duration  = avpkt->duration != -1 ?
-                           av_rescale_q(avpkt->duration, avctx->time_base, (AVRational){1,100}) : -1;
-        ret = ff_ass_add_rect_bprint(sub, &buf, ts_start, ts_duration);
-    }
+    if (ptr && avpkt->size > 0 && !webvtt_event_to_ass(&buf, ptr))
+        ret = ff_ass_add_rect(sub, buf.str, s->readorder++, 0, NULL, NULL);
     av_bprint_finalize(&buf, NULL);
     if (ret < 0)
         return ret;
@@ -92,11 +112,13 @@ static int webvtt_decode_frame(AVCodecContext *avctx,
     return avpkt->size;
 }
 
-AVCodec ff_webvtt_decoder = {
-    .name           = "webvtt",
-    .long_name      = NULL_IF_CONFIG_SMALL("WebVTT subtitle"),
-    .type           = AVMEDIA_TYPE_SUBTITLE,
-    .id             = AV_CODEC_ID_WEBVTT,
-    .decode         = webvtt_decode_frame,
+const FFCodec ff_webvtt_decoder = {
+    .p.name         = "webvtt",
+    CODEC_LONG_NAME("WebVTT subtitle"),
+    .p.type         = AVMEDIA_TYPE_SUBTITLE,
+    .p.id           = AV_CODEC_ID_WEBVTT,
+    FF_CODEC_DECODE_SUB_CB(webvtt_decode_frame),
     .init           = ff_ass_subtitle_header_default,
+    .flush          = ff_ass_decoder_flush,
+    .priv_data_size = sizeof(FFASSDecoderContext),
 };

@@ -26,13 +26,13 @@
  * @see http://wiki.multimedia.cx/index.php?title=BFI
  */
 
-#include "libavutil/common.h"
+#include "libavutil/mem.h"
 #include "avcodec.h"
 #include "bytestream.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 
 typedef struct BFIContext {
-    AVCodecContext *avctx;
     uint8_t *dst;
     uint32_t pal[256];
 } BFIContext;
@@ -47,10 +47,9 @@ static av_cold int bfi_decode_init(AVCodecContext *avctx)
     return 0;
 }
 
-static int bfi_decode_frame(AVCodecContext *avctx, void *data,
+static int bfi_decode_frame(AVCodecContext *avctx, AVFrame *frame,
                             int *got_frame, AVPacket *avpkt)
 {
-    AVFrame *frame = data;
     GetByteContext g;
     int buf_size    = avpkt->size;
     BFIContext *bfi = avctx->priv_data;
@@ -66,12 +65,12 @@ static int bfi_decode_frame(AVCodecContext *avctx, void *data,
     bytestream2_init(&g, avpkt->data, buf_size);
 
     /* Set frame parameters and palette, if necessary */
-    if (!avctx->frame_number) {
+    if (!avctx->frame_num) {
         frame->pict_type = AV_PICTURE_TYPE_I;
-        frame->key_frame = 1;
+        frame->flags |= AV_FRAME_FLAG_KEY;
         /* Setting the palette */
         if (avctx->extradata_size > 768) {
-            av_log(NULL, AV_LOG_ERROR, "Palette is too large.\n");
+            av_log(avctx, AV_LOG_ERROR, "Palette is too large.\n");
             return AVERROR_INVALIDDATA;
         }
         pal = (uint32_t *)frame->data[1];
@@ -84,11 +83,9 @@ static int bfi_decode_frame(AVCodecContext *avctx, void *data,
             pal++;
         }
         memcpy(bfi->pal, frame->data[1], sizeof(bfi->pal));
-        frame->palette_has_changed = 1;
     } else {
         frame->pict_type = AV_PICTURE_TYPE_P;
-        frame->key_frame = 0;
-        frame->palette_has_changed = 0;
+        frame->flags &= ~AV_FRAME_FLAG_KEY;
         memcpy(frame->data[1], bfi->pal, sizeof(bfi->pal));
     }
 
@@ -175,14 +172,14 @@ static av_cold int bfi_decode_close(AVCodecContext *avctx)
     return 0;
 }
 
-AVCodec ff_bfi_decoder = {
-    .name           = "bfi",
-    .long_name      = NULL_IF_CONFIG_SMALL("Brute Force & Ignorance"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_BFI,
+const FFCodec ff_bfi_decoder = {
+    .p.name         = "bfi",
+    CODEC_LONG_NAME("Brute Force & Ignorance"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_BFI,
     .priv_data_size = sizeof(BFIContext),
     .init           = bfi_decode_init,
     .close          = bfi_decode_close,
-    .decode         = bfi_decode_frame,
-    .capabilities   = CODEC_CAP_DR1,
+    FF_CODEC_DECODE_CB(bfi_decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1,
 };

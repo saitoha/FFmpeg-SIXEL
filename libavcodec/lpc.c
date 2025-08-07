@@ -21,28 +21,73 @@
 
 #include "libavutil/common.h"
 #include "libavutil/lls.h"
+#include "libavutil/mem.h"
+#include "libavutil/mem_internal.h"
 
 #define LPC_USE_DOUBLE
 #include "lpc.h"
+#include "lpc_functions.h"
 #include "libavutil/avassert.h"
+
+/**
+ * Schur recursion.
+ * Produces reflection coefficients from autocorrelation data.
+ */
+static inline void compute_ref_coefs(const LPC_TYPE *autoc, int max_order,
+                                     LPC_TYPE *ref, LPC_TYPE *error)
+{
+    LPC_TYPE err;
+    LPC_TYPE gen0[MAX_LPC_ORDER], gen1[MAX_LPC_ORDER];
+
+    for (int i = 0; i < max_order; i++)
+        gen0[i] = gen1[i] = autoc[i + 1];
+
+    err    = autoc[0];
+    ref[0] = -gen1[0] / ((LPC_USE_FIXED || err) ? err : 1);
+    err   +=  gen1[0] * ref[0];
+    if (error)
+        error[0] = err;
+    for (int i = 1; i < max_order; i++) {
+        for (int j = 0; j < max_order - i; j++) {
+            gen1[j] = gen1[j + 1] + ref[i - 1] * gen0[j];
+            gen0[j] = gen1[j + 1] * ref[i - 1] + gen0[j];
+        }
+        ref[i] = -gen1[0] / ((LPC_USE_FIXED || err) ? err : 1);
+        err   +=  gen1[0] * ref[i];
+        if (error)
+            error[i] = err;
+    }
+}
 
 
 /**
  * Apply Welch window function to audio block
  */
-static void lpc_apply_welch_window_c(const int32_t *data, int len,
+static void lpc_apply_welch_window_c(const int32_t *data, ptrdiff_t len,
                                      double *w_data)
 {
     int i, n2;
     double w;
     double c;
 
-    /* The optimization in commit fa4ed8c does not support odd len.
-     * If someone wants odd len extend that change. */
-    av_assert2(!(len & 1));
+    if (len == 1) {
+        w_data[0] = 0.0;
+        return;
+    }
 
     n2 = (len >> 1);
     c = 2.0 / (len - 1.0);
+
+    if (len & 1) {
+        for(i=0; i<n2; i++) {
+            w = c - i - 1.0;
+            w = 1.0 - (w * w);
+            w_data[i] = data[i] * w;
+            w_data[len-1-i] = data[len-1-i] * w;
+        }
+        w_data[n2] = 0.0;
+        return;
+    }
 
     w_data+=n2;
       data+=n2;
@@ -58,7 +103,7 @@ static void lpc_apply_welch_window_c(const int32_t *data, int len,
  * Calculate autocorrelation data from audio samples
  * A Welch window function is applied before calculation.
  */
-static void lpc_compute_autocorr_c(const double *data, int len, int lag,
+static void lpc_compute_autocorr_c(const double *data, ptrdiff_t len, int lag,
                                    double *autoc)
 {
     int i, j;
@@ -75,9 +120,8 @@ static void lpc_compute_autocorr_c(const double *data, int len, int lag,
 
     if(j==lag){
         double sum = 1.0;
-        for(i=j-1; i<len; i+=2){
-            sum += data[i  ] * data[i-j  ]
-                 + data[i+1] * data[i-j+1];
+        for(i=j-1; i<len; i++){
+            sum += data[i] * data[i-j];
         }
         autoc[j] = sum;
     }
@@ -87,7 +131,8 @@ static void lpc_compute_autocorr_c(const double *data, int len, int lag,
  * Quantize LPC coefficients
  */
 static void quantize_lpc_coefs(double *lpc_in, int order, int precision,
-                               int32_t *lpc_out, int *shift, int max_shift, int zero_shift)
+                               int32_t *lpc_out, int *shift, int min_shift,
+                               int max_shift, int zero_shift)
 {
     int i;
     double cmax, error;
@@ -112,7 +157,7 @@ static void quantize_lpc_coefs(double *lpc_in, int order, int precision,
 
     /* calculate level shift which scales max coeff to available bits */
     sh = max_shift;
-    while((cmax * (1 << sh) > qmax) && (sh > 0)) {
+    while((cmax * (1 << sh) > qmax) && (sh > min_shift)) {
         sh--;
     }
 
@@ -161,6 +206,29 @@ int ff_lpc_calc_ref_coefs(LPCContext *s,
     return order;
 }
 
+double ff_lpc_calc_ref_coefs_f(LPCContext *s, const float *samples, int len,
+                               int order, double *ref)
+{
+    int i;
+    double signal = 0.0f, avg_err = 0.0f;
+    double autoc[MAX_LPC_ORDER+1] = {0}, error[MAX_LPC_ORDER+1] = {0};
+    const double a = 0.5f, b = 1.0f - a;
+
+    /* Apply windowing */
+    for (i = 0; i <= len / 2; i++) {
+        double weight = a - b*cos((2*M_PI*i)/(len - 1));
+        s->windowed_samples[i] = weight*samples[i];
+        s->windowed_samples[len-1-i] = weight*samples[len-1-i];
+    }
+
+    s->lpc_compute_autocorr(s->windowed_samples, len, order, autoc);
+    signal = autoc[0];
+    compute_ref_coefs(autoc, order, ref, error);
+    for (i = 0; i < order; i++)
+        avg_err = (avg_err + error[i])/2.0f;
+    return avg_err ? signal/avg_err : NAN;
+}
+
 /**
  * Calculate LPC coefficients for multiple orders
  *
@@ -172,7 +240,7 @@ int ff_lpc_calc_coefs(LPCContext *s,
                       int max_order, int precision,
                       int32_t coefs[][MAX_LPC_ORDER], int *shift,
                       enum FFLPCType lpc_type, int lpc_passes,
-                      int omethod, int max_shift, int zero_shift)
+                      int omethod, int min_shift, int max_shift, int zero_shift)
 {
     double autoc[MAX_LPC_ORDER+1];
     double ref[MAX_LPC_ORDER] = { 0 };
@@ -199,7 +267,7 @@ int ff_lpc_calc_coefs(LPCContext *s,
 
         s->lpc_compute_autocorr(s->windowed_samples, blocksize, max_order, autoc);
 
-        compute_lpc_coefs(autoc, max_order, &lpc[0][0], MAX_LPC_ORDER, 0, 1);
+        compute_lpc_coefs(autoc, 0, max_order, &lpc[0][0], MAX_LPC_ORDER, 0, 1, NULL);
 
         for(i=0; i<max_order; i++)
             ref[i] = fabs(lpc[i][i]);
@@ -213,8 +281,10 @@ int ff_lpc_calc_coefs(LPCContext *s,
         double av_uninit(weight);
         memset(var, 0, FFALIGN(MAX_LPC_ORDER+1,4)*sizeof(*var));
 
-        for(j=0; j<max_order; j++)
-            m[0].coeff[max_order-1][j] = -lpc[max_order-1][j];
+        /* Avoids initializing with an unused value when lpc_passes == 1 */
+        if (lpc_passes > 1)
+            for(j=0; j<max_order; j++)
+                m[0].coeff[max_order-1][j] = -lpc[max_order-1][j];
 
         for(; pass<lpc_passes; pass++){
             avpriv_init_lls(&m[pass&1], max_order);
@@ -255,10 +325,12 @@ int ff_lpc_calc_coefs(LPCContext *s,
     if(omethod == ORDER_METHOD_EST) {
         opt_order = estimate_best_order(ref, min_order, max_order);
         i = opt_order-1;
-        quantize_lpc_coefs(lpc[i], i+1, precision, coefs[i], &shift[i], max_shift, zero_shift);
+        quantize_lpc_coefs(lpc[i], i+1, precision, coefs[i], &shift[i],
+                           min_shift, max_shift, zero_shift);
     } else {
         for(i=min_order-1; i<max_order; i++) {
-            quantize_lpc_coefs(lpc[i], i+1, precision, coefs[i], &shift[i], max_shift, zero_shift);
+            quantize_lpc_coefs(lpc[i], i+1, precision, coefs[i], &shift[i],
+                               min_shift, max_shift, zero_shift);
         }
     }
 
@@ -281,8 +353,11 @@ av_cold int ff_lpc_init(LPCContext *s, int blocksize, int max_order,
     s->lpc_apply_welch_window = lpc_apply_welch_window_c;
     s->lpc_compute_autocorr   = lpc_compute_autocorr_c;
 
-    if (ARCH_X86)
-        ff_lpc_init_x86(s);
+#if ARCH_RISCV
+    ff_lpc_init_riscv(s);
+#elif ARCH_X86
+    ff_lpc_init_x86(s);
+#endif
 
     return 0;
 }

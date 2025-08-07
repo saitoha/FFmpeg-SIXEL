@@ -20,11 +20,13 @@
  */
 
 #include "libavutil/channel_layout.h"
-#include "libavutil/intreadwrite.h"
+#include "libavutil/mem_internal.h"
+
 #include "avcodec.h"
 #include "bswapdsp.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include "get_bits.h"
-#include "internal.h"
 
 #include "truespeech_data.h"
 /**
@@ -62,12 +64,13 @@ static av_cold int truespeech_decode_init(AVCodecContext * avctx)
 {
     TSContext *c = avctx->priv_data;
 
-    if (avctx->channels != 1) {
-        avpriv_request_sample(avctx, "Channel count %d", avctx->channels);
+    if (avctx->ch_layout.nb_channels != 1) {
+        avpriv_request_sample(avctx, "Channel count %d", avctx->ch_layout.nb_channels);
         return AVERROR_PATCHWELCOME;
     }
 
-    avctx->channel_layout = AV_CH_LAYOUT_MONO;
+    av_channel_layout_uninit(&avctx->ch_layout);
+    avctx->ch_layout      = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
     avctx->sample_fmt     = AV_SAMPLE_FMT_S16;
 
     ff_bswapdsp_init(&c->bdsp);
@@ -132,8 +135,7 @@ static void truespeech_correlate_filter(TSContext *dec)
         if(i > 0){
             memcpy(tmp, dec->cvector, i * sizeof(*tmp));
             for(j = 0; j < i; j++)
-                dec->cvector[j] = ((tmp[i - j - 1] * dec->vector[i]) +
-                                   (dec->cvector[j] << 15) + 0x4000) >> 15;
+                dec->cvector[j] += (tmp[i - j - 1] * dec->vector[i] + 0x4000) >> 15;
         }
         dec->cvector[i] = (8 - dec->vector[i]) >> 3;
     }
@@ -255,8 +257,8 @@ static void truespeech_synth(TSContext *dec, int16_t *out, int quart)
     for(i = 0; i < 60; i++){
         int sum = 0;
         for(k = 0; k < 8; k++)
-            sum += ptr0[k] * ptr1[k];
-        sum = (sum + (out[i] << 12) + 0x800) >> 12;
+            sum += ptr0[k] * (unsigned)ptr1[k];
+        sum = out[i] + ((int)(sum + 0x800U) >> 12);
         out[i] = av_clip(sum, -0x7FFE, 0x7FFE);
         for(k = 7; k > 0; k--)
             ptr0[k] = ptr0[k - 1];
@@ -274,7 +276,7 @@ static void truespeech_synth(TSContext *dec, int16_t *out, int quart)
         for(k = 7; k > 0; k--)
             ptr0[k] = ptr0[k - 1];
         ptr0[0] = out[i];
-        out[i] = ((out[i] << 12) - sum) >> 12;
+        out[i] += (- sum) >> 12;
     }
 
     for(i = 0; i < 8; i++)
@@ -282,7 +284,7 @@ static void truespeech_synth(TSContext *dec, int16_t *out, int quart)
 
     ptr0 = dec->tmp3;
     for(i = 0; i < 60; i++){
-        int sum = out[i] << 12;
+        int sum = out[i] * (1 << 12);
         for(k = 0; k < 8; k++)
             sum += ptr0[k] * t[k];
         for(k = 7; k > 0; k--)
@@ -303,10 +305,9 @@ static void truespeech_save_prevvec(TSContext *c)
         c->prevfilt[i] = c->cvector[i];
 }
 
-static int truespeech_decode_frame(AVCodecContext *avctx, void *data,
+static int truespeech_decode_frame(AVCodecContext *avctx, AVFrame *frame,
                                    int *got_frame_ptr, AVPacket *avpkt)
 {
-    AVFrame *frame     = data;
     const uint8_t *buf = avpkt->data;
     int buf_size = avpkt->size;
     TSContext *c = avctx->priv_data;
@@ -354,13 +355,13 @@ static int truespeech_decode_frame(AVCodecContext *avctx, void *data,
     return buf_size;
 }
 
-AVCodec ff_truespeech_decoder = {
-    .name           = "truespeech",
-    .long_name      = NULL_IF_CONFIG_SMALL("DSP Group TrueSpeech"),
-    .type           = AVMEDIA_TYPE_AUDIO,
-    .id             = AV_CODEC_ID_TRUESPEECH,
+const FFCodec ff_truespeech_decoder = {
+    .p.name         = "truespeech",
+    CODEC_LONG_NAME("DSP Group TrueSpeech"),
+    .p.type         = AVMEDIA_TYPE_AUDIO,
+    .p.id           = AV_CODEC_ID_TRUESPEECH,
     .priv_data_size = sizeof(TSContext),
     .init           = truespeech_decode_init,
-    .decode         = truespeech_decode_frame,
-    .capabilities   = CODEC_CAP_DR1,
+    FF_CODEC_DECODE_CB(truespeech_decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1,
 };

@@ -21,54 +21,11 @@
  */
 
 #include "libavutil/common.h"
+#include "libavutil/ffmath.h"
 #include "libavutil/float_dsp.h"
-#include "libavutil/libm.h"
-#include "libavutil/mathematics.h"
-#include "avcodec.h"
 #include "acelp_pitch_delay.h"
 #include "celp_math.h"
 #include "audiodsp.h"
-
-int ff_acelp_decode_8bit_to_1st_delay3(int ac_index)
-{
-    ac_index += 58;
-    if(ac_index > 254)
-        ac_index = 3 * ac_index - 510;
-    return ac_index;
-}
-
-int ff_acelp_decode_4bit_to_2nd_delay3(
-        int ac_index,
-        int pitch_delay_min)
-{
-    if(ac_index < 4)
-        return 3 * (ac_index + pitch_delay_min);
-    else if(ac_index < 12)
-        return 3 * pitch_delay_min + ac_index + 6;
-    else
-        return 3 * (ac_index + pitch_delay_min) - 18;
-}
-
-int ff_acelp_decode_5_6_bit_to_2nd_delay3(
-        int ac_index,
-        int pitch_delay_min)
-{
-        return 3 * pitch_delay_min + ac_index - 2;
-}
-
-int ff_acelp_decode_9bit_to_1st_delay6(int ac_index)
-{
-    if(ac_index < 463)
-        return ac_index + 105;
-    else
-        return 6 * (ac_index - 368);
-}
-int ff_acelp_decode_6bit_to_2nd_delay6(
-        int ac_index,
-        int pitch_delay_min)
-{
-    return 6 * pitch_delay_min + ac_index - 3;
-}
 
 void ff_acelp_update_past_gain(
     int16_t* quant_energy,
@@ -118,7 +75,7 @@ int16_t ff_acelp_decode_gain_code(
                (mr_energy >> 15) - 25
            );
 #else
-    mr_energy = gain_corr_factor * exp(M_LN10 / (20 << 23) * mr_energy) /
+    mr_energy = gain_corr_factor * ff_exp10((double)mr_energy / (20 << 23)) /
                 sqrt(adsp->scalarproduct_int16(fc_v, fc_v, subframe_size));
     return mr_energy >> 12;
 #endif
@@ -132,10 +89,10 @@ float ff_amr_set_fixed_gain(float fixed_gain_factor, float fixed_mean_energy,
     // ^g_c = ^gamma_gc * 100.05 (predicted dB + mean dB - dB of fixed vector)
     // Note 10^(0.05 * -10log(average x2)) = 1/sqrt((average x2)).
     float val = fixed_gain_factor *
-        exp2f(M_LOG2_10 * 0.05 *
-              (avpriv_scalarproduct_float_c(pred_table, prediction_error, 4) +
+        ff_exp10(0.05 *
+              (ff_scalarproduct_float_c(pred_table, prediction_error, 4) +
                energy_mean)) /
-        sqrtf(fixed_mean_energy);
+        sqrtf(fixed_mean_energy ? fixed_mean_energy : 1.0);
 
     // update quantified prediction error energy history
     memmove(&prediction_error[0], &prediction_error[1],

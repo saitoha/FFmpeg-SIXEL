@@ -25,8 +25,13 @@
  */
 
 #include "libavutil/intreadwrite.h"
-#include "libavutil/pixdesc.h"
+#include "libavutil/mem.h"
+
+#include "libavcodec/codec_id.h"
+
 #include "avformat.h"
+#include "avio_internal.h"
+#include "mux.h"
 
 typedef struct {
     int offset;
@@ -42,33 +47,32 @@ typedef struct {
     IcoImage *images;
 } IcoMuxContext;
 
-static int ico_check_attributes(AVFormatContext *s, const AVCodecContext *c)
+static int ico_check_attributes(AVFormatContext *s, const AVCodecParameters *p)
 {
-    if (c->codec_id == AV_CODEC_ID_BMP) {
-        if (c->pix_fmt == AV_PIX_FMT_PAL8 && AV_PIX_FMT_RGB32 != AV_PIX_FMT_BGRA) {
+    if (p->codec_id == AV_CODEC_ID_BMP) {
+        if (p->format == AV_PIX_FMT_PAL8 && AV_PIX_FMT_RGB32 != AV_PIX_FMT_BGRA) {
             av_log(s, AV_LOG_ERROR, "Wrong endianness for bmp pixel format\n");
             return AVERROR(EINVAL);
-        } else if (c->pix_fmt != AV_PIX_FMT_PAL8 &&
-                   c->pix_fmt != AV_PIX_FMT_RGB555LE &&
-                   c->pix_fmt != AV_PIX_FMT_BGR24 &&
-                   c->pix_fmt != AV_PIX_FMT_BGRA) {
+        } else if (p->format != AV_PIX_FMT_PAL8 &&
+                   p->format != AV_PIX_FMT_RGB555LE &&
+                   p->format != AV_PIX_FMT_BGR24 &&
+                   p->format != AV_PIX_FMT_BGRA) {
             av_log(s, AV_LOG_ERROR, "BMP must be 1bit, 4bit, 8bit, 16bit, 24bit, or 32bit\n");
             return AVERROR(EINVAL);
         }
-    } else if (c->codec_id == AV_CODEC_ID_PNG) {
-        if (c->pix_fmt != AV_PIX_FMT_RGBA) {
+    } else if (p->codec_id == AV_CODEC_ID_PNG) {
+        if (p->format != AV_PIX_FMT_RGBA) {
             av_log(s, AV_LOG_ERROR, "PNG in ico requires pixel format to be rgba\n");
             return AVERROR(EINVAL);
         }
     } else {
-        const AVCodecDescriptor *codesc = avcodec_descriptor_get(c->codec_id);
-        av_log(s, AV_LOG_ERROR, "Unsupported codec %s\n", codesc ? codesc->name : "");
+        av_log(s, AV_LOG_ERROR, "Unsupported codec %s\n", avcodec_get_name(p->codec_id));
         return AVERROR(EINVAL);
     }
 
-    if (c->width > 256 ||
-        c->height > 256) {
-        av_log(s, AV_LOG_ERROR, "Unsupported dimensions %dx%d (dimensions cannot exceed 256x256)\n", c->width, c->height);
+    if (p->width > 256 ||
+        p->height > 256) {
+        av_log(s, AV_LOG_ERROR, "Unsupported dimensions %dx%d (dimensions cannot exceed 256x256)\n", p->width, p->height);
         return AVERROR(EINVAL);
     }
 
@@ -82,7 +86,7 @@ static int ico_write_header(AVFormatContext *s)
     int ret;
     int i;
 
-    if (!pb->seekable) {
+    if (!(pb->seekable & AVIO_SEEKABLE_NORMAL)) {
         av_log(s, AV_LOG_ERROR, "Output is not seekable\n");
         return AVERROR(EINVAL);
     }
@@ -95,18 +99,16 @@ static int ico_write_header(AVFormatContext *s)
     avio_skip(pb, 2); // skip the number of images
 
     for (i = 0; i < s->nb_streams; i++) {
-        if (ret = ico_check_attributes(s, s->streams[i]->codec))
+        if (ret = ico_check_attributes(s, s->streams[i]->codecpar))
             return ret;
 
         // Fill in later when writing trailer...
         avio_skip(pb, 16);
     }
 
-    ico->images = av_mallocz_array(ico->nb_images, sizeof(IcoMuxContext));
+    ico->images = av_calloc(ico->nb_images, sizeof(*ico->images));
     if (!ico->images)
         return AVERROR(ENOMEM);
-
-    avio_flush(pb);
 
     return 0;
 }
@@ -116,8 +118,7 @@ static int ico_write_packet(AVFormatContext *s, AVPacket *pkt)
     IcoMuxContext *ico = s->priv_data;
     IcoImage *image;
     AVIOContext *pb = s->pb;
-    AVCodecContext *c = s->streams[pkt->stream_index]->codec;
-    int i;
+    AVCodecParameters *par = s->streams[pkt->stream_index]->codecpar;
 
     if (ico->current_image >= ico->nb_images) {
         av_log(s, AV_LOG_ERROR, "ICO already contains %d images\n", ico->current_image);
@@ -127,11 +128,11 @@ static int ico_write_packet(AVFormatContext *s, AVPacket *pkt)
     image = &ico->images[ico->current_image++];
 
     image->offset = avio_tell(pb);
-    image->width = (c->width == 256) ? 0 : c->width;
-    image->height = (c->height == 256) ? 0 : c->height;
+    image->width = (par->width == 256) ? 0 : par->width;
+    image->height = (par->height == 256) ? 0 : par->height;
 
-    if (c->codec_id == AV_CODEC_ID_PNG) {
-        image->bits = c->bits_per_coded_sample;
+    if (par->codec_id == AV_CODEC_ID_PNG) {
+        image->bits = par->bits_per_coded_sample;
         image->size = pkt->size;
 
         avio_write(pb, pkt->data, pkt->size);
@@ -142,14 +143,14 @@ static int ico_write_packet(AVFormatContext *s, AVPacket *pkt)
         }
 
         image->bits = AV_RL16(pkt->data + 28); // allows things like 1bit and 4bit images to be preserved
-        image->size = pkt->size - 14 + c->height * (c->width + 7) / 8;
+        image->size = pkt->size - 14 + par->height * (par->width + 7) / 8;
 
         avio_write(pb, pkt->data + 14, 8); // Skip the BITMAPFILEHEADER header
         avio_wl32(pb, AV_RL32(pkt->data + 22) * 2); // rewrite height as 2 * height
         avio_write(pb, pkt->data + 26, pkt->size - 26);
 
-        for (i = 0; i < c->height * (c->width + 7) / 8; ++i)
-            avio_w8(pb, 0x00); // Write bitmask (opaque)
+        // Write bitmask (opaque)
+        ffio_fill(pb, 0x00, par->height * (par->width + 7) / 8);
     }
 
     return 0;
@@ -169,8 +170,8 @@ static int ico_write_trailer(AVFormatContext *s)
         avio_w8(pb, ico->images[i].width);
         avio_w8(pb, ico->images[i].height);
 
-        if (s->streams[i]->codec->codec_id == AV_CODEC_ID_BMP &&
-            s->streams[i]->codec->pix_fmt == AV_PIX_FMT_PAL8) {
+        if (s->streams[i]->codecpar->codec_id == AV_CODEC_ID_BMP &&
+            s->streams[i]->codecpar->format == AV_PIX_FMT_PAL8) {
             avio_w8(pb, (ico->images[i].bits >= 8) ? 0 : 1 << ico->images[i].bits);
         } else {
             avio_w8(pb, 0);
@@ -183,21 +184,27 @@ static int ico_write_trailer(AVFormatContext *s)
         avio_wl32(pb, ico->images[i].offset);
     }
 
-    av_freep(&ico->images);
-
     return 0;
 }
 
-AVOutputFormat ff_ico_muxer = {
-    .name           = "ico",
-    .long_name      = NULL_IF_CONFIG_SMALL("Microsoft Windows ICO"),
+static void ico_deinit(AVFormatContext *s)
+{
+    IcoMuxContext *ico = s->priv_data;
+
+    av_freep(&ico->images);
+}
+
+const FFOutputFormat ff_ico_muxer = {
+    .p.name         = "ico",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Microsoft Windows ICO"),
     .priv_data_size = sizeof(IcoMuxContext),
-    .mime_type      = "image/vnd.microsoft.icon",
-    .extensions     = "ico",
-    .audio_codec    = AV_CODEC_ID_NONE,
-    .video_codec    = AV_CODEC_ID_BMP,
+    .p.mime_type    = "image/vnd.microsoft.icon",
+    .p.extensions   = "ico",
+    .p.audio_codec  = AV_CODEC_ID_NONE,
+    .p.video_codec  = AV_CODEC_ID_BMP,
     .write_header   = ico_write_header,
     .write_packet   = ico_write_packet,
     .write_trailer  = ico_write_trailer,
-    .flags          = AVFMT_NOTIMESTAMPS,
+    .deinit         = ico_deinit,
+    .p.flags        = AVFMT_NOTIMESTAMPS,
 };

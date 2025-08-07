@@ -34,13 +34,14 @@
 #include <time.h>
 #include <linux/fb.h>
 
+#include "libavutil/file_open.h"
 #include "libavutil/internal.h"
 #include "libavutil/log.h"
-#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/time.h"
 #include "libavutil/parseutils.h"
 #include "libavutil/pixdesc.h"
+#include "libavformat/demux.h"
 #include "libavformat/internal.h"
 #include "avdevice.h"
 #include "fbdev_common.h"
@@ -78,8 +79,8 @@ static av_cold int fbdev_read_header(AVFormatContext *avctx)
     if (avctx->flags & AVFMT_FLAG_NONBLOCK)
         flags |= O_NONBLOCK;
 
-    if (avctx->filename[0])
-        device = avctx->filename;
+    if (avctx->url[0])
+        device = avctx->url;
     else
         device = ff_fbdev_default_device();
 
@@ -126,21 +127,21 @@ static av_cold int fbdev_read_header(AVFormatContext *avctx)
         goto fail;
     }
 
-    st->codec->codec_type = AVMEDIA_TYPE_VIDEO;
-    st->codec->codec_id   = AV_CODEC_ID_RAWVIDEO;
-    st->codec->width      = fbdev->width;
-    st->codec->height     = fbdev->height;
-    st->codec->pix_fmt    = pix_fmt;
-    st->codec->time_base  = av_inv_q(fbdev->framerate_q);
-    st->codec->bit_rate   =
+    st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+    st->codecpar->codec_id   = AV_CODEC_ID_RAWVIDEO;
+    st->codecpar->width      = fbdev->width;
+    st->codecpar->height     = fbdev->height;
+    st->codecpar->format     = pix_fmt;
+    st->avg_frame_rate       = fbdev->framerate_q;
+    st->codecpar->bit_rate   =
         fbdev->width * fbdev->height * fbdev->bytes_per_pixel * av_q2d(fbdev->framerate_q) * 8;
 
     av_log(avctx, AV_LOG_INFO,
-           "w:%d h:%d bpp:%d pixfmt:%s fps:%d/%d bit_rate:%d\n",
+           "w:%d h:%d bpp:%d pixfmt:%s fps:%d/%d bit_rate:%"PRId64"\n",
            fbdev->width, fbdev->height, fbdev->varinfo.bits_per_pixel,
            av_get_pix_fmt_name(pix_fmt),
            fbdev->framerate_q.num, fbdev->framerate_q.den,
-           st->codec->bit_rate);
+           st->codecpar->bit_rate);
     return 0;
 
 fail:
@@ -157,11 +158,11 @@ static int fbdev_read_packet(AVFormatContext *avctx, AVPacket *pkt)
     uint8_t *pin, *pout;
 
     if (fbdev->time_frame == AV_NOPTS_VALUE)
-        fbdev->time_frame = av_gettime();
+        fbdev->time_frame = av_gettime_relative();
 
     /* wait based on the frame rate */
     while (1) {
-        curtime = av_gettime();
+        curtime = av_gettime_relative();
         delay = fbdev->time_frame - curtime;
         av_log(avctx, AV_LOG_TRACE,
                 "time_frame:%"PRId64" curtime:%"PRId64" delay:%"PRId64"\n",
@@ -186,7 +187,7 @@ static int fbdev_read_packet(AVFormatContext *avctx, AVPacket *pkt)
                "Error refreshing variable info: %s\n", av_err2str(AVERROR(errno)));
     }
 
-    pkt->pts = curtime;
+    pkt->pts = av_gettime();
 
     /* compute visible data offset */
     pin = fbdev->data + fbdev->bytes_per_pixel * fbdev->varinfo.xoffset +
@@ -220,7 +221,7 @@ static int fbdev_get_device_list(AVFormatContext *s, AVDeviceInfoList *device_li
 #define OFFSET(x) offsetof(FBDevContext, x)
 #define DEC AV_OPT_FLAG_DECODING_PARAM
 static const AVOption options[] = {
-    { "framerate","", OFFSET(framerate_q), AV_OPT_TYPE_VIDEO_RATE, {.str = "25"}, 0, 0, DEC },
+    { "framerate","", OFFSET(framerate_q), AV_OPT_TYPE_VIDEO_RATE, {.str = "25"}, 0, INT_MAX, DEC },
     { NULL },
 };
 
@@ -232,14 +233,14 @@ static const AVClass fbdev_class = {
     .category   = AV_CLASS_CATEGORY_DEVICE_VIDEO_INPUT,
 };
 
-AVInputFormat ff_fbdev_demuxer = {
-    .name           = "fbdev",
-    .long_name      = NULL_IF_CONFIG_SMALL("Linux framebuffer"),
+const FFInputFormat ff_fbdev_demuxer = {
+    .p.name          = "fbdev",
+    .p.long_name     = NULL_IF_CONFIG_SMALL("Linux framebuffer"),
+    .p.flags         = AVFMT_NOFILE,
+    .p.priv_class    = &fbdev_class,
     .priv_data_size = sizeof(FBDevContext),
     .read_header    = fbdev_read_header,
     .read_packet    = fbdev_read_packet,
     .read_close     = fbdev_read_close,
     .get_device_list = fbdev_get_device_list,
-    .flags          = AVFMT_NOFILE,
-    .priv_class     = &fbdev_class,
 };

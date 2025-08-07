@@ -23,21 +23,16 @@
 
 #include <string.h>
 
-#if HAVE_SOUNDCARD_H
-#include <soundcard.h>
-#else
-#include <sys/soundcard.h>
-#endif
-
 #if HAVE_UNISTD_H
 #include <unistd.h>
 #endif
 #include <fcntl.h>
 #include <sys/ioctl.h>
+#include <sys/soundcard.h>
 
+#include "libavutil/file_open.h"
 #include "libavutil/log.h"
 
-#include "libavcodec/avcodec.h"
 #include "avdevice.h"
 
 #include "oss.h"
@@ -108,9 +103,11 @@ int ff_oss_audio_open(AVFormatContext *s1, int is_output,
     switch(tmp) {
     case AFMT_S16_LE:
         s->codec_id = AV_CODEC_ID_PCM_S16LE;
+        s->sample_size = 2;
         break;
     case AFMT_S16_BE:
         s->codec_id = AV_CODEC_ID_PCM_S16BE;
+        s->sample_size = 2;
         break;
     default:
         av_log(s1, AV_LOG_ERROR, "Soundcard does not support 16 bit sample format\n");
@@ -118,7 +115,7 @@ int ff_oss_audio_open(AVFormatContext *s1, int is_output,
         return AVERROR(EIO);
     }
     err=ioctl(audio_fd, SNDCTL_DSP_SETFMT, &tmp);
-    CHECK_IOCTL_ERROR(SNDCTL_DSP_SETFMTS)
+    CHECK_IOCTL_ERROR(SNDCTL_DSP_SETFMT)
 
     tmp = (s->channels == 2);
     err = ioctl(audio_fd, SNDCTL_DSP_STEREO, &tmp);

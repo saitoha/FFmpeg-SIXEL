@@ -24,7 +24,8 @@
  * id RoQ Video common functions based on work by Dr. Tim Ferguson
  */
 
-#include "avcodec.h"
+#include <stdint.h>
+#include <string.h>
 #include "roqvideo.h"
 
 static inline void block_copy(unsigned char *out, unsigned char *in,
@@ -110,13 +111,13 @@ static inline void apply_motion_generic(RoqContext *ri, int x, int y, int deltax
     /* check MV against frame boundaries */
     if ((mx < 0) || (mx > ri->width - sz) ||
         (my < 0) || (my > ri->height - sz)) {
-        av_log(ri->avctx, AV_LOG_ERROR, "motion vector out of bounds: MV = (%d, %d), boundaries = (0, 0, %d, %d)\n",
+        av_log(ri->logctx, AV_LOG_ERROR, "motion vector out of bounds: MV = (%d, %d), boundaries = (0, 0, %d, %d)\n",
             mx, my, ri->width, ri->height);
         return;
     }
 
     if (!ri->last_frame->data[0]) {
-        av_log(ri->avctx, AV_LOG_ERROR, "Invalid decode type. Invalid header?\n");
+        av_log(ri->logctx, AV_LOG_ERROR, "Invalid decode type. Invalid header?\n");
         return;
     }
 

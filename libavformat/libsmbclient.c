@@ -20,9 +20,8 @@
 
 #include <libsmbclient.h>
 #include "libavutil/avstring.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
-#include "avformat.h"
-#include "internal.h"
 #include "url.h"
 
 typedef struct {
@@ -166,7 +165,7 @@ static int libsmbc_read(URLContext *h, unsigned char *buf, int size)
         return ret;
     }
 
-    return bytes_read;
+    return bytes_read ? bytes_read : AVERROR_EOF;
 }
 
 static int libsmbc_write(URLContext *h, const unsigned char *buf, int size)
@@ -287,6 +286,67 @@ static int libsmbc_close_dir(URLContext *h)
     return 0;
 }
 
+static int libsmbc_delete(URLContext *h)
+{
+    LIBSMBContext *libsmbc = h->priv_data;
+    int ret;
+    struct stat st;
+
+    if ((ret = libsmbc_connect(h)) < 0)
+        goto cleanup;
+
+    if ((libsmbc->fd = smbc_open(h->filename, O_WRONLY, 0666)) < 0) {
+        ret = AVERROR(errno);
+        goto cleanup;
+    }
+
+    if (smbc_fstat(libsmbc->fd, &st) < 0) {
+        ret = AVERROR(errno);
+        goto cleanup;
+    }
+
+    smbc_close(libsmbc->fd);
+    libsmbc->fd = -1;
+
+    if (S_ISDIR(st.st_mode)) {
+        if (smbc_rmdir(h->filename) < 0) {
+            ret = AVERROR(errno);
+            goto cleanup;
+        }
+    } else {
+        if (smbc_unlink(h->filename) < 0) {
+            ret = AVERROR(errno);
+            goto cleanup;
+        }
+    }
+
+    ret = 0;
+
+cleanup:
+    libsmbc_close(h);
+    return ret;
+}
+
+static int libsmbc_move(URLContext *h_src, URLContext *h_dst)
+{
+    LIBSMBContext *libsmbc = h_src->priv_data;
+    int ret;
+
+    if ((ret = libsmbc_connect(h_src)) < 0)
+        goto cleanup;
+
+    if ((libsmbc->dh = smbc_rename(h_src->filename, h_dst->filename)) < 0) {
+        ret = AVERROR(errno);
+        goto cleanup;
+    }
+
+    ret = 0;
+
+cleanup:
+    libsmbc_close(h_src);
+    return ret;
+}
+
 #define OFFSET(x) offsetof(LIBSMBContext, x)
 #define D AV_OPT_FLAG_DECODING_PARAM
 #define E AV_OPT_FLAG_ENCODING_PARAM
@@ -304,13 +364,15 @@ static const AVClass libsmbclient_context_class = {
     .version        = LIBAVUTIL_VERSION_INT,
 };
 
-URLProtocol ff_libsmbclient_protocol = {
+const URLProtocol ff_libsmbclient_protocol = {
     .name                = "smb",
     .url_open            = libsmbc_open,
     .url_read            = libsmbc_read,
     .url_write           = libsmbc_write,
     .url_seek            = libsmbc_seek,
     .url_close           = libsmbc_close,
+    .url_delete          = libsmbc_delete,
+    .url_move            = libsmbc_move,
     .url_open_dir        = libsmbc_open_dir,
     .url_read_dir        = libsmbc_read_dir,
     .url_close_dir       = libsmbc_close_dir,

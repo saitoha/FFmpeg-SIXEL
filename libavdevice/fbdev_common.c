@@ -26,6 +26,8 @@
 #include <stdlib.h>
 #include "fbdev_common.h"
 #include "libavutil/common.h"
+#include "libavutil/file_open.h"
+#include "libavutil/mem.h"
 #include "avdevice.h"
 
 struct rgb_pixfmt_map_entry {
@@ -42,7 +44,7 @@ static const struct rgb_pixfmt_map_entry rgb_pixfmt_map[] = {
     {  32,       3,           2,           8,            0,   AV_PIX_FMT_ABGR  },
     {  24,       0,           8,          16,            0,   AV_PIX_FMT_RGB24 },
     {  24,      16,           8,           0,            0,   AV_PIX_FMT_BGR24 },
-    {  16,      11,           5,           0,           16,   AV_PIX_FMT_RGB565 },
+    {  16,      11,           5,           0,            0,   AV_PIX_FMT_RGB565 },
 };
 
 enum AVPixelFormat ff_get_pixfmt_from_fb_varinfo(struct fb_var_screeninfo *varinfo)
@@ -61,7 +63,7 @@ enum AVPixelFormat ff_get_pixfmt_from_fb_varinfo(struct fb_var_screeninfo *varin
     return AV_PIX_FMT_NONE;
 }
 
-const char* ff_fbdev_default_device()
+const char *ff_fbdev_default_device(void)
 {
     const char *dev = getenv("FRAMEBUFFER");
     if (!dev)

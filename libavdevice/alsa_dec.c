@@ -27,7 +27,7 @@
  * @author Benoit Fouet ( benoit fouet free fr )
  * @author Nicolas George ( nicolas george normalesup org )
  *
- * This avdevice decoder allows to capture audio from an ALSA (Advanced
+ * This avdevice decoder can capture audio from an ALSA (Advanced
  * Linux Sound Architecture) device.
  *
  * The filename parameter is the name of an ALSA PCM device capable of
@@ -52,6 +52,7 @@
 #include "libavutil/opt.h"
 #include "libavutil/time.h"
 
+#include "libavformat/demux.h"
 #include "libavformat/internal.h"
 
 #include "avdevice.h"
@@ -72,30 +73,41 @@ static av_cold int audio_read_header(AVFormatContext *s1)
     }
     codec_id    = s1->audio_codec_id;
 
-    ret = ff_alsa_open(s1, SND_PCM_STREAM_CAPTURE, &s->sample_rate, s->channels,
+#if FF_API_ALSA_CHANNELS
+    if (s->channels > 0) {
+        av_channel_layout_uninit(&s->ch_layout);
+        s->ch_layout.nb_channels = s->channels;
+    }
+#endif
+
+    ret = ff_alsa_open(s1, SND_PCM_STREAM_CAPTURE, &s->sample_rate, &s->ch_layout,
         &codec_id);
     if (ret < 0) {
         return AVERROR(EIO);
     }
 
     /* take real parameters */
-    st->codec->codec_type  = AVMEDIA_TYPE_AUDIO;
-    st->codec->codec_id    = codec_id;
-    st->codec->sample_rate = s->sample_rate;
-    st->codec->channels    = s->channels;
-    st->codec->frame_size = s->frame_size;
+    st->codecpar->codec_type  = AVMEDIA_TYPE_AUDIO;
+    st->codecpar->codec_id    = codec_id;
+    st->codecpar->sample_rate = s->sample_rate;
+    ret = av_channel_layout_copy(&st->codecpar->ch_layout, &s->ch_layout);
+    if (ret < 0)
+        goto fail;
+    st->codecpar->frame_size = s->frame_size;
     avpriv_set_pts_info(st, 64, 1, 1000000);  /* 64 bits pts in us */
     /* microseconds instead of seconds, MHz instead of Hz */
     s->timefilter = ff_timefilter_new(1000000.0 / s->sample_rate,
                                       s->period_size, 1.5E-6);
-    if (!s->timefilter)
+    if (!s->timefilter) {
+        ret = AVERROR(EIO);
         goto fail;
+    }
 
     return 0;
 
 fail:
     snd_pcm_close(s->h);
-    return AVERROR(EIO);
+    return ret;
 }
 
 static int audio_read_packet(AVFormatContext *s1, AVPacket *pkt)
@@ -105,33 +117,35 @@ static int audio_read_packet(AVFormatContext *s1, AVPacket *pkt)
     int64_t dts;
     snd_pcm_sframes_t delay = 0;
 
-    if (av_new_packet(pkt, s->period_size * s->frame_size) < 0) {
-        return AVERROR(EIO);
+    if (!s->pkt->data) {
+        int ret = av_new_packet(s->pkt, s->period_size * s->frame_size);
+        if (ret < 0)
+            return ret;
+        s->pkt->size = 0;
     }
 
-    while ((res = snd_pcm_readi(s->h, pkt->data, s->period_size)) < 0) {
+    do {
+        while ((res = snd_pcm_readi(s->h, s->pkt->data + s->pkt->size, s->period_size - s->pkt->size / s->frame_size)) < 0) {
         if (res == -EAGAIN) {
-            av_free_packet(pkt);
-
             return AVERROR(EAGAIN);
         }
+        s->pkt->size = 0;
         if (ff_alsa_xrun_recover(s1, res) < 0) {
             av_log(s1, AV_LOG_ERROR, "ALSA read error: %s\n",
                    snd_strerror(res));
-            av_free_packet(pkt);
-
             return AVERROR(EIO);
         }
         ff_timefilter_reset(s->timefilter);
-    }
+        }
+        s->pkt->size += res * s->frame_size;
+    } while (s->pkt->size < s->period_size * s->frame_size);
 
+    av_packet_move_ref(pkt, s->pkt);
     dts = av_gettime();
     snd_pcm_delay(s->h, &delay);
     dts -= av_rescale(delay + res, 1000000, s->sample_rate);
     pkt->pts = ff_timefilter_update(s->timefilter, dts, s->last_period);
     s->last_period = res;
-
-    pkt->size = res * s->frame_size;
 
     return 0;
 }
@@ -143,26 +157,29 @@ static int audio_get_device_list(AVFormatContext *h, AVDeviceInfoList *device_li
 
 static const AVOption options[] = {
     { "sample_rate", "", offsetof(AlsaData, sample_rate), AV_OPT_TYPE_INT, {.i64 = 48000}, 1, INT_MAX, AV_OPT_FLAG_DECODING_PARAM },
-    { "channels",    "", offsetof(AlsaData, channels),    AV_OPT_TYPE_INT, {.i64 = 2},     1, INT_MAX, AV_OPT_FLAG_DECODING_PARAM },
+#if FF_API_ALSA_CHANNELS
+    { "channels",    "", offsetof(AlsaData, channels),    AV_OPT_TYPE_INT, {.i64 = 0},     0, INT_MAX, AV_OPT_FLAG_DECODING_PARAM | AV_OPT_FLAG_DEPRECATED },
+#endif
+    { "ch_layout",   "", offsetof(AlsaData, ch_layout),   AV_OPT_TYPE_CHLAYOUT, {.str = "2C"}, INT_MIN, INT_MAX, AV_OPT_FLAG_DECODING_PARAM },
     { NULL },
 };
 
 static const AVClass alsa_demuxer_class = {
-    .class_name     = "ALSA demuxer",
+    .class_name     = "ALSA indev",
     .item_name      = av_default_item_name,
     .option         = options,
     .version        = LIBAVUTIL_VERSION_INT,
     .category       = AV_CLASS_CATEGORY_DEVICE_AUDIO_INPUT,
 };
 
-AVInputFormat ff_alsa_demuxer = {
-    .name           = "alsa",
-    .long_name      = NULL_IF_CONFIG_SMALL("ALSA audio input"),
+const FFInputFormat ff_alsa_demuxer = {
+    .p.name         = "alsa",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("ALSA audio input"),
+    .p.flags        = AVFMT_NOFILE,
+    .p.priv_class   = &alsa_demuxer_class,
     .priv_data_size = sizeof(AlsaData),
     .read_header    = audio_read_header,
     .read_packet    = audio_read_packet,
     .read_close     = ff_alsa_close,
     .get_device_list = audio_get_device_list,
-    .flags          = AVFMT_NOFILE,
-    .priv_class     = &alsa_demuxer_class,
 };

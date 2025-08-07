@@ -27,11 +27,11 @@
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
 
 enum FieldType { FIELD_TYPE_TOP = 0, FIELD_TYPE_BOTTOM };
 
-typedef struct {
+typedef struct FieldContext {
     const AVClass *class;
     int type;                   ///< FieldType
     int nb_planes;              ///< number of planes of the current format
@@ -41,9 +41,9 @@ typedef struct {
 #define FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM
 
 static const AVOption field_options[] = {
-    {"type", "set field type (top or bottom)", OFFSET(type), AV_OPT_TYPE_INT, {.i64=FIELD_TYPE_TOP}, 0, 1, FLAGS, "field_type" },
-    {"top",    "select top field",    0, AV_OPT_TYPE_CONST, {.i64=FIELD_TYPE_TOP},    INT_MIN, INT_MAX, FLAGS, "field_type"},
-    {"bottom", "select bottom field", 0, AV_OPT_TYPE_CONST, {.i64=FIELD_TYPE_BOTTOM}, INT_MIN, INT_MAX, FLAGS, "field_type"},
+    {"type", "set field type (top or bottom)", OFFSET(type), AV_OPT_TYPE_INT, {.i64=FIELD_TYPE_TOP}, 0, 1, FLAGS, .unit = "field_type" },
+    {"top",    "select top field",    0, AV_OPT_TYPE_CONST, {.i64=FIELD_TYPE_TOP},    INT_MIN, INT_MAX, FLAGS, .unit = "field_type"},
+    {"bottom", "select bottom field", 0, AV_OPT_TYPE_CONST, {.i64=FIELD_TYPE_BOTTOM}, INT_MIN, INT_MAX, FLAGS, .unit = "field_type"},
     {NULL}
 };
 
@@ -73,7 +73,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *inpicref)
     int i;
 
     inpicref->height = outlink->h;
-    inpicref->interlaced_frame = 0;
+    inpicref->flags &= ~AV_FRAME_FLAG_INTERLACED;
 
     for (i = 0; i < field->nb_planes; i++) {
         if (field->type == FIELD_TYPE_BOTTOM)
@@ -89,7 +89,6 @@ static const AVFilterPad field_inputs[] = {
         .type         = AVMEDIA_TYPE_VIDEO,
         .filter_frame = filter_frame,
     },
-    { NULL }
 };
 
 static const AVFilterPad field_outputs[] = {
@@ -98,14 +97,13 @@ static const AVFilterPad field_outputs[] = {
         .type         = AVMEDIA_TYPE_VIDEO,
         .config_props = config_props_output,
     },
-    { NULL }
 };
 
-AVFilter ff_vf_field = {
-    .name        = "field",
-    .description = NULL_IF_CONFIG_SMALL("Extract a field from the input video."),
+const FFFilter ff_vf_field = {
+    .p.name        = "field",
+    .p.description = NULL_IF_CONFIG_SMALL("Extract a field from the input video."),
+    .p.priv_class  = &field_class,
     .priv_size   = sizeof(FieldContext),
-    .inputs      = field_inputs,
-    .outputs     = field_outputs,
-    .priv_class  = &field_class,
+    FILTER_INPUTS(field_inputs),
+    FILTER_OUTPUTS(field_outputs),
 };

@@ -1,5 +1,5 @@
 /*
- * SSA/ASS spliting functions
+ * SSA/ASS splitting functions
  * Copyright (c) 2010  Aurelien Jacobs <aurel@gnuage.org>
  *
  * This file is part of FFmpeg.
@@ -19,7 +19,15 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "avcodec.h"
+#include <limits.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "libavutil/error.h"
+#include "libavutil/macros.h"
+#include "libavutil/mem.h"
 #include "ass_split.h"
 
 typedef enum {
@@ -229,7 +237,7 @@ static inline const char *skip_space(const char *buf)
     return buf;
 }
 
-static int *get_default_field_orders(const ASSSection *section)
+static int *get_default_field_orders(const ASSSection *section, int *number)
 {
     int i;
     int *order = av_malloc_array(FF_ARRAY_ELEMS(section->fields), sizeof(*order));
@@ -238,8 +246,9 @@ static int *get_default_field_orders(const ASSSection *section)
         return NULL;
     for (i = 0; section->fields[i].name; i++)
         order[i] = i;
+    *number = i;
     while (i < FF_ARRAY_ELEMS(section->fields))
-        order[i] = -1;
+        order[i++] = -1;
     return order;
 }
 
@@ -248,37 +257,54 @@ static const char *ass_split_section(ASSSplitContext *ctx, const char *buf)
     const ASSSection *section = &ass_sections[ctx->current_section];
     int *number = &ctx->field_number[ctx->current_section];
     int *order = ctx->field_order[ctx->current_section];
-    int *tmp, i, len;
+    int i, len;
 
     while (buf && *buf) {
         if (buf[0] == '[') {
             ctx->current_section = -1;
             break;
         }
-        if (buf[0] == ';' || (buf[0] == '!' && buf[1] == ':')) {
-            /* skip comments */
-        } else if (section->format_header && !order) {
-            len = strlen(section->format_header);
-            if (strncmp(buf, section->format_header, len) || buf[len] != ':')
-                goto next_line;
-            buf += len + 1;
-            while (!is_eol(*buf)) {
-                buf = skip_space(buf);
-                len = strcspn(buf, ", \r\n");
-                if (!(tmp = av_realloc_array(order, (*number + 1), sizeof(*order))))
-                    return NULL;
-                order = tmp;
-                order[*number] = -1;
-                for (i=0; section->fields[i].name; i++)
-                    if (!strncmp(buf, section->fields[i].name, len)) {
-                        order[*number] = i;
-                        break;
-                    }
-                (*number)++;
-                buf = skip_space(buf + len + (buf[len] == ','));
+        if (buf[0] == ';' || (buf[0] == '!' && buf[1] == ':'))
+            goto next_line; // skip comments
+
+        len = strcspn(buf, ":\r\n");
+        if (buf[len] == ':' &&
+            (!section->fields_header || strncmp(buf, section->fields_header, len))) {
+            for (i = 0; i < FF_ARRAY_ELEMS(ass_sections); i++) {
+                if (ass_sections[i].fields_header &&
+                    !strncmp(buf, ass_sections[i].fields_header, len)) {
+                    ctx->current_section = i;
+                    section = &ass_sections[ctx->current_section];
+                    number = &ctx->field_number[ctx->current_section];
+                    order = ctx->field_order[ctx->current_section];
+                    break;
+                }
             }
-            ctx->field_order[ctx->current_section] = order;
-        } else if (section->fields_header) {
+        }
+        if (section->format_header && !order) {
+            len = strlen(section->format_header);
+            if (!strncmp(buf, section->format_header, len) && buf[len] == ':') {
+                buf += len + 1;
+                while (!is_eol(*buf)) {
+                    buf = skip_space(buf);
+                    len = strcspn(buf, ", \r\n");
+                    if (av_reallocp_array(&order, (*number + 1), sizeof(*order)) != 0)
+                        return NULL;
+
+                    order[*number] = -1;
+                    for (i=0; section->fields[i].name; i++)
+                        if (!strncmp(buf, section->fields[i].name, len)) {
+                            order[*number] = i;
+                            break;
+                        }
+                    (*number)++;
+                    buf = skip_space(buf + len + (buf[len] == ','));
+                }
+                ctx->field_order[ctx->current_section] = order;
+                goto next_line;
+            }
+        }
+        if (section->fields_header) {
             len = strlen(section->fields_header);
             if (!strncmp(buf, section->fields_header, len) && buf[len] == ':') {
                 uint8_t *ptr, *struct_ptr = realloc_section_array(ctx);
@@ -286,7 +312,7 @@ static const char *ass_split_section(ASSSplitContext *ctx, const char *buf)
 
                 /* No format header line found so far, assume default */
                 if (!order) {
-                    order = get_default_field_orders(section);
+                    order = get_default_field_orders(section, number);
                     if (!order)
                         return NULL;
                     ctx->field_order[ctx->current_section] = order;
@@ -356,6 +382,10 @@ static int ass_split(ASSSplitContext *ctx, const char *buf)
 ASSSplitContext *ff_ass_split(const char *buf)
 {
     ASSSplitContext *ctx = av_mallocz(sizeof(*ctx));
+    if (!ctx)
+        return NULL;
+    if (buf && !strncmp(buf, "\xef\xbb\xbf", 3)) // Skip UTF-8 BOM header
+        buf += 3;
     ctx->current_section = -1;
     if (ass_split(ctx, buf) < 0) {
         ff_ass_split_free(ctx);
@@ -388,22 +418,52 @@ static void free_section(ASSSplitContext *ctx, const ASSSection *section)
         av_freep((uint8_t *)&ctx->ass + section->offset);
 }
 
-ASSDialog *ff_ass_split_dialog(ASSSplitContext *ctx, const char *buf,
-                               int cache, int *number)
+void ff_ass_free_dialog(ASSDialog **dialogp)
 {
-    ASSDialog *dialog = NULL;
-    int i, count;
-    if (!cache)
-        for (i=0; i<FF_ARRAY_ELEMS(ass_sections); i++)
-            if (!strcmp(ass_sections[i].section, "Events")) {
-                free_section(ctx, &ass_sections[i]);
-                break;
-            }
-    count = ctx->ass.dialogs_count;
-    if (ass_split(ctx, buf) == 0)
-        dialog = ctx->ass.dialogs + count;
-    if (number)
-        *number = ctx->ass.dialogs_count - count;
+    ASSDialog *dialog = *dialogp;
+    if (!dialog)
+        return;
+    av_freep(&dialog->style);
+    av_freep(&dialog->name);
+    av_freep(&dialog->effect);
+    av_freep(&dialog->text);
+    av_freep(dialogp);
+}
+
+ASSDialog *ff_ass_split_dialog(ASSSplitContext *ctx, const char *buf)
+{
+    int i;
+    static const ASSFields fields[] = {
+        {"ReadOrder", ASS_INT, offsetof(ASSDialog, readorder)},
+        {"Layer",     ASS_INT, offsetof(ASSDialog, layer)    },
+        {"Style",     ASS_STR, offsetof(ASSDialog, style)    },
+        {"Name",      ASS_STR, offsetof(ASSDialog, name)     },
+        {"MarginL",   ASS_INT, offsetof(ASSDialog, margin_l) },
+        {"MarginR",   ASS_INT, offsetof(ASSDialog, margin_r) },
+        {"MarginV",   ASS_INT, offsetof(ASSDialog, margin_v) },
+        {"Effect",    ASS_STR, offsetof(ASSDialog, effect)   },
+        {"Text",      ASS_STR, offsetof(ASSDialog, text)     },
+    };
+
+    ASSDialog *dialog = av_mallocz(sizeof(*dialog));
+    if (!dialog)
+        return NULL;
+
+    for (i = 0; i < FF_ARRAY_ELEMS(fields); i++) {
+        size_t len;
+        const int last = i == FF_ARRAY_ELEMS(fields) - 1;
+        const ASSFieldType type = fields[i].type;
+        uint8_t *ptr = (uint8_t *)dialog + fields[i].offset;
+        buf = skip_space(buf);
+        len = last ? strlen(buf) : strcspn(buf, ",");
+        if (len >= INT_MAX) {
+            ff_ass_free_dialog(&dialog);
+            return NULL;
+        }
+        convert_func[type](ptr, buf, len);
+        buf += len;
+        if (*buf) buf++;
+    }
     return dialog;
 }
 
@@ -523,7 +583,7 @@ ASSStyle *ff_ass_style_get(ASSSplitContext *ctx, const char *style)
     if (!style || !*style)
         style = "Default";
     for (i=0; i<ass->styles_count; i++)
-        if (!strcmp(ass->styles[i].name, style))
+        if (ass->styles[i].name && !strcmp(ass->styles[i].name, style))
             return ass->styles + i;
     return NULL;
 }

@@ -19,8 +19,8 @@
 #ifndef AVCODEC_ARM_HEVCDSP_ARM_H
 #define AVCODEC_ARM_HEVCDSP_ARM_H
 
-#include "libavcodec/hevcdsp.h"
+#include "libavcodec/hevc/dsp.h"
 
-void ff_hevcdsp_init_neon(HEVCDSPContext *c, const int bit_depth);
+void ff_hevc_dsp_init_neon(HEVCDSPContext *c, const int bit_depth);
 
 #endif /* AVCODEC_ARM_HEVCDSP_ARM_H */

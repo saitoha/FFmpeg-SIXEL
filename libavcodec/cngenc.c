@@ -21,9 +21,12 @@
 
 #include <math.h>
 
+#include "libavutil/avassert.h"
 #include "libavutil/common.h"
+#include "libavutil/mem.h"
 #include "avcodec.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "encode.h"
 #include "lpc.h"
 
 typedef struct CNGContext {
@@ -37,8 +40,8 @@ static av_cold int cng_encode_close(AVCodecContext *avctx)
 {
     CNGContext *p = avctx->priv_data;
     ff_lpc_end(&p->lpc);
-    av_free(p->samples32);
-    av_free(p->ref_coef);
+    av_freep(&p->samples32);
+    av_freep(&p->ref_coef);
     return 0;
 }
 
@@ -47,21 +50,14 @@ static av_cold int cng_encode_init(AVCodecContext *avctx)
     CNGContext *p = avctx->priv_data;
     int ret;
 
-    if (avctx->channels != 1) {
-        av_log(avctx, AV_LOG_ERROR, "Only mono supported\n");
-        return AVERROR(EINVAL);
-    }
-
     avctx->frame_size = 640;
     p->order = 10;
     if ((ret = ff_lpc_init(&p->lpc, avctx->frame_size, p->order, FF_LPC_TYPE_LEVINSON)) < 0)
         return ret;
     p->samples32 = av_malloc_array(avctx->frame_size, sizeof(*p->samples32));
     p->ref_coef = av_malloc_array(p->order, sizeof(*p->ref_coef));
-    if (!p->samples32 || !p->ref_coef) {
-        cng_encode_close(avctx);
+    if (!p->samples32 || !p->ref_coef)
         return AVERROR(ENOMEM);
-    }
 
     return 0;
 }
@@ -73,9 +69,9 @@ static int cng_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
     int ret, i;
     double energy = 0;
     int qdbov;
-    int16_t *samples = (int16_t*) frame->data[0];
+    const int16_t *samples = (const int16_t*) frame->data[0];
 
-    if ((ret = ff_alloc_packet(avpkt, 1 + p->order))) {
+    if ((ret = ff_get_encode_buffer(avctx, avpkt, 1 + p->order, 0))) {
         av_log(avctx, AV_LOG_ERROR, "Error getting output packet\n");
         return ret;
     }
@@ -91,26 +87,28 @@ static int cng_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
     } else {
         qdbov = 127;
     }
-    ret = ff_lpc_calc_ref_coefs(&p->lpc, p->samples32, p->order, p->ref_coef);
+    ff_lpc_calc_ref_coefs(&p->lpc, p->samples32, p->order, p->ref_coef);
     avpkt->data[0] = qdbov;
     for (i = 0; i < p->order; i++)
         avpkt->data[1 + i] = p->ref_coef[i] * 127 + 127;
 
     *got_packet_ptr = 1;
-    avpkt->size = 1 + p->order;
+    av_assert1(avpkt->size == 1 + p->order);
 
     return 0;
 }
 
-AVCodec ff_comfortnoise_encoder = {
-    .name           = "comfortnoise",
-    .long_name      = NULL_IF_CONFIG_SMALL("RFC 3389 comfort noise generator"),
-    .type           = AVMEDIA_TYPE_AUDIO,
-    .id             = AV_CODEC_ID_COMFORT_NOISE,
+const FFCodec ff_comfortnoise_encoder = {
+    .p.name         = "comfortnoise",
+    CODEC_LONG_NAME("RFC 3389 comfort noise generator"),
+    .p.type         = AVMEDIA_TYPE_AUDIO,
+    .p.id           = AV_CODEC_ID_COMFORT_NOISE,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
     .priv_data_size = sizeof(CNGContext),
     .init           = cng_encode_init,
-    .encode2        = cng_encode_frame,
+    FF_CODEC_ENCODE_CB(cng_encode_frame),
     .close          = cng_encode_close,
-    .sample_fmts    = (const enum AVSampleFormat[]){ AV_SAMPLE_FMT_S16,
-                                                     AV_SAMPLE_FMT_NONE },
+    CODEC_SAMPLEFMTS(AV_SAMPLE_FMT_S16),
+    CODEC_CH_LAYOUTS(AV_CHANNEL_LAYOUT_MONO),
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };

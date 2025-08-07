@@ -25,20 +25,22 @@
  */
 
 #include "libavutil/avassert.h"
+#include "libavutil/avstring.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/common.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 
 #include "audio.h"
 #include "avfilter.h"
 #include "formats.h"
-#include "internal.h"
+#include "filters.h"
 
 typedef struct ChannelMap {
-    int input;                ///< input stream index
-    int       in_channel_idx; ///< index of in_channel in the input stream data
-    uint64_t  in_channel;     ///< layout describing the input channel
-    uint64_t out_channel;     ///< layout describing the output channel
+    int input;                     ///< input stream index
+    int            in_channel_idx; ///< index of in_channel in the input stream data
+    enum AVChannel in_channel;
+    enum AVChannel out_channel;
 } ChannelMap;
 
 typedef struct JoinContext {
@@ -46,10 +48,11 @@ typedef struct JoinContext {
 
     int inputs;
     char *map;
-    char    *channel_layout_str;
-    uint64_t channel_layout;
+    AVChannelLayout ch_layout;
 
-    int      nb_channels;
+    int64_t  eof_pts;
+    int eof;
+
     ChannelMap *channels;
 
     /**
@@ -69,51 +72,28 @@ typedef struct JoinContext {
 static const AVOption join_options[] = {
     { "inputs",         "Number of input streams.", OFFSET(inputs),             AV_OPT_TYPE_INT,    { .i64 = 2 }, 1, INT_MAX,       A|F },
     { "channel_layout", "Channel layout of the "
-                        "output stream.",           OFFSET(channel_layout_str), AV_OPT_TYPE_STRING, {.str = "stereo"}, 0, 0, A|F },
+                        "output stream.",           OFFSET(ch_layout),          AV_OPT_TYPE_CHLAYOUT, {.str = "stereo"}, 0, 0, A|F },
     { "map",            "A comma-separated list of channels maps in the format "
                         "'input_stream.input_channel-output_channel.",
                                                     OFFSET(map),                AV_OPT_TYPE_STRING,                 .flags = A|F },
     { NULL }
 };
 
+#define MAP_SEPARATOR '|'
+
 AVFILTER_DEFINE_CLASS(join);
-
-static int filter_frame(AVFilterLink *link, AVFrame *frame)
-{
-    AVFilterContext *ctx = link->dst;
-    JoinContext       *s = ctx->priv;
-    int i;
-
-    for (i = 0; i < ctx->nb_inputs; i++)
-        if (link == ctx->inputs[i])
-            break;
-    av_assert0(i < ctx->nb_inputs);
-    av_assert0(!s->input_frames[i]);
-    s->input_frames[i] = frame;
-
-    return 0;
-}
 
 static int parse_maps(AVFilterContext *ctx)
 {
     JoinContext *s = ctx->priv;
-    char separator = '|';
     char *cur      = s->map;
 
-#if FF_API_OLD_FILTER_OPTS
-    if (cur && strchr(cur, ',')) {
-        av_log(ctx, AV_LOG_WARNING, "This syntax is deprecated, use '|' to "
-               "separate the mappings.\n");
-        separator = ',';
-    }
-#endif
-
     while (cur && *cur) {
+        ChannelMap *map;
         char *sep, *next, *p;
-        uint64_t in_channel = 0, out_channel = 0;
-        int input_idx, out_ch_idx, in_ch_idx;
+        int input_idx, out_ch_idx;
 
-        next = strchr(cur, separator);
+        next = strchr(cur, MAP_SEPARATOR);
         if (next)
             *next++ = 0;
 
@@ -125,28 +105,16 @@ static int parse_maps(AVFilterContext *ctx)
         }
         *sep++ = 0;
 
-#define PARSE_CHANNEL(str, var, inout)                                         \
-        if (!(var = av_get_channel_layout(str))) {                             \
-            av_log(ctx, AV_LOG_ERROR, "Invalid " inout " channel: %s.\n", str);\
-            return AVERROR(EINVAL);                                            \
-        }                                                                      \
-        if (av_get_channel_layout_nb_channels(var) != 1) {                     \
-            av_log(ctx, AV_LOG_ERROR, "Channel map describes more than one "   \
-                   inout " channel.\n");                                       \
-            return AVERROR(EINVAL);                                            \
-        }
-
         /* parse output channel */
-        PARSE_CHANNEL(sep, out_channel, "output");
-        if (!(out_channel & s->channel_layout)) {
-            av_log(ctx, AV_LOG_ERROR, "Output channel '%s' is not present in "
-                   "requested channel layout.\n", sep);
+        out_ch_idx = av_channel_layout_index_from_string(&s->ch_layout, sep);
+        if (out_ch_idx < 0) {
+            av_log(ctx, AV_LOG_ERROR, "Invalid output channel: %s.\n", sep);
             return AVERROR(EINVAL);
         }
 
-        out_ch_idx = av_get_channel_layout_channel_index(s->channel_layout,
-                                                         out_channel);
-        if (s->channels[out_ch_idx].input >= 0) {
+        map = &s->channels[out_ch_idx];
+
+        if (map->input >= 0) {
             av_log(ctx, AV_LOG_ERROR, "Multiple maps for output channel "
                    "'%s'.\n", sep);
             return AVERROR(EINVAL);
@@ -163,18 +131,20 @@ static int parse_maps(AVFilterContext *ctx)
         if (*cur)
             cur++;
 
-        in_ch_idx = strtol(cur, &p, 0);
+        map->input          = input_idx;
+        map->in_channel     = AV_CHAN_NONE;
+        map->in_channel_idx = strtol(cur, &p, 0);
         if (p == cur) {
-            /* channel specifier is not a number,
-             * try to parse as channel name */
-            PARSE_CHANNEL(cur, in_channel, "input");
+            /* channel specifier is not a number, handle as channel name */
+            map->in_channel = av_channel_from_string(cur);
+            if (map->in_channel < 0) {
+                av_log(ctx, AV_LOG_ERROR, "Invalid input channel: %s.\n", cur);
+                return AVERROR(EINVAL);
+            }
+        } else if (map->in_channel_idx < 0) {
+            av_log(ctx, AV_LOG_ERROR, "Invalid input channel index: %d\n", map->in_channel_idx);
+            return AVERROR(EINVAL);
         }
-
-        s->channels[out_ch_idx].input      = input_idx;
-        if (in_channel)
-            s->channels[out_ch_idx].in_channel = in_channel;
-        else
-            s->channels[out_ch_idx].in_channel_idx = in_ch_idx;
 
         cur = next;
     }
@@ -186,41 +156,32 @@ static av_cold int join_init(AVFilterContext *ctx)
     JoinContext *s = ctx->priv;
     int ret, i;
 
-    if (!(s->channel_layout = av_get_channel_layout(s->channel_layout_str))) {
-        av_log(ctx, AV_LOG_ERROR, "Error parsing channel layout '%s'.\n",
-               s->channel_layout_str);
-        return AVERROR(EINVAL);
-    }
-
-    s->nb_channels  = av_get_channel_layout_nb_channels(s->channel_layout);
-    s->channels     = av_mallocz_array(s->nb_channels, sizeof(*s->channels));
-    s->buffers      = av_mallocz_array(s->nb_channels, sizeof(*s->buffers));
-    s->input_frames = av_mallocz_array(s->inputs, sizeof(*s->input_frames));
+    s->channels     = av_calloc(s->ch_layout.nb_channels, sizeof(*s->channels));
+    s->buffers      = av_calloc(s->ch_layout.nb_channels, sizeof(*s->buffers));
+    s->input_frames = av_calloc(s->inputs, sizeof(*s->input_frames));
     if (!s->channels || !s->buffers|| !s->input_frames)
         return AVERROR(ENOMEM);
 
-    for (i = 0; i < s->nb_channels; i++) {
-        s->channels[i].out_channel = av_channel_layout_extract_channel(s->channel_layout, i);
-        s->channels[i].input       = -1;
+    for (i = 0; i < s->ch_layout.nb_channels; i++) {
+        s->channels[i].out_channel    = av_channel_layout_channel_from_index(&s->ch_layout, i);
+        s->channels[i].input          = -1;
+        s->channels[i].in_channel_idx = -1;
+        s->channels[i].in_channel     = AV_CHAN_NONE;
     }
 
     if ((ret = parse_maps(ctx)) < 0)
         return ret;
 
     for (i = 0; i < s->inputs; i++) {
-        char name[32];
         AVFilterPad pad = { 0 };
 
-        snprintf(name, sizeof(name), "input%d", i);
-        pad.type           = AVMEDIA_TYPE_AUDIO;
-        pad.name           = av_strdup(name);
+        pad.type = AVMEDIA_TYPE_AUDIO;
+        pad.name = av_asprintf("input%d", i);
         if (!pad.name)
             return AVERROR(ENOMEM);
-        pad.filter_frame   = filter_frame;
 
-        pad.needs_fifo = 1;
-
-        ff_insert_inpad(ctx, i, &pad);
+        if ((ret = ff_append_inpad_free_name(ctx, &pad)) < 0)
+            return ret;
     }
 
     return 0;
@@ -231,8 +192,7 @@ static av_cold void join_uninit(AVFilterContext *ctx)
     JoinContext *s = ctx->priv;
     int i;
 
-    for (i = 0; i < ctx->nb_inputs; i++) {
-        av_freep(&ctx->input_pads[i].name);
+    for (i = 0; i < s->inputs && s->input_frames; i++) {
         av_frame_free(&s->input_frames[i]);
     }
 
@@ -241,60 +201,79 @@ static av_cold void join_uninit(AVFilterContext *ctx)
     av_freep(&s->input_frames);
 }
 
-static int join_query_formats(AVFilterContext *ctx)
+static int join_query_formats(const AVFilterContext *ctx,
+                              AVFilterFormatsConfig **cfg_in,
+                              AVFilterFormatsConfig **cfg_out)
 {
-    JoinContext *s = ctx->priv;
+    const JoinContext *s = ctx->priv;
     AVFilterChannelLayouts *layouts = NULL;
-    int i;
+    int i, ret;
 
-    ff_add_channel_layout(&layouts, s->channel_layout);
-    ff_channel_layouts_ref(layouts, &ctx->outputs[0]->in_channel_layouts);
+    if ((ret = ff_add_channel_layout(&layouts, &s->ch_layout)) < 0 ||
+        (ret = ff_channel_layouts_ref(layouts, &cfg_out[0]->channel_layouts)) < 0)
+        return ret;
 
     for (i = 0; i < ctx->nb_inputs; i++) {
         layouts = ff_all_channel_layouts();
-        if (!layouts)
-            return AVERROR(ENOMEM);
-        ff_channel_layouts_ref(layouts, &ctx->inputs[i]->out_channel_layouts);
+        if ((ret = ff_channel_layouts_ref(layouts, &cfg_in[i]->channel_layouts)) < 0)
+            return ret;
     }
 
-    ff_set_common_formats    (ctx, ff_planar_sample_fmts());
-    ff_set_common_samplerates(ctx, ff_all_samplerates());
+    if ((ret = ff_set_common_formats2(ctx, cfg_in, cfg_out, ff_planar_sample_fmts())) < 0)
+        return ret;
 
     return 0;
 }
 
+typedef struct ChannelList {
+    enum AVChannel *ch;
+    int          nb_ch;
+} ChannelList;
+
+static enum AVChannel channel_list_pop(ChannelList *chl, int idx)
+{
+    enum AVChannel ret = chl->ch[idx];
+    memmove(chl->ch + idx, chl->ch + idx + 1,
+            (chl->nb_ch - idx - 1) * sizeof(*chl->ch));
+    chl->nb_ch--;
+    return ret;
+}
+
+/*
+ * If ch is present in chl, remove it from the list and return it.
+ * Otherwise return AV_CHAN_NONE.
+ */
+static enum AVChannel channel_list_pop_ch(ChannelList *chl, enum AVChannel ch)
+{
+    for (int i = 0; i < chl->nb_ch; i++)
+        if (chl->ch[i] == ch)
+            return channel_list_pop(chl, i);
+    return AV_CHAN_NONE;
+}
+
 static void guess_map_matching(AVFilterContext *ctx, ChannelMap *ch,
-                               uint64_t *inputs)
+                               ChannelList *inputs)
 {
     int i;
 
     for (i = 0; i < ctx->nb_inputs; i++) {
-        AVFilterLink *link = ctx->inputs[i];
-
-        if (ch->out_channel & link->channel_layout &&
-            !(ch->out_channel & inputs[i])) {
+        if (channel_list_pop_ch(&inputs[i], ch->out_channel) != AV_CHAN_NONE) {
             ch->input      = i;
             ch->in_channel = ch->out_channel;
-            inputs[i]     |= ch->out_channel;
             return;
         }
     }
 }
 
 static void guess_map_any(AVFilterContext *ctx, ChannelMap *ch,
-                          uint64_t *inputs)
+                          ChannelList *inputs)
 {
     int i;
 
     for (i = 0; i < ctx->nb_inputs; i++) {
-        AVFilterLink *link = ctx->inputs[i];
-
-        if ((inputs[i] & link->channel_layout) != link->channel_layout) {
-            uint64_t unused = link->channel_layout & ~inputs[i];
-
+        if (inputs[i].nb_ch) {
             ch->input      = i;
-            ch->in_channel = av_channel_layout_extract_channel(unused, 0);
-            inputs[i]     |= ch->in_channel;
+            ch->in_channel = channel_list_pop(&inputs[i], 0);
             return;
         }
     }
@@ -304,117 +283,166 @@ static int join_config_output(AVFilterLink *outlink)
 {
     AVFilterContext *ctx = outlink->src;
     JoinContext       *s = ctx->priv;
-    uint64_t *inputs;   // nth element tracks which channels are used from nth input
+    // unused channels from each input
+    ChannelList *inputs_unused;
+    char inbuf[64], outbuf[64];
     int i, ret = 0;
 
-    /* initialize inputs to user-specified mappings */
-    if (!(inputs = av_mallocz_array(ctx->nb_inputs, sizeof(*inputs))))
+    /* initialize unused channel list for each input */
+    inputs_unused = av_calloc(ctx->nb_inputs, sizeof(*inputs_unused));
+    if (!inputs_unused)
         return AVERROR(ENOMEM);
-    for (i = 0; i < s->nb_channels; i++) {
+    for (i = 0; i < ctx->nb_inputs; i++) {
+        AVFilterLink *inlink = ctx->inputs[i];
+        AVChannelLayout *chl = &inlink->ch_layout;
+        ChannelList      *iu = &inputs_unused[i];
+
+        iu->nb_ch = chl->nb_channels;
+        iu->ch    = av_malloc_array(iu->nb_ch, sizeof(*iu->ch));
+        if (!iu->ch) {
+            ret = AVERROR(ENOMEM);
+            goto fail;
+        }
+
+        for (int ch_idx = 0; ch_idx < iu->nb_ch; ch_idx++) {
+            iu->ch[ch_idx] = av_channel_layout_channel_from_index(chl, ch_idx);
+            if (iu->ch[ch_idx] < 0) {
+                /* no channel ordering information in this input,
+                 * so don't auto-map from it */
+                iu->nb_ch = 0;
+                break;
+            }
+        }
+    }
+
+    /* process user-specified maps */
+    for (i = 0; i < s->ch_layout.nb_channels; i++) {
         ChannelMap *ch = &s->channels[i];
         AVFilterLink *inlink;
+        AVChannelLayout *ichl;
+        ChannelList     *iu;
 
         if (ch->input < 0)
             continue;
 
         inlink = ctx->inputs[ch->input];
+        ichl   = &inlink->ch_layout;
+        iu     = &inputs_unused[ch->input];
 
-        if (!ch->in_channel)
-            ch->in_channel = av_channel_layout_extract_channel(inlink->channel_layout,
-                                                               ch->in_channel_idx);
+        /* get the index for the channels defined by name */
+        if (ch->in_channel != AV_CHAN_NONE) {
+            ch->in_channel_idx = av_channel_layout_index_from_channel(ichl, ch->in_channel);
+            if (ch->in_channel_idx < 0) {
+                av_channel_name(inbuf, sizeof(inbuf), ch->in_channel);
+                av_log(ctx, AV_LOG_ERROR, "Requested channel %s is not present in "
+                       "input stream #%d.\n", inbuf,
+                       ch->input);
+                ret = AVERROR(EINVAL);
+                goto fail;
+            }
+        }
 
-        if (!(ch->in_channel & inlink->channel_layout)) {
-            av_log(ctx, AV_LOG_ERROR, "Requested channel %s is not present in "
-                   "input stream #%d.\n", av_get_channel_name(ch->in_channel),
-                   ch->input);
+        /* make sure channels specified by index actually exist */
+        if (ch->in_channel_idx >= ichl->nb_channels) {
+            av_log(ctx, AV_LOG_ERROR, "Requested channel with index %d is not "
+                   "present in input stream #%d.\n", ch->in_channel_idx, ch->input);
             ret = AVERROR(EINVAL);
             goto fail;
         }
 
-        inputs[ch->input] |= ch->in_channel;
+        channel_list_pop_ch(iu, av_channel_layout_channel_from_index(ichl, ch->in_channel_idx));
     }
 
     /* guess channel maps when not explicitly defined */
     /* first try unused matching channels */
-    for (i = 0; i < s->nb_channels; i++) {
+    for (i = 0; i < s->ch_layout.nb_channels; i++) {
         ChannelMap *ch = &s->channels[i];
 
         if (ch->input < 0)
-            guess_map_matching(ctx, ch, inputs);
+            guess_map_matching(ctx, ch, inputs_unused);
     }
 
     /* if the above failed, try to find _any_ unused input channel */
-    for (i = 0; i < s->nb_channels; i++) {
+    for (i = 0; i < s->ch_layout.nb_channels; i++) {
         ChannelMap *ch = &s->channels[i];
 
         if (ch->input < 0)
-            guess_map_any(ctx, ch, inputs);
+            guess_map_any(ctx, ch, inputs_unused);
 
         if (ch->input < 0) {
+            av_channel_name(outbuf, sizeof(outbuf), ch->out_channel);
             av_log(ctx, AV_LOG_ERROR, "Could not find input channel for "
                    "output channel '%s'.\n",
-                   av_get_channel_name(ch->out_channel));
+                   outbuf);
+            ret = AVERROR(EINVAL);
             goto fail;
         }
 
-        ch->in_channel_idx = av_get_channel_layout_channel_index(ctx->inputs[ch->input]->channel_layout,
-                                                                 ch->in_channel);
+        if (ch->in_channel != AV_CHAN_NONE) {
+            ch->in_channel_idx = av_channel_layout_index_from_channel(
+                &ctx->inputs[ch->input]->ch_layout, ch->in_channel);
+        }
+
+        av_assert0(ch->in_channel_idx >= 0);
     }
 
     /* print mappings */
     av_log(ctx, AV_LOG_VERBOSE, "mappings: ");
-    for (i = 0; i < s->nb_channels; i++) {
+    for (i = 0; i < s->ch_layout.nb_channels; i++) {
         ChannelMap *ch = &s->channels[i];
-        av_log(ctx, AV_LOG_VERBOSE, "%d.%s => %s ", ch->input,
-               av_get_channel_name(ch->in_channel),
-               av_get_channel_name(ch->out_channel));
+        AVFilterLink  *inlink = ctx->inputs[ch->input];
+        AVChannelLayout *ichl = &inlink->ch_layout;
+        enum AVChannel  in_ch = av_channel_layout_channel_from_index(
+                                    ichl, ch->in_channel_idx);
+
+        av_channel_name(inbuf, sizeof(inbuf), in_ch);
+        av_channel_name(outbuf, sizeof(outbuf), ch->out_channel);
+        av_log(ctx, AV_LOG_VERBOSE, "%d.%s(%d) => %s(%d) ", ch->input,
+               inbuf, ch->in_channel_idx,
+               outbuf, i);
     }
     av_log(ctx, AV_LOG_VERBOSE, "\n");
 
     for (i = 0; i < ctx->nb_inputs; i++) {
-        if (!inputs[i])
+        if (inputs_unused[i].nb_ch == ctx->inputs[i]->ch_layout.nb_channels)
             av_log(ctx, AV_LOG_WARNING, "No channels are used from input "
                    "stream %d.\n", i);
     }
 
 fail:
-    av_freep(&inputs);
+    for (i = 0; i < ctx->nb_inputs; i++)
+        av_freep(&inputs_unused[i].ch);
+    av_freep(&inputs_unused);
     return ret;
 }
 
-static int join_request_frame(AVFilterLink *outlink)
+static int try_push_frame(AVFilterContext *ctx)
 {
-    AVFilterContext *ctx = outlink->src;
+    AVFilterLink *outlink = ctx->outputs[0];
     JoinContext *s       = ctx->priv;
     AVFrame *frame;
     int linesize   = INT_MAX;
-    int nb_samples = 0;
+    int nb_samples = INT_MAX;
     int nb_buffers = 0;
     int i, j, ret;
 
-    /* get a frame on each input */
     for (i = 0; i < ctx->nb_inputs; i++) {
-        AVFilterLink *inlink = ctx->inputs[i];
-
-        if (!s->input_frames[i] &&
-            (ret = ff_request_frame(inlink)) < 0)
-            return ret;
-
-        /* request the same number of samples on all inputs */
-        if (i == 0) {
-            nb_samples = s->input_frames[0]->nb_samples;
-
-            for (j = 1; !i && j < ctx->nb_inputs; j++)
-                ctx->inputs[j]->request_samples = nb_samples;
+        if (!s->input_frames[i]) {
+            nb_samples = 0;
+            break;
+        } else {
+            nb_samples = FFMIN(nb_samples, s->input_frames[i]->nb_samples);
         }
     }
+    if (!nb_samples)
+        goto eof;
 
     /* setup the output frame */
     frame = av_frame_alloc();
     if (!frame)
         return AVERROR(ENOMEM);
-    if (s->nb_channels > FF_ARRAY_ELEMS(frame->data)) {
-        frame->extended_data = av_mallocz_array(s->nb_channels,
+    if (s->ch_layout.nb_channels > FF_ARRAY_ELEMS(frame->data)) {
+        frame->extended_data = av_calloc(s->ch_layout.nb_channels,
                                           sizeof(*frame->extended_data));
         if (!frame->extended_data) {
             ret = AVERROR(ENOMEM);
@@ -423,7 +451,7 @@ static int join_request_frame(AVFilterLink *outlink)
     }
 
     /* copy the data pointers */
-    for (i = 0; i < s->nb_channels; i++) {
+    for (i = 0; i < s->ch_layout.nb_channels; i++) {
         ChannelMap *ch = &s->channels[i];
         AVFrame *cur   = s->input_frames[ch->input];
         AVBufferRef *buf;
@@ -448,8 +476,8 @@ static int join_request_frame(AVFilterLink *outlink)
     /* create references to the buffers we copied to output */
     if (nb_buffers > FF_ARRAY_ELEMS(frame->buf)) {
         frame->nb_extended_buf = nb_buffers - FF_ARRAY_ELEMS(frame->buf);
-        frame->extended_buf = av_mallocz_array(frame->nb_extended_buf,
-                                               sizeof(*frame->extended_buf));
+        frame->extended_buf = av_calloc(frame->nb_extended_buf,
+                                        sizeof(*frame->extended_buf));
         if (!frame->extended_buf) {
             frame->nb_extended_buf = 0;
             ret = AVERROR(ENOMEM);
@@ -473,17 +501,24 @@ static int join_request_frame(AVFilterLink *outlink)
     }
 
     frame->nb_samples     = nb_samples;
-    frame->channel_layout = outlink->channel_layout;
-    av_frame_set_channels(frame, outlink->channels);
+    frame->duration = av_rescale_q(frame->nb_samples,
+                                   av_make_q(1, outlink->sample_rate),
+                                   outlink->time_base);
+
+    if ((ret = av_channel_layout_copy(&frame->ch_layout, &outlink->ch_layout)) < 0)
+        goto fail;
     frame->sample_rate    = outlink->sample_rate;
     frame->format         = outlink->format;
     frame->pts            = s->input_frames[0]->pts;
     frame->linesize[0]    = linesize;
     if (frame->data != frame->extended_data) {
         memcpy(frame->data, frame->extended_data, sizeof(*frame->data) *
-               FFMIN(FF_ARRAY_ELEMS(frame->data), s->nb_channels));
+               FFMIN(FF_ARRAY_ELEMS(frame->data), s->ch_layout.nb_channels));
     }
 
+    s->eof_pts = frame->pts + av_rescale_q(frame->nb_samples,
+                                           av_make_q(1, outlink->sample_rate),
+                                           outlink->time_base);
     ret = ff_filter_frame(outlink, frame);
 
     for (i = 0; i < ctx->nb_inputs; i++)
@@ -494,6 +529,62 @@ static int join_request_frame(AVFilterLink *outlink)
 fail:
     av_frame_free(&frame);
     return ret;
+eof:
+    for (i = 0; i < ctx->nb_inputs; i++) {
+        if (s->eof &&
+            ff_inlink_queued_samples(ctx->inputs[i]) <= 0 &&
+            !s->input_frames[i]) {
+            ff_outlink_set_status(outlink, AVERROR_EOF, s->eof_pts);
+            break;
+        }
+    }
+
+    return 0;
+}
+
+static int activate(AVFilterContext *ctx)
+{
+    JoinContext *s = ctx->priv;
+    int i, ret, status;
+    int nb_samples = 0;
+    int64_t pts;
+
+    FF_FILTER_FORWARD_STATUS_BACK_ALL(ctx->outputs[0], ctx);
+
+    if (!s->input_frames[0]) {
+        ret = ff_inlink_consume_frame(ctx->inputs[0], &s->input_frames[0]);
+        if (ret < 0) {
+            return ret;
+        } else if (ret == 0 && ff_inlink_acknowledge_status(ctx->inputs[0], &status, &pts)) {
+            s->eof |= status == AVERROR_EOF;
+        }
+
+        if (!s->eof && !s->input_frames[0] && ff_outlink_frame_wanted(ctx->outputs[0])) {
+            ff_inlink_request_frame(ctx->inputs[0]);
+            return 0;
+        }
+    }
+
+    if (s->input_frames[0])
+        nb_samples = s->input_frames[0]->nb_samples;
+
+    for (i = 1; i < ctx->nb_inputs && nb_samples > 0; i++) {
+        if (s->input_frames[i])
+            continue;
+        ret = ff_inlink_consume_samples(ctx->inputs[i], nb_samples, nb_samples, &s->input_frames[i]);
+        if (ret < 0) {
+            return ret;
+        } else if (ff_inlink_acknowledge_status(ctx->inputs[i], &status, &pts)) {
+            s->eof |= status == AVERROR_EOF;
+        }
+
+        if (!s->eof && !s->input_frames[i]) {
+            ff_inlink_request_frame(ctx->inputs[i]);
+            return 0;
+        }
+    }
+
+    return try_push_frame(ctx);
 }
 
 static const AVFilterPad avfilter_af_join_outputs[] = {
@@ -501,21 +592,19 @@ static const AVFilterPad avfilter_af_join_outputs[] = {
         .name          = "default",
         .type          = AVMEDIA_TYPE_AUDIO,
         .config_props  = join_config_output,
-        .request_frame = join_request_frame,
     },
-    { NULL }
 };
 
-AVFilter ff_af_join = {
-    .name           = "join",
-    .description    = NULL_IF_CONFIG_SMALL("Join multiple audio streams into "
+const FFFilter ff_af_join = {
+    .p.name         = "join",
+    .p.description  = NULL_IF_CONFIG_SMALL("Join multiple audio streams into "
                                            "multi-channel output."),
+    .p.priv_class   = &join_class,
+    .p.flags        = AVFILTER_FLAG_DYNAMIC_INPUTS,
     .priv_size      = sizeof(JoinContext),
-    .priv_class     = &join_class,
     .init           = join_init,
     .uninit         = join_uninit,
-    .query_formats  = join_query_formats,
-    .inputs         = NULL,
-    .outputs        = avfilter_af_join_outputs,
-    .flags          = AVFILTER_FLAG_DYNAMIC_INPUTS,
+    .activate       = activate,
+    FILTER_OUTPUTS(avfilter_af_join_outputs),
+    FILTER_QUERY_FUNC2(join_query_formats),
 };

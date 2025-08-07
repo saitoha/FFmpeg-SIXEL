@@ -26,88 +26,41 @@
  * Direct Stream Digital (DSD) decoder
  */
 
-#include "libavcodec/internal.h"
-#include "libavcodec/mathops.h"
+#include "libavutil/mem.h"
+
 #include "avcodec.h"
-#include "dsd_tablegen.h"
+#include "codec_internal.h"
+#include "decode.h"
+#include "dsd.h"
 
-#define FIFOSIZE 16              /** must be a power of two */
-#define FIFOMASK (FIFOSIZE - 1)  /** bit mask for FIFO offsets */
-
-#if FIFOSIZE * 8 < HTAPS * 2
-#error "FIFOSIZE too small"
-#endif
-
-/**
- * Per-channel buffer
+#define DSD_SILENCE 0x69
+#define DSD_SILENCE_REVERSED 0x96
+/* 0x69 = 01101001
+ * This pattern "on repeat" makes a low energy 352.8 kHz tone
+ * and a high energy 1.0584 MHz tone which should be filtered
+ * out completely by any playback system --> silence
  */
-typedef struct {
-    unsigned char buf[FIFOSIZE];
-    unsigned pos;
-} DSDContext;
-
-static void dsd2pcm_translate(DSDContext* s, size_t samples, int lsbf,
-                              const unsigned char *src, ptrdiff_t src_stride,
-                              float *dst, ptrdiff_t dst_stride)
-{
-    unsigned pos, i;
-    unsigned char* p;
-    double sum;
-
-    pos = s->pos;
-
-    while (samples-- > 0) {
-        s->buf[pos] = lsbf ? ff_reverse[*src] : *src;
-        src += src_stride;
-
-        p = s->buf + ((pos - CTABLES) & FIFOMASK);
-        *p = ff_reverse[*p];
-
-        sum = 0.0;
-        for (i = 0; i < CTABLES; i++) {
-            unsigned char a = s->buf[(pos                   - i) & FIFOMASK];
-            unsigned char b = s->buf[(pos - (CTABLES*2 - 1) + i) & FIFOMASK];
-            sum += ctables[i][a] + ctables[i][b];
-        }
-
-        *dst = (float)sum;
-        dst += dst_stride;
-
-        pos = (pos + 1) & FIFOMASK;
-    }
-
-    s->pos = pos;
-}
-
-static av_cold void init_static_data(void)
-{
-    static int done = 0;
-    if (done)
-        return;
-    dsd_ctables_tableinit();
-    done = 1;
-}
 
 static av_cold int decode_init(AVCodecContext *avctx)
 {
     DSDContext * s;
     int i;
+    uint8_t silence;
 
-    init_static_data();
+    if (!avctx->ch_layout.nb_channels)
+        return AVERROR_INVALIDDATA;
 
-    s = av_malloc_array(sizeof(DSDContext), avctx->channels);
+    ff_init_dsd_data();
+
+    s = av_malloc_array(sizeof(DSDContext), avctx->ch_layout.nb_channels);
     if (!s)
         return AVERROR(ENOMEM);
 
-    for (i = 0; i < avctx->channels; i++) {
+    silence = avctx->codec_id == AV_CODEC_ID_DSD_LSBF_PLANAR ||
+              avctx->codec_id == AV_CODEC_ID_DSD_LSBF ? DSD_SILENCE_REVERSED : DSD_SILENCE;
+    for (i = 0; i < avctx->ch_layout.nb_channels; i++) {
         s[i].pos = 0;
-        memset(s[i].buf, 0x69, sizeof(s[i].buf));
-
-        /* 0x69 = 01101001
-         * This pattern "on repeat" makes a low energy 352.8 kHz tone
-         * and a high energy 1.0584 MHz tone which should be filtered
-         * out completely by any playback system --> silence
-         */
+        memset(s[i].buf, silence, sizeof(s[i].buf));
     }
 
     avctx->sample_fmt = AV_SAMPLE_FMT_FLTP;
@@ -115,50 +68,65 @@ static av_cold int decode_init(AVCodecContext *avctx)
     return 0;
 }
 
-static int decode_frame(AVCodecContext *avctx, void *data,
-                        int *got_frame_ptr, AVPacket *avpkt)
-{
-    DSDContext * s = avctx->priv_data;
-    AVFrame *frame = data;
-    int ret, i;
-    int lsbf = avctx->codec_id == AV_CODEC_ID_DSD_LSBF || avctx->codec_id == AV_CODEC_ID_DSD_LSBF_PLANAR;
-    int src_next;
-    int src_stride;
+typedef struct ThreadData {
+    AVFrame *frame;
+    const AVPacket *avpkt;
+} ThreadData;
 
-    frame->nb_samples = avpkt->size / avctx->channels;
+static int dsd_channel(AVCodecContext *avctx, void *tdata, int j, int threadnr)
+{
+    int lsbf = avctx->codec_id == AV_CODEC_ID_DSD_LSBF || avctx->codec_id == AV_CODEC_ID_DSD_LSBF_PLANAR;
+    DSDContext *s = avctx->priv_data;
+    ThreadData *td = tdata;
+    AVFrame *frame = td->frame;
+    const AVPacket *avpkt = td->avpkt;
+    int src_next, src_stride;
+    float *dst = ((float **)frame->extended_data)[j];
 
     if (avctx->codec_id == AV_CODEC_ID_DSD_LSBF_PLANAR || avctx->codec_id == AV_CODEC_ID_DSD_MSBF_PLANAR) {
         src_next   = frame->nb_samples;
         src_stride = 1;
     } else {
         src_next   = 1;
-        src_stride = avctx->channels;
+        src_stride = avctx->ch_layout.nb_channels;
     }
+
+    ff_dsd2pcm_translate(&s[j], frame->nb_samples, lsbf,
+                         avpkt->data + j * src_next, src_stride,
+                         dst, 1);
+
+    return 0;
+}
+
+static int decode_frame(AVCodecContext *avctx, AVFrame *frame,
+                        int *got_frame_ptr, AVPacket *avpkt)
+{
+    ThreadData td;
+    int ret;
+
+    frame->nb_samples = avpkt->size / avctx->ch_layout.nb_channels;
 
     if ((ret = ff_get_buffer(avctx, frame, 0)) < 0)
         return ret;
 
-    for (i = 0; i < avctx->channels; i++) {
-        float * dst = ((float **)frame->extended_data)[i];
-        dsd2pcm_translate(&s[i], frame->nb_samples, lsbf,
-            avpkt->data + i * src_next, src_stride,
-            dst, 1);
-    }
+    td.frame = frame;
+    td.avpkt = avpkt;
+    avctx->execute2(avctx, dsd_channel, &td, NULL, avctx->ch_layout.nb_channels);
 
     *got_frame_ptr = 1;
-    return frame->nb_samples * avctx->channels;
+    return frame->nb_samples * avctx->ch_layout.nb_channels;
 }
 
 #define DSD_DECODER(id_, name_, long_name_) \
-AVCodec ff_##name_##_decoder = { \
-    .name         = #name_, \
-    .long_name    = NULL_IF_CONFIG_SMALL(long_name_), \
-    .type         = AVMEDIA_TYPE_AUDIO, \
-    .id           = AV_CODEC_ID_##id_, \
+const FFCodec ff_ ## name_ ## _decoder = { \
+    .p.name       = #name_, \
+    CODEC_LONG_NAME(long_name_), \
+    .p.type       = AVMEDIA_TYPE_AUDIO, \
+    .p.id         = AV_CODEC_ID_##id_, \
     .init         = decode_init, \
-    .decode       = decode_frame, \
-    .sample_fmts  = (const enum AVSampleFormat[]){ AV_SAMPLE_FMT_FLTP, \
-                                                   AV_SAMPLE_FMT_NONE }, \
+    FF_CODEC_DECODE_CB(decode_frame), \
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_SLICE_THREADS, \
+    CODEC_SAMPLEFMTS(AV_SAMPLE_FMT_FLTP), \
 };
 
 DSD_DECODER(DSD_LSBF, dsd_lsbf, "DSD (Direct Stream Digital), least significant bit first")

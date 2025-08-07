@@ -1,6 +1,6 @@
 /*
  * Autodesk RLE Decoder
- * Copyright (c) 2005 The FFmpeg Project
+ * Copyright (C) 2005 The FFmpeg project
  *
  * This file is part of FFmpeg.
  *
@@ -24,12 +24,11 @@
  * Autodesk RLE Video Decoder by Konstantin Shishkov
  */
 
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include "avcodec.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include "msrledec.h"
 
 typedef struct AascContext {
@@ -77,9 +76,8 @@ static av_cold int aasc_decode_init(AVCodecContext *avctx)
     return 0;
 }
 
-static int aasc_decode_frame(AVCodecContext *avctx,
-                              void *data, int *got_frame,
-                              AVPacket *avpkt)
+static int aasc_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
+                             int *got_frame, AVPacket *avpkt)
 {
     const uint8_t *buf = avpkt->data;
     int buf_size       = avpkt->size;
@@ -91,7 +89,7 @@ static int aasc_decode_frame(AVCodecContext *avctx,
         return AVERROR_INVALIDDATA;
     }
 
-    if ((ret = ff_reget_buffer(avctx, s->frame)) < 0)
+    if ((ret = ff_reget_buffer(avctx, s->frame, 0)) < 0)
         return ret;
 
     compr     = AV_RL32(buf);
@@ -101,28 +99,28 @@ static int aasc_decode_frame(AVCodecContext *avctx,
     switch (avctx->codec_tag) {
     case MKTAG('A', 'A', 'S', '4'):
         bytestream2_init(&s->gb, buf - 4, buf_size + 4);
-        ff_msrle_decode(avctx, (AVPicture*)s->frame, 8, &s->gb);
+        ff_msrle_decode(avctx, s->frame, 8, &s->gb);
         break;
     case MKTAG('A', 'A', 'S', 'C'):
-    switch (compr) {
-    case 0:
-        stride = (avctx->width * psize + psize) & ~psize;
-        if (buf_size < stride * avctx->height)
+        switch (compr) {
+        case 0:
+            stride = (avctx->width * psize + psize) & ~psize;
+            if (buf_size < stride * avctx->height)
+                return AVERROR_INVALIDDATA;
+            for (i = avctx->height - 1; i >= 0; i--) {
+                memcpy(s->frame->data[0] + i * s->frame->linesize[0], buf, avctx->width * psize);
+                buf += stride;
+                buf_size -= stride;
+            }
+            break;
+        case 1:
+            bytestream2_init(&s->gb, buf, buf_size);
+            ff_msrle_decode(avctx, s->frame, 8, &s->gb);
+            break;
+        default:
+            av_log(avctx, AV_LOG_ERROR, "Unknown compression type %d\n", compr);
             return AVERROR_INVALIDDATA;
-        for (i = avctx->height - 1; i >= 0; i--) {
-            memcpy(s->frame->data[0] + i * s->frame->linesize[0], buf, avctx->width * psize);
-            buf += stride;
-            buf_size -= stride;
         }
-        break;
-    case 1:
-        bytestream2_init(&s->gb, buf, buf_size);
-        ff_msrle_decode(avctx, (AVPicture*)s->frame, 8, &s->gb);
-        break;
-    default:
-        av_log(avctx, AV_LOG_ERROR, "Unknown compression type %d\n", compr);
-        return AVERROR_INVALIDDATA;
-    }
         break;
     default:
         av_log(avctx, AV_LOG_ERROR, "Unknown FourCC: %X\n", avctx->codec_tag);
@@ -133,7 +131,7 @@ static int aasc_decode_frame(AVCodecContext *avctx,
         memcpy(s->frame->data[1], s->palette, s->palette_size);
 
     *got_frame = 1;
-    if ((ret = av_frame_ref(data, s->frame)) < 0)
+    if ((ret = av_frame_ref(rframe, s->frame)) < 0)
         return ret;
 
     /* report that the buffer was completely consumed */
@@ -149,14 +147,14 @@ static av_cold int aasc_decode_end(AVCodecContext *avctx)
     return 0;
 }
 
-AVCodec ff_aasc_decoder = {
-    .name           = "aasc",
-    .long_name      = NULL_IF_CONFIG_SMALL("Autodesk RLE"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_AASC,
+const FFCodec ff_aasc_decoder = {
+    .p.name         = "aasc",
+    CODEC_LONG_NAME("Autodesk RLE"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_AASC,
     .priv_data_size = sizeof(AascContext),
     .init           = aasc_decode_init,
     .close          = aasc_decode_end,
-    .decode         = aasc_decode_frame,
-    .capabilities   = CODEC_CAP_DR1,
+    FF_CODEC_DECODE_CB(aasc_decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1,
 };

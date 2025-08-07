@@ -28,9 +28,10 @@
 #include <math.h>
 
 #include "libavutil/float_dsp.h"
-#include "avcodec.h"
+#include "libavutil/libm.h"
+#include "libavutil/mem_internal.h"
+
 #include "sinewin.h"
-#include "fft.h"
 #include "atrac3plus.h"
 
 /**
@@ -76,15 +77,6 @@ const float ff_atrac3p_mant_tab[8] = {
 
 #define ATRAC3P_MDCT_SIZE (ATRAC3P_SUBBAND_SAMPLES * 2)
 
-av_cold void ff_atrac3p_init_imdct(AVCodecContext *avctx, FFTContext *mdct_ctx)
-{
-    ff_init_ff_sine_windows(7);
-    ff_init_ff_sine_windows(6);
-
-    /* Initialize the MDCT transform. */
-    ff_mdct_init(mdct_ctx, 8, 1, -1.0);
-}
-
 #define TWOPI (2 * M_PI)
 
 #define DEQUANT_PHASE(ph) (((ph) & 0x1F) << 6)
@@ -93,7 +85,7 @@ static DECLARE_ALIGNED(32, float, sine_table)[2048]; ///< wave table
 static DECLARE_ALIGNED(32, float, hann_window)[256]; ///< Hann windowing function
 static float amp_sf_tab[64];   ///< scalefactors for quantized amplitudes
 
-av_cold void ff_atrac3p_init_wave_synth(void)
+av_cold void ff_atrac3p_init_dsp_static(void)
 {
     int i;
 
@@ -107,7 +99,10 @@ av_cold void ff_atrac3p_init_wave_synth(void)
 
     /* generate amplitude scalefactors table */
     for (i = 0; i < 64; i++)
-        amp_sf_tab[i] = pow(2.0f, ((double)i - 3) / 4.0f);
+        amp_sf_tab[i] = exp2f((i - 3) / 4.0f);
+
+    ff_init_ff_sine_windows(7);
+    ff_init_ff_sine_windows(6);
 }
 
 /**
@@ -116,14 +111,16 @@ av_cold void ff_atrac3p_init_wave_synth(void)
  *  @param[in]    synth_param   ptr to common synthesis parameters
  *  @param[in]    waves_info    parameters for each sine wave
  *  @param[in]    envelope      envelope data for all waves in a group
- *  @param[in]    phase_shift   flag indicates 180° phase shift
+ *  @param[in]    fdsp          ptr to floating-point DSP context
+ *  @param[in]    invert_phase  flag indicating 180° phase shift
  *  @param[in]    reg_offset    region offset for trimming envelope data
- *  @param[out]   out           receives sythesized data
+ *  @param[out]   out           receives synthesized data
  */
 static void waves_synth(Atrac3pWaveSynthParams *synth_param,
                         Atrac3pWavesData *waves_info,
                         Atrac3pWaveEnvelope *envelope,
-                        int phase_shift, int reg_offset, float *out)
+                        AVFloatDSPContext *fdsp,
+                        int invert_phase, int reg_offset, float *out)
 {
     int i, wn, inc, pos;
     double amp;
@@ -145,6 +142,10 @@ static void waves_synth(Atrac3pWaveSynthParams *synth_param,
             pos     = (pos + inc) & 2047;
         }
     }
+
+    /* invert phase if requested */
+    if (invert_phase)
+        fdsp->vector_fmul_scalar(out, out, -1.0f, 128);
 
     /* fade in with steep Hann window if requested */
     if (envelope->has_start_point) {
@@ -216,12 +217,12 @@ void ff_atrac3p_generate_tones(Atrac3pChanUnitCtx *ch_unit, AVFloatDSPContext *f
     /* synthesize waves for both overlapping regions */
     if (tones_now->num_wavs && reg1_env_nonzero)
         waves_synth(ch_unit->waves_info_prev, tones_now, &tones_now->curr_env,
-                    ch_unit->waves_info_prev->phase_shift[sb] & ch_num,
+                    fdsp, ch_unit->waves_info_prev->invert_phase[sb] & ch_num,
                     128, wavreg1);
 
     if (tones_next->num_wavs && reg2_env_nonzero)
-        waves_synth(ch_unit->waves_info, tones_next, &tones_next->curr_env,
-                    ch_unit->waves_info->phase_shift[sb] & ch_num, 0, wavreg2);
+        waves_synth(ch_unit->waves_info, tones_next, &tones_next->curr_env, fdsp,
+                    ch_unit->waves_info->invert_phase[sb] & ch_num, 0, wavreg2);
 
     /* Hann windowing for non-faded wave signals */
     if (tones_now->num_wavs && tones_next->num_wavs &&
@@ -241,7 +242,7 @@ void ff_atrac3p_generate_tones(Atrac3pChanUnitCtx *ch_unit, AVFloatDSPContext *f
         out[i] += wavreg1[i] + wavreg2[i];
 }
 
-static const int subband_to_powgrp[ATRAC3P_SUBBANDS] = {
+static const uint8_t subband_to_powgrp[ATRAC3P_SUBBANDS] = {
     0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4
 };
 
@@ -404,15 +405,16 @@ static const float pwc_levs[16] = {
 };
 
 /** Map subband number to quant unit number. */
-static const int subband_to_qu[17] = {
+static const uint8_t subband_to_qu[17] = {
     0, 8, 12, 16, 18, 20, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32
 };
 
-void ff_atrac3p_power_compensation(Atrac3pChanUnitCtx *ctx, int ch_index,
-                                   float *sp, int rng_index, int sb)
+void ff_atrac3p_power_compensation(Atrac3pChanUnitCtx *ctx, AVFloatDSPContext *fdsp,
+                                   int ch_index, float *sp, int rng_index, int sb)
 {
     AtracGainInfo *g1, *g2;
-    float pwcsp[ATRAC3P_SUBBAND_SAMPLES], *dst, grp_lev, qu_lev;
+    LOCAL_ALIGNED_32(float, pwcsp, [ATRAC3P_SUBBAND_SAMPLES]);
+    float *dst, grp_lev, qu_lev;
     int i, gain_lev, gcv = 0, qu, nsp;
     int swap_ch = (ctx->unit_type == CH_UNIT_STEREO && ctx->swap_channels[sb]) ? 1 : 0;
 
@@ -449,13 +451,13 @@ void ff_atrac3p_power_compensation(Atrac3pChanUnitCtx *ctx, int ch_index,
         dst = &sp[ff_atrac3p_qu_to_spec_pos[qu]];
         nsp = ff_atrac3p_qu_to_spec_pos[qu + 1] - ff_atrac3p_qu_to_spec_pos[qu];
 
-        for (i = 0; i < nsp; i++)
-            dst[i] += pwcsp[i] * qu_lev;
+        fdsp->vector_fmac_scalar(dst, pwcsp, qu_lev, nsp);
     }
 }
 
-void ff_atrac3p_imdct(AVFloatDSPContext *fdsp, FFTContext *mdct_ctx, float *pIn,
-                      float *pOut, int wind_id, int sb)
+void ff_atrac3p_imdct(AVFloatDSPContext *fdsp, AVTXContext *mdct_ctx,
+                      av_tx_fn mdct_fn, float *pIn, float *pOut,
+                      int wind_id, int sb)
 {
     int i;
 
@@ -463,7 +465,7 @@ void ff_atrac3p_imdct(AVFloatDSPContext *fdsp, FFTContext *mdct_ctx, float *pIn,
         for (i = 0; i < ATRAC3P_SUBBAND_SAMPLES / 2; i++)
             FFSWAP(float, pIn[i], pIn[ATRAC3P_SUBBAND_SAMPLES - 1 - i]);
 
-    mdct_ctx->imdct_calc(mdct_ctx, pOut, pIn);
+    mdct_fn(mdct_ctx, pOut, pIn, sizeof(float));
 
     /* Perform windowing on the output.
      * ATRAC3+ uses two different MDCT windows:
@@ -595,8 +597,8 @@ static const float ipqf_coeffs2[ATRAC3P_PQF_FIR_LEN][16] = {
       -4.4400572e-8,    -4.2005411e-7,    -8.0604229e-7,    -5.8336207e-7 }
 };
 
-void ff_atrac3p_ipqf(FFTContext *dct_ctx, Atrac3pIPQFChannelCtx *hist,
-                     const float *in, float *out)
+void ff_atrac3p_ipqf(AVTXContext *dct_ctx, av_tx_fn dct_fn,
+                     Atrac3pIPQFChannelCtx *hist, const float *in, float *out)
 {
     int i, s, sb, t, pos_now, pos_next;
     LOCAL_ALIGNED(32, float, idct_in, [ATRAC3P_SUBBANDS]);
@@ -610,7 +612,7 @@ void ff_atrac3p_ipqf(FFTContext *dct_ctx, Atrac3pIPQFChannelCtx *hist,
             idct_in[sb] = in[sb * ATRAC3P_SUBBAND_SAMPLES + s];
 
         /* Calculate the sine and cosine part of the PQF using IDCT-IV */
-        dct_ctx->imdct_half(dct_ctx, idct_out, idct_in);
+        dct_fn(dct_ctx, idct_out, idct_in, sizeof(float));
 
         /* append the result to the history */
         for (i = 0; i < 8; i++) {

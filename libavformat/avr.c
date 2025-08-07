@@ -21,10 +21,11 @@
 
 #include "libavutil/intreadwrite.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 #include "pcm.h"
 
-static int avr_probe(AVProbeData *p)
+static int avr_probe(const AVProbeData *p)
 {
     if (AV_RL32(p->buf) != MKTAG('2', 'B', 'I', 'T'))
         return 0;
@@ -46,54 +47,51 @@ static int avr_read_header(AVFormatContext *s)
     if (!st)
         return AVERROR(ENOMEM);
 
-    st->codec->codec_type = AVMEDIA_TYPE_AUDIO;
+    st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
 
-    avio_skip(s->pb, 4); // magic
-    avio_skip(s->pb, 8); // sample_name
+    avio_skip(s->pb, 4 /* magic */ + 8 /* sample_name */);
 
     chan = avio_rb16(s->pb);
     if (!chan) {
-        st->codec->channels = 1;
+        st->codecpar->ch_layout.nb_channels = 1;
     } else if (chan == 0xFFFFu) {
-        st->codec->channels = 2;
+        st->codecpar->ch_layout.nb_channels = 2;
     } else {
         avpriv_request_sample(s, "chan %d", chan);
         return AVERROR_PATCHWELCOME;
     }
 
-    st->codec->bits_per_coded_sample = bps = avio_rb16(s->pb);
+    st->codecpar->bits_per_coded_sample = bps = avio_rb16(s->pb);
 
     sign = avio_rb16(s->pb);
 
-    avio_skip(s->pb, 2); // loop
-    avio_skip(s->pb, 2); // midi
-    avio_skip(s->pb, 1); // replay speed
+    avio_skip(s->pb, 2 /* loop */ + 2 /* midi */ + 1 /* replay speed */);
 
-    st->codec->sample_rate = avio_rb24(s->pb);
-    avio_skip(s->pb, 4 * 3);
-    avio_skip(s->pb, 2 * 3);
-    avio_skip(s->pb, 20);
-    avio_skip(s->pb, 64);
+    st->codecpar->sample_rate = avio_rb24(s->pb);
+    if (st->codecpar->sample_rate == 0)
+        return AVERROR_INVALIDDATA;
 
-    st->codec->codec_id = ff_get_pcm_codec_id(bps, 0, 1, sign);
-    if (st->codec->codec_id == AV_CODEC_ID_NONE) {
+    avio_skip(s->pb, 4 * 3 + 2 * 3 + 20 + 64);
+
+    st->codecpar->codec_id = ff_get_pcm_codec_id(bps, 0, 1, sign);
+    if (st->codecpar->codec_id == AV_CODEC_ID_NONE) {
         avpriv_request_sample(s, "Bps %d and sign %d", bps, sign);
         return AVERROR_PATCHWELCOME;
     }
 
-    st->codec->block_align = bps * st->codec->channels / 8;
+    st->codecpar->block_align = bps * st->codecpar->ch_layout.nb_channels / 8;
 
-    avpriv_set_pts_info(st, 64, 1, st->codec->sample_rate);
+    avpriv_set_pts_info(st, 64, 1, st->codecpar->sample_rate);
     return 0;
 }
 
-AVInputFormat ff_avr_demuxer = {
-    .name           = "avr",
-    .long_name      = NULL_IF_CONFIG_SMALL("AVR (Audio Visual Research)"),
+const FFInputFormat ff_avr_demuxer = {
+    .p.name         = "avr",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("AVR (Audio Visual Research)"),
+    .p.extensions   = "avr",
+    .p.flags        = AVFMT_GENERIC_INDEX,
     .read_probe     = avr_probe,
     .read_header    = avr_read_header,
     .read_packet    = ff_pcm_read_packet,
     .read_seek      = ff_pcm_read_seek,
-    .extensions     = "avr",
-    .flags          = AVFMT_GENERIC_INDEX,
 };

@@ -23,9 +23,10 @@
 #define AVCODEC_WMA_H
 
 #include "libavutil/float_dsp.h"
+#include "libavutil/mem_internal.h"
+#include "libavutil/tx.h"
 
 #include "avcodec.h"
-#include "fft.h"
 #include "get_bits.h"
 #include "put_bits.h"
 
@@ -114,15 +115,17 @@ typedef struct WMACodecContext {
     float max_exponent[MAX_CHANNELS];
     WMACoef coefs1[MAX_CHANNELS][BLOCK_MAX_SIZE];
     DECLARE_ALIGNED(32, float, coefs)[MAX_CHANNELS][BLOCK_MAX_SIZE];
-    DECLARE_ALIGNED(32, FFTSample, output)[BLOCK_MAX_SIZE * 2];
-    FFTContext mdct_ctx[BLOCK_NB_SIZES];
+    DECLARE_ALIGNED(32, float, output)[BLOCK_MAX_SIZE * 2];
+    AVTXContext *mdct_ctx[BLOCK_NB_SIZES];
+    av_tx_fn mdct_fn[BLOCK_NB_SIZES];
     const float *windows[BLOCK_NB_SIZES];
     /* output buffer for one frame and the last for IMDCT windowing */
     DECLARE_ALIGNED(32, float, frame_out)[MAX_CHANNELS][BLOCK_MAX_SIZE * 2];
     /* last frame info */
-    uint8_t last_superframe[MAX_CODED_SUPERFRAME_SIZE + FF_INPUT_BUFFER_PADDING_SIZE]; /* padding added */
+    uint8_t last_superframe[MAX_CODED_SUPERFRAME_SIZE + AV_INPUT_BUFFER_PADDING_SIZE]; /* padding added */
     int last_bitoffset;
     int last_superframe_len;
+    int exponents_initialized[MAX_CHANNELS];
     float noise_table[NOISE_TAB_SIZE];
     int noise_index;
     float noise_mult; /* XXX: suppress that and integrate it in the noise array */
@@ -133,23 +136,26 @@ typedef struct WMACodecContext {
     float lsp_pow_m_table2[(1 << LSP_POW_BITS)];
     AVFloatDSPContext *fdsp;
 
+    int eof_done; /* decode flag to output remaining samples after EOF */
+
 #ifdef TRACE
     int frame_count;
 #endif /* TRACE */
 } WMACodecContext;
 
-extern const uint16_t ff_wma_hgain_huffcodes[37];
-extern const uint8_t ff_wma_hgain_huffbits[37];
+extern const uint8_t ff_wma_hgain_hufftab[37][2];
 extern const float ff_wma_lsp_codebook[NB_LSP_COEFS][16];
 extern const uint32_t ff_aac_scalefactor_code[121];
 extern const uint8_t  ff_aac_scalefactor_bits[121];
 
+av_warn_unused_result
 int ff_wma_init(AVCodecContext *avctx, int flags2);
+
 int ff_wma_total_gain_to_bits(int total_gain);
 int ff_wma_end(AVCodecContext *avctx);
 unsigned int ff_wma_get_large_val(GetBitContext *gb);
 int ff_wma_run_level_decode(AVCodecContext *avctx, GetBitContext *gb,
-                            VLC *vlc, const float *level_table,
+                            const VLCElem *vlc, const float *level_table,
                             const uint16_t *run_table, int version,
                             WMACoef *ptr, int offset, int num_coefs,
                             int block_len, int frame_len_bits,

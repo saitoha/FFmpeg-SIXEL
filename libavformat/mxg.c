@@ -22,8 +22,10 @@
 #include "libavutil/channel_layout.h"
 #include "libavutil/internal.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
 #include "libavcodec/mjpeg.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 #include "avio.h"
 
@@ -48,20 +50,19 @@ static int mxg_read_header(AVFormatContext *s)
     video_st = avformat_new_stream(s, NULL);
     if (!video_st)
         return AVERROR(ENOMEM);
-    video_st->codec->codec_type = AVMEDIA_TYPE_VIDEO;
-    video_st->codec->codec_id = AV_CODEC_ID_MXPEG;
+    video_st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+    video_st->codecpar->codec_id = AV_CODEC_ID_MXPEG;
     avpriv_set_pts_info(video_st, 64, 1, 1000000);
 
     audio_st = avformat_new_stream(s, NULL);
     if (!audio_st)
         return AVERROR(ENOMEM);
-    audio_st->codec->codec_type = AVMEDIA_TYPE_AUDIO;
-    audio_st->codec->codec_id = AV_CODEC_ID_PCM_ALAW;
-    audio_st->codec->channels = 1;
-    audio_st->codec->channel_layout = AV_CH_LAYOUT_MONO;
-    audio_st->codec->sample_rate = 8000;
-    audio_st->codec->bits_per_coded_sample = 8;
-    audio_st->codec->block_align = 1;
+    audio_st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
+    audio_st->codecpar->codec_id = AV_CODEC_ID_PCM_ALAW;
+    audio_st->codecpar->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
+    audio_st->codecpar->sample_rate = 8000;
+    audio_st->codecpar->bits_per_coded_sample = 8;
+    audio_st->codecpar->block_align = 1;
     avpriv_set_pts_info(audio_st, 64, 1, 1000000);
 
     mxg->soi_ptr = mxg->buffer_ptr = mxg->buffer = 0;
@@ -111,7 +112,7 @@ static int mxg_update_cache(AVFormatContext *s, unsigned int cache_size)
     soi_pos = mxg->soi_ptr - mxg->buffer;
     buffer = av_fast_realloc(mxg->buffer, &mxg->buffer_size,
                              current_pos + cache_size +
-                             FF_INPUT_BUFFER_PADDING_SIZE);
+                             AV_INPUT_BUFFER_PADDING_SIZE);
     if (!buffer)
         return AVERROR(ENOMEM);
     mxg->buffer = buffer;
@@ -125,6 +126,8 @@ static int mxg_update_cache(AVFormatContext *s, unsigned int cache_size)
         return ret;
 
     mxg->cache_size += ret;
+
+    memset(mxg->buffer_ptr + mxg->cache_size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
 
     return ret;
 }
@@ -169,20 +172,18 @@ static int mxg_read_packet(AVFormatContext *s, AVPacket *pkt)
                     continue;
                 }
 
+                size = mxg->buffer_ptr - mxg->soi_ptr;
+                ret = av_new_packet(pkt, size);
+                if (ret < 0)
+                    return ret;
+                memcpy(pkt->data, mxg->soi_ptr, size);
+
                 pkt->pts = pkt->dts = mxg->dts;
                 pkt->stream_index = 0;
-#if FF_API_DESTRUCT_PACKET
-FF_DISABLE_DEPRECATION_WARNINGS
-                pkt->destruct = NULL;
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
-                pkt->buf  = NULL;
-                pkt->size = mxg->buffer_ptr - mxg->soi_ptr;
-                pkt->data = mxg->soi_ptr;
 
                 if (mxg->soi_ptr - mxg->buffer > mxg->cache_size) {
                     if (mxg->cache_size > 0) {
-                        memcpy(mxg->buffer, mxg->buffer_ptr, mxg->cache_size);
+                        memmove(mxg->buffer, mxg->buffer_ptr, mxg->cache_size);
                     }
 
                     mxg->buffer_ptr = mxg->buffer;
@@ -211,17 +212,14 @@ FF_ENABLE_DEPRECATION_WARNINGS
                 mxg->buffer_ptr += size;
 
                 if (marker == APP13 && size >= 16) { /* audio data */
+                    ret = av_new_packet(pkt, size - 14);
+                    if (ret < 0)
+                        return ret;
+                    memcpy(pkt->data, startmarker_ptr + 16, size - 14);
+
                     /* time (GMT) of first sample in usec since 1970, little-endian */
                     pkt->pts = pkt->dts = AV_RL64(startmarker_ptr + 8);
                     pkt->stream_index = 1;
-#if FF_API_DESTRUCT_PACKET
-FF_DISABLE_DEPRECATION_WARNINGS
-                    pkt->destruct = NULL;
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
-                    pkt->buf  = NULL;
-                    pkt->size = size - 14;
-                    pkt->data = startmarker_ptr + 16;
 
                     if (startmarker_ptr - mxg->buffer > mxg->cache_size) {
                         if (mxg->cache_size > 0) {
@@ -254,12 +252,12 @@ static int mxg_close(struct AVFormatContext *s)
     return 0;
 }
 
-AVInputFormat ff_mxg_demuxer = {
-    .name           = "mxg",
-    .long_name      = NULL_IF_CONFIG_SMALL("MxPEG clip"),
+const FFInputFormat ff_mxg_demuxer = {
+    .p.name         = "mxg",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("MxPEG clip"),
+    .p.extensions   = "mxg",
     .priv_data_size = sizeof(MXGContext),
     .read_header    = mxg_read_header,
     .read_packet    = mxg_read_packet,
     .read_close     = mxg_close,
-    .extensions     = "mxg",
 };

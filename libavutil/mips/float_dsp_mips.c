@@ -56,6 +56,7 @@
 #include "libavutil/mips/asmdefs.h"
 
 #if HAVE_INLINE_ASM && HAVE_MIPSFPU
+#if !HAVE_MIPS32R6 && !HAVE_MIPS64R6
 static void vector_fmul_mips(float *dst, const float *src0, const float *src1,
                              int len)
 {
@@ -223,7 +224,7 @@ static void vector_fmul_window_mips(float *dst, const float *src0,
     );
 }
 
-static void butterflies_float_mips(float *av_restrict v1, float *av_restrict v2,
+static void butterflies_float_mips(float *restrict v1, float *restrict v2,
                                 int len)
 {
     float temp0, temp1, temp2, temp3, temp4;
@@ -339,14 +340,17 @@ static void vector_fmul_reverse_mips(float *dst, const float *src0, const float 
         );
     }
 }
+#endif /* !HAVE_MIPS32R6 && !HAVE_MIPS64R6 */
 #endif /* HAVE_INLINE_ASM && HAVE_MIPSFPU */
 
 void ff_float_dsp_init_mips(AVFloatDSPContext *fdsp) {
 #if HAVE_INLINE_ASM && HAVE_MIPSFPU
+#if !HAVE_MIPS32R6 && !HAVE_MIPS64R6
     fdsp->vector_fmul = vector_fmul_mips;
     fdsp->vector_fmul_scalar  = vector_fmul_scalar_mips;
     fdsp->vector_fmul_window = vector_fmul_window_mips;
     fdsp->butterflies_float = butterflies_float_mips;
     fdsp->vector_fmul_reverse = vector_fmul_reverse_mips;
+#endif /* !HAVE_MIPS32R6 && !HAVE_MIPS64R6 */
 #endif /* HAVE_INLINE_ASM && HAVE_MIPSFPU */
 }

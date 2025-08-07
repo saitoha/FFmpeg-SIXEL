@@ -1,7 +1,7 @@
 /*
  * Copyright (c) 2010 Mark Heath mjpeg0 @ silicontrip dot org
  * Copyright (c) 2014 Clément Bœsch
- * Copyright (c) 2014 Dave Rice @dericed
+ * Copyright (c) 2014 Dave Rice
  *
  * This file is part of FFmpeg.
  *
@@ -20,9 +20,11 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
-#include "internal.h"
+#include "filters.h"
 
 enum FilterMode {
     FILTER_NONE = -1,
@@ -32,12 +34,13 @@ enum FilterMode {
     FILT_NUMB
 };
 
-typedef struct {
+typedef struct SignalstatsContext {
     const AVClass *class;
     int chromah;    // height of chroma plane
     int chromaw;    // width of chroma plane
     int hsub;       // horizontal subsampling
     int vsub;       // vertical subsampling
+    int depth;      // pixel depth
     int fs;         // pixel count per frame
     int cfs;        // pixel count per frame of chroma planes
     int outfilter;  // FilterMode
@@ -47,6 +50,9 @@ typedef struct {
     int yuv_color[3];
     int nb_jobs;
     int *jobs_rets;
+
+    int maxsize;    // history stats array size
+    int *histy, *histu, *histv, *histsat;
 
     AVFrame *frame_sat;
     AVFrame *frame_hue;
@@ -66,14 +72,14 @@ typedef struct ThreadDataHueSatMetrics {
 #define FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM
 
 static const AVOption signalstats_options[] = {
-    {"stat", "set statistics filters", OFFSET(filters), AV_OPT_TYPE_FLAGS, {.i64=0}, 0, INT_MAX, FLAGS, "filters"},
-        {"tout", "analyze pixels for temporal outliers",                0, AV_OPT_TYPE_CONST, {.i64=1<<FILTER_TOUT}, 0, 0, FLAGS, "filters"},
-        {"vrep", "analyze video lines for vertical line repetition",    0, AV_OPT_TYPE_CONST, {.i64=1<<FILTER_VREP}, 0, 0, FLAGS, "filters"},
-        {"brng", "analyze for pixels outside of broadcast range",       0, AV_OPT_TYPE_CONST, {.i64=1<<FILTER_BRNG}, 0, 0, FLAGS, "filters"},
-    {"out", "set video filter", OFFSET(outfilter), AV_OPT_TYPE_INT, {.i64=FILTER_NONE}, -1, FILT_NUMB-1, FLAGS, "out"},
-        {"tout", "highlight pixels that depict temporal outliers",              0, AV_OPT_TYPE_CONST, {.i64=FILTER_TOUT}, 0, 0, FLAGS, "out"},
-        {"vrep", "highlight video lines that depict vertical line repetition",  0, AV_OPT_TYPE_CONST, {.i64=FILTER_VREP}, 0, 0, FLAGS, "out"},
-        {"brng", "highlight pixels that are outside of broadcast range",        0, AV_OPT_TYPE_CONST, {.i64=FILTER_BRNG}, 0, 0, FLAGS, "out"},
+    {"stat", "set statistics filters", OFFSET(filters), AV_OPT_TYPE_FLAGS, {.i64=0}, 0, INT_MAX, FLAGS, .unit = "filters"},
+        {"tout", "analyze pixels for temporal outliers",                0, AV_OPT_TYPE_CONST, {.i64=1<<FILTER_TOUT}, 0, 0, FLAGS, .unit = "filters"},
+        {"vrep", "analyze video lines for vertical line repetition",    0, AV_OPT_TYPE_CONST, {.i64=1<<FILTER_VREP}, 0, 0, FLAGS, .unit = "filters"},
+        {"brng", "analyze for pixels outside of broadcast range",       0, AV_OPT_TYPE_CONST, {.i64=1<<FILTER_BRNG}, 0, 0, FLAGS, .unit = "filters"},
+    {"out", "set video filter", OFFSET(outfilter), AV_OPT_TYPE_INT, {.i64=FILTER_NONE}, -1, FILT_NUMB-1, FLAGS, .unit = "out"},
+        {"tout", "highlight pixels that depict temporal outliers",              0, AV_OPT_TYPE_CONST, {.i64=FILTER_TOUT}, 0, 0, FLAGS, .unit = "out"},
+        {"vrep", "highlight video lines that depict vertical line repetition",  0, AV_OPT_TYPE_CONST, {.i64=FILTER_VREP}, 0, 0, FLAGS, .unit = "out"},
+        {"brng", "highlight pixels that are outside of broadcast range",        0, AV_OPT_TYPE_CONST, {.i64=FILTER_BRNG}, 0, 0, FLAGS, .unit = "out"},
     {"c",     "set highlight color", OFFSET(rgba_color), AV_OPT_TYPE_COLOR, {.str="yellow"}, .flags=FLAGS},
     {"color", "set highlight color", OFFSET(rgba_color), AV_OPT_TYPE_COLOR, {.str="yellow"}, .flags=FLAGS},
     {NULL}
@@ -105,24 +111,27 @@ static av_cold void uninit(AVFilterContext *ctx)
     av_frame_free(&s->frame_sat);
     av_frame_free(&s->frame_hue);
     av_freep(&s->jobs_rets);
+    av_freep(&s->histy);
+    av_freep(&s->histu);
+    av_freep(&s->histv);
+    av_freep(&s->histsat);
 }
 
-static int query_formats(AVFilterContext *ctx)
-{
-    // TODO: add more
-    static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_YUV444P, AV_PIX_FMT_YUV422P, AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV411P,
-        AV_PIX_FMT_YUV440P,
-        AV_PIX_FMT_YUVJ422P, AV_PIX_FMT_YUVJ444P, AV_PIX_FMT_YUVJ420P, AV_PIX_FMT_YUVJ411P,
-        AV_PIX_FMT_YUVJ440P,
-        AV_PIX_FMT_NONE
-    };
-
-    AVFilterFormats *fmts_list = ff_make_format_list(pix_fmts);
-    if (!fmts_list)
-        return AVERROR(ENOMEM);
-    return ff_set_common_formats(ctx, fmts_list);
-}
+// TODO: add more
+static const enum AVPixelFormat pix_fmts[] = {
+    AV_PIX_FMT_YUV444P, AV_PIX_FMT_YUV422P, AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV411P,
+    AV_PIX_FMT_YUV440P,
+    AV_PIX_FMT_YUVJ422P, AV_PIX_FMT_YUVJ444P, AV_PIX_FMT_YUVJ420P, AV_PIX_FMT_YUVJ411P,
+    AV_PIX_FMT_YUVJ440P,
+    AV_PIX_FMT_YUV444P9, AV_PIX_FMT_YUV422P9, AV_PIX_FMT_YUV420P9,
+    AV_PIX_FMT_YUV444P10, AV_PIX_FMT_YUV422P10, AV_PIX_FMT_YUV420P10,
+    AV_PIX_FMT_YUV440P10,
+    AV_PIX_FMT_YUV444P12, AV_PIX_FMT_YUV422P12, AV_PIX_FMT_YUV420P12,
+    AV_PIX_FMT_YUV440P12,
+    AV_PIX_FMT_YUV444P14, AV_PIX_FMT_YUV422P14, AV_PIX_FMT_YUV420P14,
+    AV_PIX_FMT_YUV444P16, AV_PIX_FMT_YUV422P16, AV_PIX_FMT_YUV420P16,
+    AV_PIX_FMT_NONE
+};
 
 static AVFrame *alloc_frame(enum AVPixelFormat pixfmt, int w, int h)
 {
@@ -134,7 +143,7 @@ static AVFrame *alloc_frame(enum AVPixelFormat pixfmt, int w, int h)
     frame->width  = w;
     frame->height = h;
 
-    if (av_frame_get_buffer(frame, 32) < 0) {
+    if (av_frame_get_buffer(frame, 0) < 0) {
         av_frame_free(&frame);
         return NULL;
     }
@@ -142,7 +151,7 @@ static AVFrame *alloc_frame(enum AVPixelFormat pixfmt, int w, int h)
     return frame;
 }
 
-static int config_props(AVFilterLink *outlink)
+static int config_output(AVFilterLink *outlink)
 {
     AVFilterContext *ctx = outlink->src;
     SignalstatsContext *s = ctx->priv;
@@ -150,22 +159,31 @@ static int config_props(AVFilterLink *outlink)
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(outlink->format);
     s->hsub = desc->log2_chroma_w;
     s->vsub = desc->log2_chroma_h;
+    s->depth = desc->comp[0].depth;
+    s->maxsize = 1 << s->depth;
+    s->histy = av_malloc_array(s->maxsize, sizeof(*s->histy));
+    s->histu = av_malloc_array(s->maxsize, sizeof(*s->histu));
+    s->histv = av_malloc_array(s->maxsize, sizeof(*s->histv));
+    s->histsat = av_malloc_array(s->maxsize, sizeof(*s->histsat));
+
+    if (!s->histy || !s->histu || !s->histv || !s->histsat)
+        return AVERROR(ENOMEM);
 
     outlink->w = inlink->w;
     outlink->h = inlink->h;
 
-    s->chromaw = FF_CEIL_RSHIFT(inlink->w, s->hsub);
-    s->chromah = FF_CEIL_RSHIFT(inlink->h, s->vsub);
+    s->chromaw = AV_CEIL_RSHIFT(inlink->w, s->hsub);
+    s->chromah = AV_CEIL_RSHIFT(inlink->h, s->vsub);
 
     s->fs = inlink->w * inlink->h;
     s->cfs = s->chromaw * s->chromah;
 
-    s->nb_jobs   = FFMAX(1, FFMIN(inlink->h, ctx->graph->nb_threads));
+    s->nb_jobs   = FFMAX(1, FFMIN(inlink->h, ff_filter_get_nb_threads(ctx)));
     s->jobs_rets = av_malloc_array(s->nb_jobs, sizeof(*s->jobs_rets));
     if (!s->jobs_rets)
         return AVERROR(ENOMEM);
 
-    s->frame_sat = alloc_frame(AV_PIX_FMT_GRAY8,  inlink->w, inlink->h);
+    s->frame_sat = alloc_frame(s->depth > 8 ? AV_PIX_FMT_GRAY16 : AV_PIX_FMT_GRAY8,  inlink->w, inlink->h);
     s->frame_hue = alloc_frame(AV_PIX_FMT_GRAY16, inlink->w, inlink->h);
     if (!s->frame_sat || !s->frame_hue)
         return AVERROR(ENOMEM);
@@ -173,7 +191,7 @@ static int config_props(AVFilterLink *outlink)
     return 0;
 }
 
-static void burn_frame(const SignalstatsContext *s, AVFrame *f, int x, int y)
+static void burn_frame8(const SignalstatsContext *s, AVFrame *f, int x, int y)
 {
     const int chromax = x >> s->hsub;
     const int chromay = y >> s->vsub;
@@ -182,7 +200,17 @@ static void burn_frame(const SignalstatsContext *s, AVFrame *f, int x, int y)
     f->data[2][chromay * f->linesize[2] + chromax] = s->yuv_color[2];
 }
 
-static int filter_brng(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+static void burn_frame16(const SignalstatsContext *s, AVFrame *f, int x, int y)
+{
+    const int chromax = x >> s->hsub;
+    const int chromay = y >> s->vsub;
+    const int mult = 1 << (s->depth - 8);
+    AV_WN16(f->data[0] + y       * f->linesize[0] +       x * 2, s->yuv_color[0] * mult);
+    AV_WN16(f->data[1] + chromay * f->linesize[1] + chromax * 2, s->yuv_color[1] * mult);
+    AV_WN16(f->data[2] + chromay * f->linesize[2] + chromax * 2, s->yuv_color[2] * mult);
+}
+
+static int filter8_brng(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
 {
     ThreadData *td = arg;
     const SignalstatsContext *s = ctx->priv;
@@ -210,7 +238,42 @@ static int filter_brng(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
                 chromav < 16 || chromav > 240;
             score += filt;
             if (out && filt)
-                burn_frame(s, out, x, y);
+                burn_frame8(s, out, x, y);
+        }
+    }
+    return score;
+}
+
+static int filter16_brng(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    ThreadData *td = arg;
+    const SignalstatsContext *s = ctx->priv;
+    const AVFrame *in = td->in;
+    AVFrame *out = td->out;
+    const int mult = 1 << (s->depth - 8);
+    const int w = in->width;
+    const int h = in->height;
+    const int slice_start = (h *  jobnr   ) / nb_jobs;
+    const int slice_end   = (h * (jobnr+1)) / nb_jobs;
+    int x, y, score = 0;
+
+    for (y = slice_start; y < slice_end; y++) {
+        const int yc = y >> s->vsub;
+        const uint16_t *pluma    = (uint16_t *)&in->data[0][y  * in->linesize[0]];
+        const uint16_t *pchromau = (uint16_t *)&in->data[1][yc * in->linesize[1]];
+        const uint16_t *pchromav = (uint16_t *)&in->data[2][yc * in->linesize[2]];
+
+        for (x = 0; x < w; x++) {
+            const int xc = x >> s->hsub;
+            const int luma    = pluma[x];
+            const int chromau = pchromau[xc];
+            const int chromav = pchromav[xc];
+            const int filt = luma    < 16 * mult || luma    > 235 * mult ||
+                chromau < 16 * mult || chromau > 240 * mult ||
+                chromav < 16 * mult || chromav > 240 * mult;
+            score += filt;
+            if (out && filt)
+                burn_frame16(s, out, x, y);
         }
     }
     return score;
@@ -221,7 +284,7 @@ static int filter_tout_outlier(uint8_t x, uint8_t y, uint8_t z)
     return ((abs(x - y) + abs (z - y)) / 2) - abs(z - x) > 4; // make 4 configurable?
 }
 
-static int filter_tout(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+static int filter8_tout(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
 {
     ThreadData *td = arg;
     const SignalstatsContext *s = ctx->priv;
@@ -241,7 +304,7 @@ static int filter_tout(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
             continue;
 
         // detect two pixels above and below (to eliminate interlace artefacts)
-        // should check that video format is infact interlaced.
+        // should check that video format is in fact interlaced.
 
 #define FILTER(i, j) \
         filter_tout_outlier(p[(y-j) * lw + x + i], \
@@ -255,14 +318,55 @@ static int filter_tout(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
                 filt = FILTER3(2) && FILTER3(1);
                 score += filt;
                 if (filt && out)
-                    burn_frame(s, out, x, y);
+                    burn_frame8(s, out, x, y);
             }
         } else {
             for (x = 1; x < w - 1; x++) {
                 filt = FILTER3(1);
                 score += filt;
                 if (filt && out)
-                    burn_frame(s, out, x, y);
+                    burn_frame8(s, out, x, y);
+            }
+        }
+    }
+    return score;
+}
+
+static int filter16_tout(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    ThreadData *td = arg;
+    const SignalstatsContext *s = ctx->priv;
+    const AVFrame *in = td->in;
+    AVFrame *out = td->out;
+    const int w = in->width;
+    const int h = in->height;
+    const int slice_start = (h *  jobnr   ) / nb_jobs;
+    const int slice_end   = (h * (jobnr+1)) / nb_jobs;
+    const uint16_t *p = (uint16_t *)in->data[0];
+    int lw = in->linesize[0] / 2;
+    int x, y, score = 0, filt;
+
+    for (y = slice_start; y < slice_end; y++) {
+
+        if (y - 1 < 0 || y + 1 >= h)
+            continue;
+
+        // detect two pixels above and below (to eliminate interlace artefacts)
+        // should check that video format is in fact interlaced.
+
+        if (y - 2 >= 0 && y + 2 < h) {
+            for (x = 1; x < w - 1; x++) {
+                filt = FILTER3(2) && FILTER3(1);
+                score += filt;
+                if (filt && out)
+                    burn_frame16(s, out, x, y);
+            }
+        } else {
+            for (x = 1; x < w - 1; x++) {
+                filt = FILTER3(1);
+                score += filt;
+                if (filt && out)
+                    burn_frame16(s, out, x, y);
             }
         }
     }
@@ -271,7 +375,7 @@ static int filter_tout(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
 
 #define VREP_START 4
 
-static int filter_vrep(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+static int filter8_vrep(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
 {
     ThreadData *td = arg;
     const SignalstatsContext *s = ctx->priv;
@@ -300,24 +404,58 @@ static int filter_vrep(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
         score += filt;
         if (filt && out)
             for (x = 0; x < w; x++)
-                burn_frame(s, out, x, y);
+                burn_frame8(s, out, x, y);
+    }
+    return score * w;
+}
+
+static int filter16_vrep(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    ThreadData *td = arg;
+    const SignalstatsContext *s = ctx->priv;
+    const AVFrame *in = td->in;
+    AVFrame *out = td->out;
+    const int w = in->width;
+    const int h = in->height;
+    const int slice_start = (h *  jobnr   ) / nb_jobs;
+    const int slice_end   = (h * (jobnr+1)) / nb_jobs;
+    const uint16_t *p = (uint16_t *)in->data[0];
+    const int lw = in->linesize[0] / 2;
+    int x, y, score = 0;
+
+    for (y = slice_start; y < slice_end; y++) {
+        const int y2lw = (y - VREP_START) * lw;
+        const int ylw  =  y               * lw;
+        int64_t totdiff = 0;
+        int filt;
+
+        if (y < VREP_START)
+            continue;
+
+        for (x = 0; x < w; x++)
+            totdiff += abs(p[y2lw + x] - p[ylw + x]);
+        filt = totdiff < w;
+
+        score += filt;
+        if (filt && out)
+            for (x = 0; x < w; x++)
+                burn_frame16(s, out, x, y);
     }
     return score * w;
 }
 
 static const struct {
     const char *name;
-    int (*process)(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs);
+    int (*process8)(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs);
+    int (*process16)(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs);
 } filters_def[] = {
-    {"TOUT", filter_tout},
-    {"VREP", filter_vrep},
-    {"BRNG", filter_brng},
+    {"TOUT", filter8_tout, filter16_tout},
+    {"VREP", filter8_vrep, filter16_vrep},
+    {"BRNG", filter8_brng, filter16_brng},
     {NULL}
 };
 
-#define DEPTH 256
-
-static int compute_sat_hue_metrics(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+static int compute_sat_hue_metrics8(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
 {
     int i, j;
     ThreadDataHueSatMetrics *td = arg;
@@ -343,8 +481,8 @@ static int compute_sat_hue_metrics(AVFilterContext *ctx, void *arg, int jobnr, i
         for (i = 0; i < s->chromaw; i++) {
             const int yuvu = p_u[i];
             const int yuvv = p_v[i];
-            p_sat[i] = hypot(yuvu - 128, yuvv - 128); // int or round?
-            ((int16_t*)p_hue)[i] = floor((180 / M_PI) * atan2f(yuvu-128, yuvv-128) + 180);
+            p_sat[i] = hypotf(yuvu - 128, yuvv - 128); // int or round?
+            ((int16_t*)p_hue)[i] = fmodf(floorf((180.f / M_PI) * atan2f(yuvu-128, yuvv-128) + 180.f), 360.f);
         }
         p_u   += lsz_u;
         p_v   += lsz_v;
@@ -355,22 +493,65 @@ static int compute_sat_hue_metrics(AVFilterContext *ctx, void *arg, int jobnr, i
     return 0;
 }
 
+static int compute_sat_hue_metrics16(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    int i, j;
+    ThreadDataHueSatMetrics *td = arg;
+    const SignalstatsContext *s = ctx->priv;
+    const AVFrame *src = td->src;
+    AVFrame *dst_sat = td->dst_sat;
+    AVFrame *dst_hue = td->dst_hue;
+    const int mid = 1 << (s->depth - 1);
+
+    const int slice_start = (s->chromah *  jobnr   ) / nb_jobs;
+    const int slice_end   = (s->chromah * (jobnr+1)) / nb_jobs;
+
+    const int lsz_u = src->linesize[1] / 2;
+    const int lsz_v = src->linesize[2] / 2;
+    const uint16_t *p_u = (uint16_t*)src->data[1] + slice_start * lsz_u;
+    const uint16_t *p_v = (uint16_t*)src->data[2] + slice_start * lsz_v;
+
+    const int lsz_sat = dst_sat->linesize[0] / 2;
+    const int lsz_hue = dst_hue->linesize[0] / 2;
+    uint16_t *p_sat = (uint16_t*)dst_sat->data[0] + slice_start * lsz_sat;
+    uint16_t *p_hue = (uint16_t*)dst_hue->data[0] + slice_start * lsz_hue;
+
+    for (j = slice_start; j < slice_end; j++) {
+        for (i = 0; i < s->chromaw; i++) {
+            const int yuvu = p_u[i];
+            const int yuvv = p_v[i];
+            p_sat[i] = hypotf(yuvu - mid, yuvv - mid); // int or round?
+            ((int16_t*)p_hue)[i] = fmodf(floorf((180.f / M_PI) * atan2f(yuvu-mid, yuvv-mid) + 180.f), 360.f);
+        }
+        p_u   += lsz_u;
+        p_v   += lsz_v;
+        p_sat += lsz_sat;
+        p_hue += lsz_hue;
+    }
+
+    return 0;
+}
+
+static unsigned compute_bit_depth(uint16_t mask)
+{
+    return av_popcount(mask);
+}
+
 static int filter_frame(AVFilterLink *link, AVFrame *in)
 {
     AVFilterContext *ctx = link->dst;
     SignalstatsContext *s = ctx->priv;
     AVFilterLink *outlink = ctx->outputs[0];
     AVFrame *out = in;
-    int i, j;
     int  w = 0,  cw = 0, // in
         pw = 0, cpw = 0; // prev
     int fil;
     char metabuf[128];
-    unsigned int histy[DEPTH] = {0},
-                 histu[DEPTH] = {0},
-                 histv[DEPTH] = {0},
+    unsigned int *histy = s->histy,
+                 *histu = s->histu,
+                 *histv = s->histv,
                  histhue[360] = {0},
-                 histsat[DEPTH] = {0}; // limited to 8 bit data.
+                 *histsat = s->histsat;
     int miny  = -1, minu  = -1, minv  = -1;
     int maxy  = -1, maxu  = -1, maxv  = -1;
     int lowy  = -1, lowu  = -1, lowv  = -1;
@@ -380,19 +561,17 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
     int accy, accu, accv;
     int accsat, acchue = 0;
     int medhue, maxhue;
-    int toty = 0, totu = 0, totv = 0, totsat=0;
-    int tothue = 0;
-    int dify = 0, difu = 0, difv = 0;
+    int64_t toty = 0, totu = 0, totv = 0, totsat=0;
+    int64_t tothue = 0;
+    int64_t dify = 0, difu = 0, difv = 0;
+    uint16_t masky = 0, masku = 0, maskv = 0;
 
     int filtot[FILT_NUMB] = {0};
     AVFrame *prev;
-
+    int ret;
     AVFrame *sat = s->frame_sat;
     AVFrame *hue = s->frame_hue;
-    const uint8_t *p_sat = sat->data[0];
-    const uint8_t *p_hue = hue->data[0];
-    const int lsz_sat = sat->linesize[0];
-    const int lsz_hue = hue->linesize[0];
+    const int hbd = s->depth > 8;
     ThreadDataHueSatMetrics td_huesat = {
         .src     = in,
         .dst_sat = sat,
@@ -406,40 +585,105 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
 
     if (s->outfilter != FILTER_NONE) {
         out = av_frame_clone(in);
-        av_frame_make_writable(out);
+        if (!out) {
+            av_frame_free(&in);
+            return AVERROR(ENOMEM);
+        }
+        ret = ff_inlink_make_frame_writable(link, &out);
+        if (ret < 0) {
+            av_frame_free(&out);
+            av_frame_free(&in);
+            return ret;
+        }
     }
 
-    ctx->internal->execute(ctx, compute_sat_hue_metrics, &td_huesat,
-                           NULL, FFMIN(s->chromah, ctx->graph->nb_threads));
+    ff_filter_execute(ctx, hbd ? compute_sat_hue_metrics16
+                               : compute_sat_hue_metrics8, &td_huesat,
+                      NULL, FFMIN(s->chromah, ff_filter_get_nb_threads(ctx)));
 
-    // Calculate luma histogram and difference with previous frame or field.
-    for (j = 0; j < link->h; j++) {
-        for (i = 0; i < link->w; i++) {
-            const int yuv = in->data[0][w + i];
-            histy[yuv]++;
-            dify += abs(yuv - prev->data[0][pw + i]);
+    memset(s->histy, 0, s->maxsize * sizeof(*s->histy));
+    memset(s->histu, 0, s->maxsize * sizeof(*s->histu));
+    memset(s->histv, 0, s->maxsize * sizeof(*s->histv));
+    memset(s->histsat, 0, s->maxsize * sizeof(*s->histsat));
+
+    if (hbd) {
+        const uint16_t *p_sat = (uint16_t *)sat->data[0];
+        const uint16_t *p_hue = (uint16_t *)hue->data[0];
+        const int lsz_sat = sat->linesize[0] / 2;
+        const int lsz_hue = hue->linesize[0] / 2;
+        // Calculate luma histogram and difference with previous frame or field.
+        for (int j = 0; j < link->h; j++) {
+            for (int i = 0; i < link->w; i++) {
+                const int yuv = AV_RN16(in->data[0] + w + i * 2);
+
+                masky |= yuv;
+                histy[yuv]++;
+                dify += abs(yuv - (int)AV_RN16(prev->data[0] + pw + i * 2));
+            }
+            w  += in->linesize[0];
+            pw += prev->linesize[0];
         }
-        w  += in->linesize[0];
-        pw += prev->linesize[0];
-    }
 
-    // Calculate chroma histogram and difference with previous frame or field.
-    for (j = 0; j < s->chromah; j++) {
-        for (i = 0; i < s->chromaw; i++) {
-            const int yuvu = in->data[1][cw+i];
-            const int yuvv = in->data[2][cw+i];
-            histu[yuvu]++;
-            difu += abs(yuvu - prev->data[1][cpw+i]);
-            histv[yuvv]++;
-            difv += abs(yuvv - prev->data[2][cpw+i]);
+        // Calculate chroma histogram and difference with previous frame or field.
+        for (int j = 0; j < s->chromah; j++) {
+            for (int i = 0; i < s->chromaw; i++) {
+                const int yuvu = AV_RN16(in->data[1] + cw + i * 2);
+                const int yuvv = AV_RN16(in->data[2] + cw + i * 2);
 
-            histsat[p_sat[i]]++;
-            histhue[((int16_t*)p_hue)[i]]++;
+                masku |= yuvu;
+                maskv |= yuvv;
+                histu[yuvu]++;
+                difu += abs(yuvu - (int)AV_RN16(prev->data[1] + cpw + i * 2));
+                histv[yuvv]++;
+                difv += abs(yuvv - (int)AV_RN16(prev->data[2] + cpw + i * 2));
+
+                histsat[p_sat[i]]++;
+                histhue[((int16_t*)p_hue)[i]]++;
+            }
+            cw  += in->linesize[1];
+            cpw += prev->linesize[1];
+            p_sat += lsz_sat;
+            p_hue += lsz_hue;
         }
-        cw  += in->linesize[1];
-        cpw += prev->linesize[1];
-        p_sat += lsz_sat;
-        p_hue += lsz_hue;
+    } else {
+        const uint8_t *p_sat = sat->data[0];
+        const uint8_t *p_hue = hue->data[0];
+        const int lsz_sat = sat->linesize[0];
+        const int lsz_hue = hue->linesize[0];
+        // Calculate luma histogram and difference with previous frame or field.
+        for (int j = 0; j < link->h; j++) {
+            for (int i = 0; i < link->w; i++) {
+                const int yuv = in->data[0][w + i];
+
+                masky |= yuv;
+                histy[yuv]++;
+                dify += abs(yuv - prev->data[0][pw + i]);
+            }
+            w  += in->linesize[0];
+            pw += prev->linesize[0];
+        }
+
+        // Calculate chroma histogram and difference with previous frame or field.
+        for (int j = 0; j < s->chromah; j++) {
+            for (int i = 0; i < s->chromaw; i++) {
+                const int yuvu = in->data[1][cw+i];
+                const int yuvv = in->data[2][cw+i];
+
+                masku |= yuvu;
+                maskv |= yuvv;
+                histu[yuvu]++;
+                difu += abs(yuvu - prev->data[1][cpw+i]);
+                histv[yuvv]++;
+                difv += abs(yuvv - prev->data[2][cpw+i]);
+
+                histsat[p_sat[i]]++;
+                histhue[((int16_t*)p_hue)[i]]++;
+            }
+            cw  += in->linesize[1];
+            cpw += prev->linesize[1];
+            p_sat += lsz_sat;
+            p_hue += lsz_hue;
+        }
     }
 
     for (fil = 0; fil < FILT_NUMB; fil ++) {
@@ -449,9 +693,9 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
                 .out = out != in && s->outfilter == fil ? out : NULL,
             };
             memset(s->jobs_rets, 0, s->nb_jobs * sizeof(*s->jobs_rets));
-            ctx->internal->execute(ctx, filters_def[fil].process,
-                                   &td, s->jobs_rets, s->nb_jobs);
-            for (i = 0; i < s->nb_jobs; i++)
+            ff_filter_execute(ctx, hbd ? filters_def[fil].process16 : filters_def[fil].process8,
+                              &td, s->jobs_rets, s->nb_jobs);
+            for (int i = 0; i < s->nb_jobs; i++)
                 filtot[fil] += s->jobs_rets[i];
         }
     }
@@ -465,7 +709,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
     chighp = lrint(s->cfs * 90 / 100.);
 
     accy = accu = accv = accsat = 0;
-    for (fil = 0; fil < DEPTH; fil++) {
+    for (fil = 0; fil < s->maxsize; fil++) {
         if (miny   < 0 && histy[fil])   miny = fil;
         if (minu   < 0 && histu[fil])   minu = fil;
         if (minv   < 0 && histv[fil])   minv = fil;
@@ -476,10 +720,10 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
         if (histv[fil])   maxv   = fil;
         if (histsat[fil]) maxsat = fil;
 
-        toty   += histy[fil]   * fil;
-        totu   += histu[fil]   * fil;
-        totv   += histv[fil]   * fil;
-        totsat += histsat[fil] * fil;
+        toty   += (uint64_t)histy[fil]   * fil;
+        totu   += (uint64_t)histu[fil]   * fil;
+        totv   += (uint64_t)histv[fil]   * fil;
+        totsat += (uint64_t)histsat[fil] * fil;
 
         accy   += histy[fil];
         accu   += histu[fil];
@@ -500,7 +744,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
     maxhue = histhue[0];
     medhue = -1;
     for (fil = 0; fil < 360; fil++) {
-        tothue += histhue[fil] * fil;
+        tothue += (uint64_t)histhue[fil] * fil;
         acchue += histhue[fil];
 
         if (medhue == -1 && acchue > s->cfs / 2)
@@ -518,36 +762,40 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
     av_dict_set(&out->metadata, "lavfi.signalstats." key, metabuf, 0);   \
 } while (0)
 
-    SET_META("YMIN",    "%d", miny);
-    SET_META("YLOW",    "%d", lowy);
+    av_dict_set_int(&out->metadata, "lavfi.signalstats.YMIN", miny, 0);
+    av_dict_set_int(&out->metadata, "lavfi.signalstats.YLOW", lowy, 0);
     SET_META("YAVG",    "%g", 1.0 * toty / s->fs);
-    SET_META("YHIGH",   "%d", highy);
-    SET_META("YMAX",    "%d", maxy);
+    av_dict_set_int(&out->metadata, "lavfi.signalstats.YHIGH", highy, 0);
+    av_dict_set_int(&out->metadata, "lavfi.signalstats.YMAX", maxy, 0);
 
-    SET_META("UMIN",    "%d", minu);
-    SET_META("ULOW",    "%d", lowu);
+    av_dict_set_int(&out->metadata, "lavfi.signalstats.UMIN", minu, 0);
+    av_dict_set_int(&out->metadata, "lavfi.signalstats.ULOW", lowu, 0);
     SET_META("UAVG",    "%g", 1.0 * totu / s->cfs);
-    SET_META("UHIGH",   "%d", highu);
-    SET_META("UMAX",    "%d", maxu);
+    av_dict_set_int(&out->metadata, "lavfi.signalstats.UHIGH", highu, 0);
+    av_dict_set_int(&out->metadata, "lavfi.signalstats.UMAX", maxu, 0);
 
-    SET_META("VMIN",    "%d", minv);
-    SET_META("VLOW",    "%d", lowv);
+    av_dict_set_int(&out->metadata, "lavfi.signalstats.VMIN", minv, 0);
+    av_dict_set_int(&out->metadata, "lavfi.signalstats.VLOW", lowv, 0);
     SET_META("VAVG",    "%g", 1.0 * totv / s->cfs);
-    SET_META("VHIGH",   "%d", highv);
-    SET_META("VMAX",    "%d", maxv);
+    av_dict_set_int(&out->metadata, "lavfi.signalstats.VHIGH", highv, 0);
+    av_dict_set_int(&out->metadata, "lavfi.signalstats.VMAX", maxv, 0);
 
-    SET_META("SATMIN",  "%d", minsat);
-    SET_META("SATLOW",  "%d", lowsat);
+    av_dict_set_int(&out->metadata, "lavfi.signalstats.SATMIN", minsat, 0);
+    av_dict_set_int(&out->metadata, "lavfi.signalstats.SATLOW", lowsat, 0);
     SET_META("SATAVG",  "%g", 1.0 * totsat / s->cfs);
-    SET_META("SATHIGH", "%d", highsat);
-    SET_META("SATMAX",  "%d", maxsat);
+    av_dict_set_int(&out->metadata, "lavfi.signalstats.SATHIGH", highsat, 0);
+    av_dict_set_int(&out->metadata, "lavfi.signalstats.SATMAX", maxsat, 0);
 
-    SET_META("HUEMED",  "%d", medhue);
+    av_dict_set_int(&out->metadata, "lavfi.signalstats.HUEMED", medhue, 0);
     SET_META("HUEAVG",  "%g", 1.0 * tothue / s->cfs);
 
     SET_META("YDIF",    "%g", 1.0 * dify / s->fs);
     SET_META("UDIF",    "%g", 1.0 * difu / s->cfs);
     SET_META("VDIF",    "%g", 1.0 * difv / s->cfs);
+
+    av_dict_set_int(&out->metadata, "lavfi.signalstats.YBITDEPTH", compute_bit_depth(masky), 0);
+    av_dict_set_int(&out->metadata, "lavfi.signalstats.UBITDEPTH", compute_bit_depth(masku), 0);
+    av_dict_set_int(&out->metadata, "lavfi.signalstats.VBITDEPTH", compute_bit_depth(maskv), 0);
 
     for (fil = 0; fil < FILT_NUMB; fil ++) {
         if (s->filters & 1<<fil) {
@@ -569,27 +817,25 @@ static const AVFilterPad signalstats_inputs[] = {
         .type           = AVMEDIA_TYPE_VIDEO,
         .filter_frame   = filter_frame,
     },
-    { NULL }
 };
 
 static const AVFilterPad signalstats_outputs[] = {
     {
         .name           = "default",
-        .config_props   = config_props,
+        .config_props   = config_output,
         .type           = AVMEDIA_TYPE_VIDEO,
     },
-    { NULL }
 };
 
-AVFilter ff_vf_signalstats = {
-    .name          = "signalstats",
-    .description   = "Generate statistics from video analysis.",
+const FFFilter ff_vf_signalstats = {
+    .p.name        = "signalstats",
+    .p.description = "Generate statistics from video analysis.",
+    .p.priv_class  = &signalstats_class,
+    .p.flags       = AVFILTER_FLAG_SLICE_THREADS,
     .init          = init,
     .uninit        = uninit,
-    .query_formats = query_formats,
     .priv_size     = sizeof(SignalstatsContext),
-    .inputs        = signalstats_inputs,
-    .outputs       = signalstats_outputs,
-    .priv_class    = &signalstats_class,
-    .flags         = AVFILTER_FLAG_SLICE_THREADS,
+    FILTER_INPUTS(signalstats_inputs),
+    FILTER_OUTPUTS(signalstats_outputs),
+    FILTER_PIXFMTS_ARRAY(pix_fmts),
 };

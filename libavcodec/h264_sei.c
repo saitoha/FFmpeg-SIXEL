@@ -1,5 +1,5 @@
 /*
- * H.26L/H.264/AVC/JVT/14496-10/... sei decoding
+ * H.26L/H.264/AVC/JVT/14496-10/... SEI decoding
  * Copyright (c) 2003 Michael Niedermayer <michaelni@gmx.at>
  *
  * This file is part of FFmpeg.
@@ -21,380 +21,326 @@
 
 /**
  * @file
- * H.264 / AVC / MPEG4 part10 sei decoding.
+ * H.264 / AVC / MPEG-4 part10 SEI decoding.
  * @author Michael Niedermayer <michaelni@gmx.at>
  */
 
-#include "avcodec.h"
+#include <limits.h>
+#include <stdio.h>
+#include <string.h>
+#include "libavutil/error.h"
+#include "libavutil/log.h"
+#include "libavutil/macros.h"
+#include "libavutil/mem.h"
+#include "bytestream.h"
+#include "get_bits.h"
 #include "golomb.h"
-#include "h264.h"
-#include "internal.h"
+#include "h264_ps.h"
+#include "h264_sei.h"
+#include "sei.h"
+
+#define AVERROR_PS_NOT_FOUND      FFERRTAG(0xF8,'?','P','S')
 
 static const uint8_t sei_num_clock_ts_table[9] = {
     1, 1, 1, 2, 2, 3, 3, 2, 3
 };
 
-void ff_h264_reset_sei(H264Context *h)
+void ff_h264_sei_uninit(H264SEIContext *h)
 {
-    h->sei_recovery_frame_cnt       = -1;
-    h->sei_dpb_output_delay         =  0;
-    h->sei_cpb_removal_delay        = -1;
-    h->sei_buffering_period_present =  0;
-    h->sei_frame_packing_present    =  0;
-    h->sei_display_orientation_present = 0;
+    h->recovery_point.recovery_frame_cnt = -1;
+
+    h->picture_timing.dpb_output_delay  = 0;
+    h->picture_timing.cpb_removal_delay = -1;
+
+    h->picture_timing.present      = 0;
+    h->buffering_period.present    = 0;
+    h->common.frame_packing.present       = 0;
+    h->common.display_orientation.present = 0;
+    h->common.afd.present                 =  0;
+
+    ff_h2645_sei_reset(&h->common);
 }
 
-static int decode_picture_timing(H264Context *h)
+int ff_h264_sei_process_picture_timing(H264SEIPictureTiming *h, const SPS *sps,
+                                       void *logctx)
 {
-    SPS *sps = &h->sps;
-    int i;
+    GetBitContext gb;
+    av_unused int ret;
 
-    for (i = 0; i<MAX_SPS_COUNT; i++)
-        if (!sps->log2_max_frame_num && h->sps_buffers[i])
-            sps = h->sps_buffers[i];
+    ret = init_get_bits8(&gb, h->payload, h->payload_size_bytes);
+    av_assert1(ret >= 0);
 
-    if (sps->nal_hrd_parameters_present_flag || sps->vcl_hrd_parameters_present_flag) {
-        h->sei_cpb_removal_delay = get_bits_long(&h->gb,
-                                                 sps->cpb_removal_delay_length);
-        h->sei_dpb_output_delay  = get_bits_long(&h->gb,
-                                                 sps->dpb_output_delay_length);
+    if (sps->nal_hrd_parameters_present_flag ||
+        sps->vcl_hrd_parameters_present_flag) {
+        h->cpb_removal_delay = get_bits_long(&gb, sps->cpb_removal_delay_length);
+        h->dpb_output_delay  = get_bits_long(&gb, sps->dpb_output_delay_length);
     }
     if (sps->pic_struct_present_flag) {
         unsigned int i, num_clock_ts;
 
-        h->sei_pic_struct = get_bits(&h->gb, 4);
-        h->sei_ct_type    = 0;
+        h->pic_struct = get_bits(&gb, 4);
+        h->ct_type    = 0;
 
-        if (h->sei_pic_struct > SEI_PIC_STRUCT_FRAME_TRIPLING)
+        if (h->pic_struct > H264_SEI_PIC_STRUCT_FRAME_TRIPLING)
             return AVERROR_INVALIDDATA;
 
-        num_clock_ts = sei_num_clock_ts_table[h->sei_pic_struct];
-
+        num_clock_ts = sei_num_clock_ts_table[h->pic_struct];
+        h->timecode_cnt = 0;
         for (i = 0; i < num_clock_ts; i++) {
-            if (get_bits(&h->gb, 1)) {                /* clock_timestamp_flag */
+            if (get_bits(&gb, 1)) {                      /* clock_timestamp_flag */
+                H264SEITimeCode *tc = &h->timecode[h->timecode_cnt++];
                 unsigned int full_timestamp_flag;
-
-                h->sei_ct_type |= 1 << get_bits(&h->gb, 2);
-                skip_bits(&h->gb, 1);                 /* nuit_field_based_flag */
-                skip_bits(&h->gb, 5);                 /* counting_type */
-                full_timestamp_flag = get_bits(&h->gb, 1);
-                skip_bits(&h->gb, 1);                 /* discontinuity_flag */
-                skip_bits(&h->gb, 1);                 /* cnt_dropped_flag */
-                skip_bits(&h->gb, 8);                 /* n_frames */
+                unsigned int counting_type, cnt_dropped_flag;
+                h->ct_type |= 1 << get_bits(&gb, 2);
+                skip_bits(&gb, 1);                       /* nuit_field_based_flag */
+                counting_type = get_bits(&gb, 5);        /* counting_type */
+                full_timestamp_flag = get_bits(&gb, 1);
+                skip_bits(&gb, 1);                       /* discontinuity_flag */
+                cnt_dropped_flag = get_bits(&gb, 1);      /* cnt_dropped_flag */
+                if (cnt_dropped_flag && counting_type > 1 && counting_type < 7)
+                    tc->dropframe = 1;
+                tc->frame = get_bits(&gb, 8);         /* n_frames */
                 if (full_timestamp_flag) {
-                    skip_bits(&h->gb, 6);             /* seconds_value 0..59 */
-                    skip_bits(&h->gb, 6);             /* minutes_value 0..59 */
-                    skip_bits(&h->gb, 5);             /* hours_value 0..23 */
+                    tc->full = 1;
+                    tc->seconds = get_bits(&gb, 6); /* seconds_value 0..59 */
+                    tc->minutes = get_bits(&gb, 6); /* minutes_value 0..59 */
+                    tc->hours = get_bits(&gb, 5);   /* hours_value 0..23 */
                 } else {
-                    if (get_bits(&h->gb, 1)) {        /* seconds_flag */
-                        skip_bits(&h->gb, 6);         /* seconds_value range 0..59 */
-                        if (get_bits(&h->gb, 1)) {    /* minutes_flag */
-                            skip_bits(&h->gb, 6);     /* minutes_value 0..59 */
-                            if (get_bits(&h->gb, 1))  /* hours_flag */
-                                skip_bits(&h->gb, 5); /* hours_value 0..23 */
+                    tc->seconds = tc->minutes = tc->hours = tc->full = 0;
+                    if (get_bits(&gb, 1)) {             /* seconds_flag */
+                        tc->seconds = get_bits(&gb, 6);
+                        if (get_bits(&gb, 1)) {         /* minutes_flag */
+                            tc->minutes = get_bits(&gb, 6);
+                            if (get_bits(&gb, 1))       /* hours_flag */
+                                tc->hours = get_bits(&gb, 5);
                         }
                     }
                 }
+
                 if (sps->time_offset_length > 0)
-                    skip_bits(&h->gb,
+                    skip_bits(&gb,
                               sps->time_offset_length); /* time_offset */
             }
         }
 
-        if (h->avctx->debug & FF_DEBUG_PICT_INFO)
-            av_log(h->avctx, AV_LOG_DEBUG, "ct_type:%X pic_struct:%d\n",
-                   h->sei_ct_type, h->sei_pic_struct);
-    }
-    return 0;
-}
-
-static int decode_user_data_itu_t_t35(H264Context *h, int size)
-{
-    uint32_t user_identifier;
-    int dtg_active_format;
-
-    if (size < 7)
-        return -1;
-    size -= 7;
-
-    skip_bits(&h->gb, 8);   // country_code
-    skip_bits(&h->gb, 16);  // provider_code
-    user_identifier = get_bits_long(&h->gb, 32);
-
-    switch (user_identifier) {
-        case 0x44544731:    // "DTG1" - AFD_data
-            if (size < 1)
-                return -1;
-            skip_bits(&h->gb, 1);
-            if (get_bits(&h->gb, 1)) {
-                skip_bits(&h->gb, 6);
-                if (size < 2)
-                    return -1;
-                skip_bits(&h->gb, 4);
-                dtg_active_format = get_bits(&h->gb, 4);
-                h->avctx->dtg_active_format = dtg_active_format;
-            } else {
-                skip_bits(&h->gb, 6);
-            }
-            break;
-        default:
-            skip_bits(&h->gb, size * 8);
-            break;
+        av_log(logctx, AV_LOG_DEBUG, "ct_type:%X pic_struct:%d\n",
+               h->ct_type, h->pic_struct);
     }
 
     return 0;
 }
 
-static int decode_unregistered_user_data(H264Context *h, int size)
+static int decode_picture_timing(H264SEIPictureTiming *h, GetByteContext *gb,
+                                 void *logctx)
 {
-    uint8_t user_data[16 + 256];
-    int e, build, i;
+    int size = bytestream2_get_bytes_left(gb);
 
-    if (size < 16)
+    if (size > sizeof(h->payload)) {
+        av_log(logctx, AV_LOG_ERROR, "Picture timing SEI payload too large\n");
         return AVERROR_INVALIDDATA;
+    }
+    bytestream2_get_bufferu(gb, h->payload, size);
 
-    for (i = 0; i < sizeof(user_data) - 1 && i < size; i++)
-        user_data[i] = get_bits(&h->gb, 8);
+    h->payload_size_bytes = size;
 
-    user_data[i] = 0;
-    e = sscanf(user_data + 16, "x264 - core %d", &build);
-    if (e == 1 && build > 0)
-        h->x264_build = build;
-    if (e == 1 && build == 1 && !strncmp(user_data+16, "x264 - core 0000", 16))
-        h->x264_build = 67;
-
-    if (h->avctx->debug & FF_DEBUG_BUGS)
-        av_log(h->avctx, AV_LOG_DEBUG, "user data:\"%s\"\n", user_data + 16);
-
-    for (; i < size; i++)
-        skip_bits(&h->gb, 8);
-
+    h->present = 1;
     return 0;
 }
 
-static int decode_recovery_point(H264Context *h)
+static int decode_recovery_point(H264SEIRecoveryPoint *h, GetBitContext *gb, void *logctx)
 {
-    h->sei_recovery_frame_cnt = get_ue_golomb(&h->gb);
+    unsigned recovery_frame_cnt = get_ue_golomb_long(gb);
 
+    if (recovery_frame_cnt >= (1<<MAX_LOG2_MAX_FRAME_NUM)) {
+        av_log(logctx, AV_LOG_ERROR, "recovery_frame_cnt %u is out of range\n", recovery_frame_cnt);
+        return AVERROR_INVALIDDATA;
+    }
+
+    h->recovery_frame_cnt = recovery_frame_cnt;
     /* 1b exact_match_flag,
      * 1b broken_link_flag,
      * 2b changing_slice_group_idc */
-    skip_bits(&h->gb, 4);
-
-    if (h->avctx->debug & FF_DEBUG_PICT_INFO)
-        av_log(h->avctx, AV_LOG_DEBUG, "sei_recovery_frame_cnt: %d\n", h->sei_recovery_frame_cnt);
-
-    h->has_recovery_point = 1;
+    skip_bits(gb, 4);
 
     return 0;
 }
 
-static int decode_buffering_period(H264Context *h)
+static int decode_buffering_period(H264SEIBufferingPeriod *h, GetBitContext *gb,
+                                   const H264ParamSets *ps, void *logctx)
 {
     unsigned int sps_id;
     int sched_sel_idx;
-    SPS *sps;
+    const SPS *sps;
 
-    sps_id = get_ue_golomb_31(&h->gb);
-    if (sps_id > 31 || !h->sps_buffers[sps_id]) {
-        av_log(h->avctx, AV_LOG_ERROR,
+    sps_id = get_ue_golomb_31(gb);
+    if (sps_id > 31 || !ps->sps_list[sps_id]) {
+        av_log(logctx, AV_LOG_ERROR,
                "non-existing SPS %d referenced in buffering period\n", sps_id);
-        return AVERROR_INVALIDDATA;
+        return sps_id > 31 ? AVERROR_INVALIDDATA : AVERROR_PS_NOT_FOUND;
     }
-    sps = h->sps_buffers[sps_id];
+    sps = ps->sps_list[sps_id];
 
     // NOTE: This is really so duplicated in the standard... See H.264, D.1.1
     if (sps->nal_hrd_parameters_present_flag) {
         for (sched_sel_idx = 0; sched_sel_idx < sps->cpb_cnt; sched_sel_idx++) {
             h->initial_cpb_removal_delay[sched_sel_idx] =
-                get_bits_long(&h->gb, sps->initial_cpb_removal_delay_length);
+                get_bits_long(gb, sps->initial_cpb_removal_delay_length);
             // initial_cpb_removal_delay_offset
-            skip_bits(&h->gb, sps->initial_cpb_removal_delay_length);
+            skip_bits(gb, sps->initial_cpb_removal_delay_length);
         }
     }
     if (sps->vcl_hrd_parameters_present_flag) {
         for (sched_sel_idx = 0; sched_sel_idx < sps->cpb_cnt; sched_sel_idx++) {
             h->initial_cpb_removal_delay[sched_sel_idx] =
-                get_bits_long(&h->gb, sps->initial_cpb_removal_delay_length);
+                get_bits_long(gb, sps->initial_cpb_removal_delay_length);
             // initial_cpb_removal_delay_offset
-            skip_bits(&h->gb, sps->initial_cpb_removal_delay_length);
+            skip_bits(gb, sps->initial_cpb_removal_delay_length);
         }
     }
 
-    h->sei_buffering_period_present = 1;
+    h->present = 1;
     return 0;
 }
 
-static int decode_frame_packing_arrangement(H264Context *h)
+static int decode_green_metadata(H264SEIGreenMetaData *h, GetByteContext *gb)
 {
-    h->sei_fpa.frame_packing_arrangement_id          = get_ue_golomb(&h->gb);
-    h->sei_fpa.frame_packing_arrangement_cancel_flag = get_bits1(&h->gb);
-    h->sei_frame_packing_present = !h->sei_fpa.frame_packing_arrangement_cancel_flag;
+    h->green_metadata_type = bytestream2_get_byte(gb);
 
-    if (h->sei_frame_packing_present) {
-        h->sei_fpa.frame_packing_arrangement_type =
-        h->frame_packing_arrangement_type = get_bits(&h->gb, 7);
-        h->sei_fpa.quincunx_sampling_flag         =
-        h->quincunx_subsampling           = get_bits1(&h->gb);
-        h->sei_fpa.content_interpretation_type    =
-        h->content_interpretation_type    = get_bits(&h->gb, 6);
+    if (h->green_metadata_type == 0) {
+        h->period_type = bytestream2_get_byte(gb);
 
-        // the following skips: spatial_flipping_flag, frame0_flipped_flag,
-        // field_views_flag, current_frame_is_frame0_flag,
-        // frame0_self_contained_flag, frame1_self_contained_flag
-        skip_bits(&h->gb, 6);
+        if (h->period_type == 2)
+            h->num_seconds = bytestream2_get_be16(gb);
+        else if (h->period_type == 3)
+            h->num_pictures = bytestream2_get_be16(gb);
 
-        if (!h->quincunx_subsampling && h->frame_packing_arrangement_type != 5)
-            skip_bits(&h->gb, 16);      // frame[01]_grid_position_[xy]
-        skip_bits(&h->gb, 8);           // frame_packing_arrangement_reserved_byte
-        h->sei_fpa.frame_packing_arrangement_repetition_period = get_ue_golomb(&h->gb) /* frame_packing_arrangement_repetition_period */;
-    }
-    skip_bits1(&h->gb);                 // frame_packing_arrangement_extension_flag
+        h->percent_non_zero_macroblocks            = bytestream2_get_byte(gb);
+        h->percent_intra_coded_macroblocks         = bytestream2_get_byte(gb);
+        h->percent_six_tap_filtering               = bytestream2_get_byte(gb);
+        h->percent_alpha_point_deblocking_instance = bytestream2_get_byte(gb);
 
-    if (h->avctx->debug & FF_DEBUG_PICT_INFO)
-        av_log(h->avctx, AV_LOG_DEBUG, "SEI FPA %d %d %d %d %d %d\n",
-                                       h->sei_fpa.frame_packing_arrangement_id,
-                                       h->sei_fpa.frame_packing_arrangement_cancel_flag,
-                                       h->sei_fpa.frame_packing_arrangement_type,
-                                       h->sei_fpa.quincunx_sampling_flag,
-                                       h->sei_fpa.content_interpretation_type,
-                                       h->sei_fpa.frame_packing_arrangement_repetition_period);
-
-    return 0;
-}
-
-static int decode_display_orientation(H264Context *h)
-{
-    h->sei_display_orientation_present = !get_bits1(&h->gb);
-
-    if (h->sei_display_orientation_present) {
-        h->sei_hflip = get_bits1(&h->gb);     // hor_flip
-        h->sei_vflip = get_bits1(&h->gb);     // ver_flip
-
-        h->sei_anticlockwise_rotation = get_bits(&h->gb, 16);
-        get_ue_golomb(&h->gb);  // display_orientation_repetition_period
-        skip_bits1(&h->gb);     // display_orientation_extension_flag
+    } else if (h->green_metadata_type == 1) {
+        h->xsd_metric_type  = bytestream2_get_byte(gb);
+        h->xsd_metric_value = bytestream2_get_be16(gb);
     }
 
     return 0;
 }
 
-int ff_h264_decode_sei(H264Context *h)
+int ff_h264_sei_decode(H264SEIContext *h, GetBitContext *gb,
+                       const H264ParamSets *ps, void *logctx)
 {
-    while (get_bits_left(&h->gb) > 16 && show_bits(&h->gb, 16)) {
+    GetByteContext gbyte;
+    int master_ret = 0;
+
+    av_assert1((get_bits_count(gb) % 8) == 0);
+    bytestream2_init(&gbyte, gb->buffer + get_bits_count(gb) / 8,
+                     get_bits_left(gb) / 8);
+
+    while (bytestream2_get_bytes_left(&gbyte) > 2 && bytestream2_peek_ne16(&gbyte)) {
+        GetByteContext gbyte_payload;
+        GetBitContext gb_payload;
         int type = 0;
         unsigned size = 0;
-        unsigned next;
         int ret  = 0;
 
         do {
-            if (get_bits_left(&h->gb) < 8)
+            if (bytestream2_get_bytes_left(&gbyte) <= 0)
                 return AVERROR_INVALIDDATA;
-            type += show_bits(&h->gb, 8);
-        } while (get_bits(&h->gb, 8) == 255);
+            type += bytestream2_peek_byteu(&gbyte);
+        } while (bytestream2_get_byteu(&gbyte) == 255);
 
         do {
-            if (get_bits_left(&h->gb) < 8)
+            if (bytestream2_get_bytes_left(&gbyte) <= 0)
                 return AVERROR_INVALIDDATA;
-            size += show_bits(&h->gb, 8);
-        } while (get_bits(&h->gb, 8) == 255);
+            size += bytestream2_peek_byteu(&gbyte);
+        } while (bytestream2_get_byteu(&gbyte) == 255);
 
-        if (h->avctx->debug&FF_DEBUG_STARTCODE)
-            av_log(h->avctx, AV_LOG_DEBUG, "SEI %d len:%d\n", type, size);
-
-        if (size > get_bits_left(&h->gb) / 8) {
-            av_log(h->avctx, AV_LOG_ERROR, "SEI type %d size %d truncated at %d\n",
-                   type, 8*size, get_bits_left(&h->gb));
+        if (size > bytestream2_get_bytes_left(&gbyte)) {
+            av_log(logctx, AV_LOG_ERROR, "SEI type %d size %d truncated at %d\n",
+                   type, size, bytestream2_get_bytes_left(&gbyte));
             return AVERROR_INVALIDDATA;
         }
-        next = get_bits_count(&h->gb) + 8 * size;
+
+        bytestream2_init (&gbyte_payload, gbyte.buffer, size);
+        ret = init_get_bits8(&gb_payload, gbyte.buffer, size);
+        if (ret < 0)
+            return ret;
 
         switch (type) {
         case SEI_TYPE_PIC_TIMING: // Picture timing SEI
-            ret = decode_picture_timing(h);
-            if (ret < 0)
-                return ret;
-            break;
-        case SEI_TYPE_USER_DATA_ITU_T_T35:
-            if (decode_user_data_itu_t_t35(h, size) < 0)
-                return -1;
-            break;
-        case SEI_TYPE_USER_DATA_UNREGISTERED:
-            ret = decode_unregistered_user_data(h, size);
-            if (ret < 0)
-                return ret;
+            ret = decode_picture_timing(&h->picture_timing, &gbyte_payload, logctx);
             break;
         case SEI_TYPE_RECOVERY_POINT:
-            ret = decode_recovery_point(h);
-            if (ret < 0)
-                return ret;
+            ret = decode_recovery_point(&h->recovery_point, &gb_payload, logctx);
             break;
         case SEI_TYPE_BUFFERING_PERIOD:
-            ret = decode_buffering_period(h);
-            if (ret < 0)
-                return ret;
+            ret = decode_buffering_period(&h->buffering_period, &gb_payload, ps, logctx);
             break;
-        case SEI_TYPE_FRAME_PACKING:
-            ret = decode_frame_packing_arrangement(h);
-            if (ret < 0)
-                return ret;
-            break;
-        case SEI_TYPE_DISPLAY_ORIENTATION:
-            ret = decode_display_orientation(h);
-            if (ret < 0)
-                return ret;
+        case SEI_TYPE_GREEN_METADATA:
+            ret = decode_green_metadata(&h->green_metadata, &gbyte_payload);
             break;
         default:
-            av_log(h->avctx, AV_LOG_DEBUG, "unknown SEI type %d\n", type);
+            ret = ff_h2645_sei_message_decode(&h->common, type, AV_CODEC_ID_H264,
+                                              &gb_payload, &gbyte_payload, logctx);
+            if (ret == FF_H2645_SEI_MESSAGE_UNHANDLED)
+                av_log(logctx, AV_LOG_DEBUG, "unknown SEI type %d\n", type);
         }
-        skip_bits_long(&h->gb, next - get_bits_count(&h->gb));
+        if (ret < 0 && ret != AVERROR_PS_NOT_FOUND)
+            return ret;
+        if (ret < 0)
+            master_ret = ret;
 
-        // FIXME check bits here
-        align_get_bits(&h->gb);
+        if (get_bits_left(&gb_payload) < 0) {
+            av_log(logctx, AV_LOG_WARNING, "SEI type %d overread by %d bits\n",
+                   type, -get_bits_left(&gb_payload));
+        }
+
+        bytestream2_skipu(&gbyte, size);
     }
 
-    return 0;
+    return master_ret;
 }
 
-const char* ff_h264_sei_stereo_mode(H264Context *h)
+const char *ff_h264_sei_stereo_mode(const H2645SEIFramePacking *h)
 {
-    if (h->sei_fpa.frame_packing_arrangement_cancel_flag == 0) {
-        switch (h->sei_fpa.frame_packing_arrangement_type) {
-            case SEI_FPA_TYPE_CHECKERBOARD:
-                if (h->sei_fpa.content_interpretation_type == 2)
+    if (h->arrangement_cancel_flag == 0) {
+        switch (h->arrangement_type) {
+            case SEI_FPA_H264_TYPE_CHECKERBOARD:
+                if (h->content_interpretation_type == 2)
                     return "checkerboard_rl";
                 else
                     return "checkerboard_lr";
-            case SEI_FPA_TYPE_INTERLEAVE_COLUMN:
-                if (h->sei_fpa.content_interpretation_type == 2)
+            case SEI_FPA_H264_TYPE_INTERLEAVE_COLUMN:
+                if (h->content_interpretation_type == 2)
                     return "col_interleaved_rl";
                 else
                     return "col_interleaved_lr";
-            case SEI_FPA_TYPE_INTERLEAVE_ROW:
-                if (h->sei_fpa.content_interpretation_type == 2)
+            case SEI_FPA_H264_TYPE_INTERLEAVE_ROW:
+                if (h->content_interpretation_type == 2)
                     return "row_interleaved_rl";
                 else
                     return "row_interleaved_lr";
             case SEI_FPA_TYPE_SIDE_BY_SIDE:
-                if (h->sei_fpa.content_interpretation_type == 2)
+                if (h->content_interpretation_type == 2)
                     return "right_left";
                 else
                     return "left_right";
             case SEI_FPA_TYPE_TOP_BOTTOM:
-                if (h->sei_fpa.content_interpretation_type == 2)
+                if (h->content_interpretation_type == 2)
                     return "bottom_top";
                 else
                     return "top_bottom";
             case SEI_FPA_TYPE_INTERLEAVE_TEMPORAL:
-                if (h->sei_fpa.content_interpretation_type == 2)
+                if (h->content_interpretation_type == 2)
                     return "block_rl";
                 else
                     return "block_lr";
-            case SEI_FPA_TYPE_2D:
+            case SEI_FPA_H264_TYPE_2D:
             default:
                 return "mono";
         }
-    } else if (h->sei_fpa.frame_packing_arrangement_cancel_flag == 1) {
+    } else if (h->arrangement_cancel_flag == 1) {
         return "mono";
     } else {
         return NULL;

@@ -23,7 +23,7 @@
 #ifndef AVCODEC_FMTCONVERT_H
 #define AVCODEC_FMTCONVERT_H
 
-#include "avcodec.h"
+#include <stdint.h>
 
 typedef struct FmtConvertContext {
     /**
@@ -56,15 +56,13 @@ typedef struct FmtConvertContext {
 
 } FmtConvertContext;
 
-void ff_fmt_convert_init(FmtConvertContext *c, AVCodecContext *avctx);
+void ff_fmt_convert_init(FmtConvertContext *c);
 
-void ff_fmt_convert_init_arm(FmtConvertContext *c, AVCodecContext *avctx);
-void ff_fmt_convert_init_ppc(FmtConvertContext *c, AVCodecContext *avctx);
-void ff_fmt_convert_init_x86(FmtConvertContext *c, AVCodecContext *avctx);
+void ff_fmt_convert_init_aarch64(FmtConvertContext *c);
+void ff_fmt_convert_init_arm(FmtConvertContext *c);
+void ff_fmt_convert_init_ppc(FmtConvertContext *c);
+void ff_fmt_convert_init_riscv(FmtConvertContext *c);
+void ff_fmt_convert_init_x86(FmtConvertContext *c);
 void ff_fmt_convert_init_mips(FmtConvertContext *c);
-
-/* ffdshow custom code */
-void float_interleave(float *dst, const float **src, long len, int channels);
-void float_interleave_noscale(float *dst, const float **src, long len, int channels);
 
 #endif /* AVCODEC_FMTCONVERT_H */

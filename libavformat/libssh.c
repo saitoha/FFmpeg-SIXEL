@@ -22,8 +22,10 @@
 #define LIBSSH_STATIC
 #include <libssh/sftp.h>
 #include "libavutil/avstring.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/attributes.h"
+#include "libavformat/avio.h"
 #include "avformat.h"
 #include "internal.h"
 #include "url.h"
@@ -33,6 +35,7 @@ typedef struct {
     ssh_session session;
     sftp_session sftp;
     sftp_file file;
+    sftp_dir dir;
     int64_t filesize;
     int rw_timeout;
     int trunc;
@@ -82,12 +85,9 @@ static av_cold int libssh_authentication(LIBSSHContext *libssh, const char *user
 
     if (auth_methods & SSH_AUTH_METHOD_PUBLICKEY) {
         if (libssh->priv_key) {
-            ssh_string pub_key;
-            ssh_private_key priv_key;
-            int type;
-            if (!ssh_try_publickey_from_file(libssh->session, libssh->priv_key, &pub_key, &type)) {
-                priv_key = privatekey_from_file(libssh->session, libssh->priv_key, type, password);
-                if (ssh_userauth_pubkey(libssh->session, NULL, pub_key, priv_key) == SSH_AUTH_SUCCESS) {
+            ssh_key priv_key;
+            if (ssh_pki_import_privkey_file(libssh->priv_key, password, NULL, NULL, &priv_key) == SSH_OK) {
+                if (ssh_userauth_publickey(libssh->session, NULL, priv_key) == SSH_AUTH_SUCCESS) {
                     av_log(libssh, AV_LOG_DEBUG, "Authentication successful with selected private key.\n");
                     authorized = 1;
                 }
@@ -95,13 +95,13 @@ static av_cold int libssh_authentication(LIBSSHContext *libssh, const char *user
                 av_log(libssh, AV_LOG_DEBUG, "Invalid key is provided.\n");
                 return AVERROR(EACCES);
             }
-        } else if (ssh_userauth_autopubkey(libssh->session, password) == SSH_AUTH_SUCCESS) {
+        } else if (ssh_userauth_publickey_auto(libssh->session, NULL, password) == SSH_AUTH_SUCCESS) {
             av_log(libssh, AV_LOG_DEBUG, "Authentication successful with auto selected key.\n");
             authorized = 1;
         }
     }
 
-    if (!authorized && (auth_methods & SSH_AUTH_METHOD_PASSWORD)) {
+    if (!authorized && password && (auth_methods & SSH_AUTH_METHOD_PASSWORD)) {
         if (ssh_userauth_password(libssh->session, NULL, password) == SSH_AUTH_SUCCESS) {
             av_log(libssh, AV_LOG_DEBUG, "Authentication successful with password.\n");
             authorized = 1;
@@ -187,35 +187,50 @@ static av_cold int libssh_close(URLContext *h)
     return 0;
 }
 
-static av_cold int libssh_open(URLContext *h, const char *url, int flags)
+static av_cold int libssh_connect(URLContext *h, const char *url, char *path, size_t path_size)
 {
     LIBSSHContext *libssh = h->priv_data;
-    char proto[10], path[MAX_URL_SIZE], hostname[1024], credencials[1024];
-    int port, ret;
+    char proto[10], hostname[1024], credentials[1024];
+    int port = 22, ret;
     const char *user = NULL, *pass = NULL;
     char *end = NULL;
 
     av_url_split(proto, sizeof(proto),
-                 credencials, sizeof(credencials),
+                 credentials, sizeof(credentials),
                  hostname, sizeof(hostname),
                  &port,
-                 path, sizeof(path),
+                 path, path_size,
                  url);
+
+    if (!(*path))
+        av_strlcpy(path, "/", path_size);
 
     // a port of 0 will use a port from ~/.ssh/config or the default value 22
     if (port < 0 || port > 65535)
         port = 0;
 
     if ((ret = libssh_create_ssh_session(libssh, hostname, port)) < 0)
-        goto fail;
+        return ret;
 
-    user = av_strtok(credencials, ":", &end);
+    user = av_strtok(credentials, ":", &end);
     pass = av_strtok(end, ":", &end);
 
     if ((ret = libssh_authentication(libssh, user, pass)) < 0)
-        goto fail;
+        return ret;
 
     if ((ret = libssh_create_sftp_session(libssh)) < 0)
+        return ret;
+
+    return 0;
+}
+
+static av_cold int libssh_open(URLContext *h, const char *url, int flags)
+{
+    int ret;
+    LIBSSHContext *libssh = h->priv_data;
+    char path[MAX_URL_SIZE];
+
+    if ((ret = libssh_connect(h, url, path, sizeof(path))) < 0)
         goto fail;
 
     if ((ret = libssh_open_file(libssh, flags, path)) < 0)
@@ -257,7 +272,7 @@ static int64_t libssh_seek(URLContext *h, int64_t pos, int whence)
     }
 
     if (newpos < 0) {
-        av_log(h, AV_LOG_ERROR, "Seeking to nagative position.\n");
+        av_log(h, AV_LOG_ERROR, "Seeking to negative position.\n");
         return AVERROR(EINVAL);
     }
 
@@ -278,7 +293,7 @@ static int libssh_read(URLContext *h, unsigned char *buf, int size)
         av_log(libssh, AV_LOG_ERROR, "Read error.\n");
         return AVERROR(EIO);
     }
-    return bytes_read;
+    return bytes_read ? bytes_read : AVERROR_EOF;
 }
 
 static int libssh_write(URLContext *h, const unsigned char *buf, int size)
@@ -291,6 +306,168 @@ static int libssh_write(URLContext *h, const unsigned char *buf, int size)
         return AVERROR(EIO);
     }
     return bytes_written;
+}
+
+static int libssh_open_dir(URLContext *h)
+{
+    LIBSSHContext *libssh = h->priv_data;
+    int ret;
+    char path[MAX_URL_SIZE];
+
+    if ((ret = libssh_connect(h, h->filename, path, sizeof(path))) < 0)
+        goto fail;
+
+    if (!(libssh->dir = sftp_opendir(libssh->sftp, path))) {
+        av_log(libssh, AV_LOG_ERROR, "Error opening sftp dir: %s\n", ssh_get_error(libssh->session));
+        ret = AVERROR(EIO);
+        goto fail;
+    }
+
+    return 0;
+
+  fail:
+    libssh_close(h);
+    return ret;
+}
+
+static int libssh_read_dir(URLContext *h, AVIODirEntry **next)
+{
+    LIBSSHContext *libssh = h->priv_data;
+    sftp_attributes attr = NULL;
+    AVIODirEntry *entry;
+
+    *next = entry = ff_alloc_dir_entry();
+    if (!entry)
+        return AVERROR(ENOMEM);
+
+    do {
+        if (attr)
+            sftp_attributes_free(attr);
+        attr = sftp_readdir(libssh->sftp, libssh->dir);
+        if (!attr) {
+            av_freep(next);
+            if (sftp_dir_eof(libssh->dir))
+                return 0;
+            return AVERROR(EIO);
+        }
+    } while (!strcmp(attr->name, ".") || !strcmp(attr->name, ".."));
+
+    entry->name = av_strdup(attr->name);
+    entry->group_id = attr->gid;
+    entry->user_id = attr->uid;
+    entry->size = attr->size;
+    entry->access_timestamp = INT64_C(1000000) * attr->atime;
+    entry->modification_timestamp = INT64_C(1000000) * attr->mtime;
+    entry->filemode = attr->permissions & 0777;
+    switch(attr->type) {
+    case SSH_FILEXFER_TYPE_REGULAR:
+        entry->type = AVIO_ENTRY_FILE;
+        break;
+    case SSH_FILEXFER_TYPE_DIRECTORY:
+        entry->type = AVIO_ENTRY_DIRECTORY;
+        break;
+    case SSH_FILEXFER_TYPE_SYMLINK:
+        entry->type = AVIO_ENTRY_SYMBOLIC_LINK;
+        break;
+    case SSH_FILEXFER_TYPE_SPECIAL:
+        /* Special type includes: sockets, char devices, block devices and pipes.
+           It is probably better to return unknown type, to not confuse anybody. */
+    case SSH_FILEXFER_TYPE_UNKNOWN:
+    default:
+        entry->type = AVIO_ENTRY_UNKNOWN;
+    }
+    sftp_attributes_free(attr);
+    return 0;
+}
+
+static int libssh_close_dir(URLContext *h)
+{
+    LIBSSHContext *libssh = h->priv_data;
+    if (libssh->dir)
+        sftp_closedir(libssh->dir);
+    libssh->dir = NULL;
+    libssh_close(h);
+    return 0;
+}
+
+static int libssh_delete(URLContext *h)
+{
+    int ret;
+    LIBSSHContext *libssh = h->priv_data;
+    sftp_attributes attr = NULL;
+    char path[MAX_URL_SIZE];
+
+    if ((ret = libssh_connect(h, h->filename, path, sizeof(path))) < 0)
+        goto cleanup;
+
+    if (!(attr = sftp_stat(libssh->sftp, path))) {
+        ret = AVERROR(sftp_get_error(libssh->sftp));
+        goto cleanup;
+    }
+
+    if (attr->type == SSH_FILEXFER_TYPE_DIRECTORY) {
+        if (sftp_rmdir(libssh->sftp, path) < 0) {
+            ret = AVERROR(sftp_get_error(libssh->sftp));
+            goto cleanup;
+        }
+    } else {
+        if (sftp_unlink(libssh->sftp, path) < 0) {
+            ret = AVERROR(sftp_get_error(libssh->sftp));
+            goto cleanup;
+        }
+    }
+
+    ret = 0;
+
+cleanup:
+    if (attr)
+        sftp_attributes_free(attr);
+    libssh_close(h);
+    return ret;
+}
+
+static int libssh_move(URLContext *h_src, URLContext *h_dst)
+{
+    int ret;
+    LIBSSHContext *libssh = h_src->priv_data;
+    char path_src[MAX_URL_SIZE], path_dst[MAX_URL_SIZE];
+    char hostname_src[1024], hostname_dst[1024];
+    char credentials_src[1024], credentials_dst[1024];
+    int port_src = 22, port_dst = 22;
+
+    av_url_split(NULL, 0,
+                 credentials_src, sizeof(credentials_src),
+                 hostname_src, sizeof(hostname_src),
+                 &port_src,
+                 path_src, sizeof(path_src),
+                 h_src->filename);
+
+    av_url_split(NULL, 0,
+                 credentials_dst, sizeof(credentials_dst),
+                 hostname_dst, sizeof(hostname_dst),
+                 &port_dst,
+                 path_dst, sizeof(path_dst),
+                 h_dst->filename);
+
+    if (strcmp(credentials_src, credentials_dst) ||
+            strcmp(hostname_src, hostname_dst) ||
+            port_src != port_dst) {
+        return AVERROR(EINVAL);
+    }
+
+    if ((ret = libssh_connect(h_src, h_src->filename, path_src, sizeof(path_src))) < 0)
+        goto cleanup;
+
+    if (sftp_rename(libssh->sftp, path_src, path_dst) < 0) {
+        ret = AVERROR(sftp_get_error(libssh->sftp));
+        goto cleanup;
+    }
+
+    ret = 0;
+
+cleanup:
+    libssh_close(h_src);
+    return ret;
 }
 
 #define OFFSET(x) offsetof(LIBSSHContext, x)
@@ -310,13 +487,18 @@ static const AVClass libssh_context_class = {
     .version        = LIBAVUTIL_VERSION_INT,
 };
 
-URLProtocol ff_libssh_protocol = {
+const URLProtocol ff_libssh_protocol = {
     .name                = "sftp",
     .url_open            = libssh_open,
     .url_read            = libssh_read,
     .url_write           = libssh_write,
     .url_seek            = libssh_seek,
     .url_close           = libssh_close,
+    .url_delete          = libssh_delete,
+    .url_move            = libssh_move,
+    .url_open_dir        = libssh_open_dir,
+    .url_read_dir        = libssh_read_dir,
+    .url_close_dir       = libssh_close_dir,
     .priv_data_size      = sizeof(LIBSSHContext),
     .priv_data_class     = &libssh_context_class,
     .flags               = URL_PROTOCOL_FLAG_NETWORK,

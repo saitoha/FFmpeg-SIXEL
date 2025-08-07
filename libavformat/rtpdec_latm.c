@@ -23,6 +23,7 @@
 #include "rtpdec_formats.h"
 #include "internal.h"
 #include "libavutil/avstring.h"
+#include "libavutil/mem.h"
 #include "libavcodec/get_bits.h"
 
 struct PayloadContext {
@@ -97,11 +98,13 @@ static int parse_fmtp_config(AVStream *st, const char *value)
     int audio_mux_version, same_time_framing, num_programs, num_layers;
 
     /* Pad this buffer, too, to avoid out of bounds reads with get_bits below */
-    config = av_mallocz(len + FF_INPUT_BUFFER_PADDING_SIZE);
+    config = av_mallocz(len + AV_INPUT_BUFFER_PADDING_SIZE);
     if (!config)
         return AVERROR(ENOMEM);
     ff_hex_to_data(config, value);
-    init_get_bits(&gb, config, len*8);
+    ret = init_get_bits(&gb, config, len*8);
+    if (ret < 0)
+        goto end;
     audio_mux_version = get_bits(&gb, 1);
     same_time_framing = get_bits(&gb, 1);
     skip_bits(&gb, 6); /* num_sub_frames */
@@ -109,19 +112,18 @@ static int parse_fmtp_config(AVStream *st, const char *value)
     num_layers        = get_bits(&gb, 3);
     if (audio_mux_version != 0 || same_time_framing != 1 || num_programs != 0 ||
         num_layers != 0) {
-        av_log(NULL, AV_LOG_WARNING, "Unsupported LATM config (%d,%d,%d,%d)\n",
-                                     audio_mux_version, same_time_framing,
-                                     num_programs, num_layers);
+        avpriv_report_missing_feature(NULL, "LATM config (%d,%d,%d,%d)",
+                                      audio_mux_version, same_time_framing,
+                                      num_programs, num_layers);
         ret = AVERROR_PATCHWELCOME;
         goto end;
     }
-    av_freep(&st->codec->extradata);
-    if (ff_alloc_extradata(st->codec, (get_bits_left(&gb) + 7)/8)) {
-        ret = AVERROR(ENOMEM);
+    ret = ff_alloc_extradata(st->codecpar, (get_bits_left(&gb) + 7)/8);
+    if (ret < 0) {
         goto end;
     }
-    for (i = 0; i < st->codec->extradata_size; i++)
-        st->codec->extradata[i] = get_bits(&gb, 8);
+    for (i = 0; i < st->codecpar->extradata_size; i++)
+        st->codecpar->extradata[i] = get_bits(&gb, 8);
 
 end:
     av_free(config);
@@ -162,7 +164,7 @@ static int latm_parse_sdp_line(AVFormatContext *s, int st_index,
     return 0;
 }
 
-RTPDynamicProtocolHandler ff_mp4a_latm_dynamic_handler = {
+const RTPDynamicProtocolHandler ff_mp4a_latm_dynamic_handler = {
     .enc_name           = "MP4A-LATM",
     .codec_type         = AVMEDIA_TYPE_AUDIO,
     .codec_id           = AV_CODEC_ID_AAC,

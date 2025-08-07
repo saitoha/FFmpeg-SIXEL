@@ -19,18 +19,16 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "config_components.h"
+
 #include <string.h>
 
 #include "avcodec.h"
-#include "ass_split.h"
 #include "ass.h"
+#include "codec_internal.h"
 #include "libavutil/avstring.h"
 #include "libavutil/internal.h"
 #include "libavutil/mem.h"
-
-typedef struct {
-    int id; ///< current event id, ReadOrder field
-} ASSEncodeContext;
 
 static av_cold int ass_encode_init(AVCodecContext *avctx)
 {
@@ -47,86 +45,46 @@ static int ass_encode_frame(AVCodecContext *avctx,
                             unsigned char *buf, int bufsize,
                             const AVSubtitle *sub)
 {
-    ASSEncodeContext *s = avctx->priv_data;
-    int i, len, total_len = 0;
+    size_t len;
 
-    for (i=0; i<sub->num_rects; i++) {
-        char ass_line[2048];
-        const char *ass = sub->rects[i]->ass;
-
-        if (sub->rects[i]->type != SUBTITLE_ASS) {
-            av_log(avctx, AV_LOG_ERROR, "Only SUBTITLE_ASS type supported.\n");
-            return -1;
-        }
-
-        if (strncmp(ass, "Dialogue: ", 10)) {
-            av_log(avctx, AV_LOG_ERROR, "AVSubtitle rectangle ass \"%s\""
-                   " does not look like a SSA markup\n", ass);
-            return AVERROR_INVALIDDATA;
-        }
-
-        if (avctx->codec->id == AV_CODEC_ID_ASS) {
-            long int layer;
-            char *p;
-
-            if (i > 0) {
-                av_log(avctx, AV_LOG_ERROR, "ASS encoder supports only one "
-                       "ASS rectangle field.\n");
-                return AVERROR_INVALIDDATA;
-            }
-
-            ass += 10; // skip "Dialogue: "
-            /* parse Layer field. If it's a Marked field, the content
-             * will be "Marked=N" instead of the layer num, so we will
-             * have layer=0, which is fine. */
-            layer = strtol(ass, &p, 10);
-
-#define SKIP_ENTRY(ptr) do {        \
-    char *sep = strchr(ptr, ',');   \
-    if (sep)                        \
-        ptr = sep + 1;              \
-} while (0)
-
-            SKIP_ENTRY(p); // skip layer or marked
-            SKIP_ENTRY(p); // skip start timestamp
-            SKIP_ENTRY(p); // skip end timestamp
-            snprintf(ass_line, sizeof(ass_line), "%d,%ld,%s", ++s->id, layer, p);
-            ass_line[strcspn(ass_line, "\r\n")] = 0;
-            ass = ass_line;
-        }
-        len = av_strlcpy(buf+total_len, ass, bufsize-total_len);
-
-        if (len > bufsize-total_len-1) {
-            av_log(avctx, AV_LOG_ERROR, "Buffer too small for ASS event.\n");
-            return -1;
-        }
-
-        total_len += len;
+    if (sub->num_rects != 1) {
+        av_log(avctx, AV_LOG_ERROR, "Only one rect per AVSubtitle is supported in ASS.\n");
+        return AVERROR_INVALIDDATA;
     }
 
-    return total_len;
+    if (sub->rects[0]->type != SUBTITLE_ASS) {
+        av_log(avctx, AV_LOG_ERROR, "Only SUBTITLE_ASS type supported.\n");
+        return AVERROR(EINVAL);
+    }
+
+    len = av_strlcpy(buf, sub->rects[0]->ass, bufsize);
+
+    if (len >= bufsize) {
+        av_log(avctx, AV_LOG_ERROR, "Buffer too small for ASS event.\n");
+        return AVERROR_BUFFER_TOO_SMALL;
+    }
+
+    return len;
 }
 
 #if CONFIG_SSA_ENCODER
-AVCodec ff_ssa_encoder = {
-    .name         = "ssa",
-    .long_name    = NULL_IF_CONFIG_SMALL("SSA (SubStation Alpha) subtitle"),
-    .type         = AVMEDIA_TYPE_SUBTITLE,
-    .id           = AV_CODEC_ID_SSA,
+const FFCodec ff_ssa_encoder = {
+    .p.name       = "ssa",
+    CODEC_LONG_NAME("ASS (Advanced SubStation Alpha) subtitle"),
+    .p.type       = AVMEDIA_TYPE_SUBTITLE,
+    .p.id         = AV_CODEC_ID_ASS,
     .init         = ass_encode_init,
-    .encode_sub   = ass_encode_frame,
-    .priv_data_size = sizeof(ASSEncodeContext),
+    FF_CODEC_ENCODE_SUB_CB(ass_encode_frame),
 };
 #endif
 
 #if CONFIG_ASS_ENCODER
-AVCodec ff_ass_encoder = {
-    .name         = "ass",
-    .long_name    = NULL_IF_CONFIG_SMALL("ASS (Advanced SubStation Alpha) subtitle"),
-    .type         = AVMEDIA_TYPE_SUBTITLE,
-    .id           = AV_CODEC_ID_ASS,
+const FFCodec ff_ass_encoder = {
+    .p.name       = "ass",
+    CODEC_LONG_NAME("ASS (Advanced SubStation Alpha) subtitle"),
+    .p.type       = AVMEDIA_TYPE_SUBTITLE,
+    .p.id         = AV_CODEC_ID_ASS,
     .init         = ass_encode_init,
-    .encode_sub   = ass_encode_frame,
-    .priv_data_size = sizeof(ASSEncodeContext),
+    FF_CODEC_ENCODE_SUB_CB(ass_encode_frame),
 };
 #endif

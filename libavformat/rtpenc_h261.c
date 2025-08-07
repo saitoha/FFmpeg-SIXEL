@@ -24,8 +24,8 @@
 
 #define RTP_H261_HEADER_SIZE 4
 
-static const uint8_t *find_resync_marker_reverse(const uint8_t *av_restrict start,
-                                                 const uint8_t *av_restrict end)
+static const uint8_t *find_resync_marker_reverse(const uint8_t *restrict start,
+                                                 const uint8_t *restrict end)
 {
     const uint8_t *p = end - 1;
     start += 1; /* Make sure we never return the original start. */
@@ -72,12 +72,12 @@ void ff_rtp_send_h261(AVFormatContext *ctx, const uint8_t *frame_buf, int frame_
         rtp_ctx->buf[2] = 0; /* quant=0, hmvd=5 */
         rtp_ctx->buf[3] = 0; /* vmvd=0 */
         if (frame_size < 2 || frame_buf[0] != 0 || frame_buf[1] != 1) {
-            /* A full, correct fix for this would be to make the H261 encoder
+            /* A full, correct fix for this would be to make the H.261 encoder
              * support inserting extra GOB headers (triggered by setting e.g.
              * "-ps 1"), and including information about macroblock boundaries
              * (such as for h263_rfc2190). */
             av_log(ctx, AV_LOG_WARNING,
-                   "RTP/H261 packet not cut at a GOB boundary, not signaled correctly\n");
+                   "RTP/H.261 packet not cut at a GOB boundary, not signaled correctly\n");
         }
 
         cur_frame_size = FFMIN(rtp_ctx->max_payload_size - RTP_H261_HEADER_SIZE, frame_size);

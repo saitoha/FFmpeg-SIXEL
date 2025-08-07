@@ -30,30 +30,25 @@
 
 #include <stdint.h>
 
-#include "libavutil/float_dsp.h"
+#include "libavutil/mem_internal.h"
+#include "libavutil/opt.h"
+#include "libavutil/tx.h"
 
 #include "ac3.h"
+#include "ac3defs.h"
 #include "ac3dsp.h"
 #include "avcodec.h"
-#include "fft.h"
+#include "codec_internal.h"
 #include "mathops.h"
 #include "me_cmp.h"
-#include "put_bits.h"
 #include "audiodsp.h"
 
-#ifndef CONFIG_AC3ENC_FLOAT
-#define CONFIG_AC3ENC_FLOAT 0
+#ifndef AC3ENC_FLOAT
+#define AC3ENC_FLOAT 0
 #endif
 
-#define OFFSET(param) offsetof(AC3EncodeContext, options.param)
-#define AC3ENC_PARAM (AV_OPT_FLAG_AUDIO_PARAM | AV_OPT_FLAG_ENCODING_PARAM)
-
-#define AC3ENC_TYPE_AC3_FIXED   0
-#define AC3ENC_TYPE_AC3         1
-#define AC3ENC_TYPE_EAC3        2
-
-#if CONFIG_AC3ENC_FLOAT
-#define AC3_NAME(x) ff_ac3_float_ ## x
+#if AC3ENC_FLOAT
+#include "libavutil/float_dsp.h"
 #define MAC_COEF(d,a,b) ((d)+=(a)*(b))
 #define COEF_MIN (-16777215.0/16777216.0)
 #define COEF_MAX ( 16777215.0/16777216.0)
@@ -62,12 +57,12 @@ typedef float SampleType;
 typedef float CoefType;
 typedef float CoefSumType;
 #else
-#define AC3_NAME(x) ff_ac3_fixed_ ## x
+#include "libavutil/fixed_dsp.h"
 #define MAC_COEF(d,a,b) MAC64(d,a,b)
 #define COEF_MIN -16777215
 #define COEF_MAX  16777215
 #define NEW_CPL_COORD_THRESHOLD 503317
-typedef int16_t SampleType;
+typedef int32_t SampleType;
 typedef int32_t CoefType;
 typedef int64_t CoefSumType;
 #endif
@@ -131,17 +126,16 @@ typedef struct AC3EncOptions {
  * Data for a single audio block.
  */
 typedef struct AC3Block {
-    CoefType **mdct_coef;                       ///< MDCT coefficients
-    int32_t  **fixed_coef;                      ///< fixed-point MDCT coefficients
-    uint8_t  **exp;                             ///< original exponents
-    uint8_t  **grouped_exp;                     ///< grouped exponents
-    int16_t  **psd;                             ///< psd per frequency bin
-    int16_t  **band_psd;                        ///< psd per critical band
-    int16_t  **mask;                            ///< masking curve
-    uint16_t **qmant;                           ///< quantized mantissas
-    uint8_t  **cpl_coord_exp;                   ///< coupling coord exponents           (cplcoexp)
-    uint8_t  **cpl_coord_mant;                  ///< coupling coord mantissas           (cplcomant)
-    uint8_t  coeff_shift[AC3_MAX_CHANNELS];     ///< fixed-point coefficient shift values
+    CoefType *mdct_coef[AC3_MAX_CHANNELS];      ///< MDCT coefficients
+    int32_t  *fixed_coef[AC3_MAX_CHANNELS];     ///< fixed-point MDCT coefficients
+    uint8_t  *exp[AC3_MAX_CHANNELS];            ///< original exponents
+    uint8_t  *grouped_exp[AC3_MAX_CHANNELS];    ///< grouped exponents
+    int16_t  *psd[AC3_MAX_CHANNELS];            ///< psd per frequency bin
+    int16_t  *band_psd[AC3_MAX_CHANNELS];       ///< psd per critical band
+    int16_t  *mask[AC3_MAX_CHANNELS];           ///< masking curve
+    uint16_t *qmant[AC3_MAX_CHANNELS];          ///< quantized mantissas
+    uint8_t  *cpl_coord_exp[AC3_MAX_CHANNELS];  ///< coupling coord exponents           (cplcoexp)
+    uint8_t  *cpl_coord_mant[AC3_MAX_CHANNELS]; ///< coupling coord mantissas           (cplcomant)
     uint8_t  new_rematrixing_strategy;          ///< send new rematrixing flags in this block
     int      num_rematrixing_bands;             ///< number of rematrixing bands
     uint8_t  rematrixing_flags[4];              ///< rematrixing flags
@@ -156,6 +150,8 @@ typedef struct AC3Block {
     int      end_freq[AC3_MAX_CHANNELS];        ///< end frequency bin                  (endmant)
 } AC3Block;
 
+struct PutBitContext;
+
 /**
  * AC-3 encoder private context.
  */
@@ -163,13 +159,16 @@ typedef struct AC3EncodeContext {
     AVClass *av_class;                      ///< AVClass used for AVOption
     AC3EncOptions options;                  ///< encoding options
     AVCodecContext *avctx;                  ///< parent AVCodecContext
-    PutBitContext pb;                       ///< bitstream writer context
     AudioDSPContext adsp;
+#if AC3ENC_FLOAT
     AVFloatDSPContext *fdsp;
+#else
+    AVFixedDSPContext *fdsp;
+#endif
     MECmpContext mecc;
     AC3DSPContext ac3dsp;                   ///< AC-3 optimized functions
-    FFTContext mdct;                        ///< FFT context for MDCT calculation
-    const SampleType *mdct_window;          ///< MDCT window function array
+    AVTXContext *tx;                        ///< FFT context for MDCT calculation
+    av_tx_fn tx_fn;
 
     AC3Block blocks[AC3_MAX_BLOCKS];        ///< per-block info
 
@@ -233,8 +232,7 @@ typedef struct AC3EncodeContext {
     int frame_bits;                         ///< all frame bits except exponents and mantissas
     int exponent_bits;                      ///< number of bits used for exponents
 
-    SampleType *windowed_samples;
-    SampleType **planar_samples;
+    uint8_t *planar_samples[AC3_MAX_CHANNELS - 1];
     uint8_t *bap_buffer;
     uint8_t *bap1_buffer;
     CoefType *mdct_coef_buffer;
@@ -245,8 +243,7 @@ typedef struct AC3EncodeContext {
     int16_t *band_psd_buffer;
     int16_t *mask_buffer;
     int16_t *qmant_buffer;
-    uint8_t *cpl_coord_exp_buffer;
-    uint8_t *cpl_coord_mant_buffer;
+    uint8_t *cpl_coord_buffer;
 
     uint8_t exp_strategy[AC3_MAX_CHANNELS][AC3_MAX_BLOCKS]; ///< exponent strategies
     uint8_t frame_exp_strategy[AC3_MAX_CHANNELS];           ///< frame exp strategy index
@@ -255,61 +252,36 @@ typedef struct AC3EncodeContext {
     uint8_t *ref_bap     [AC3_MAX_CHANNELS][AC3_MAX_BLOCKS]; ///< bit allocation pointers (bap)
     int ref_bap_set;                                         ///< indicates if ref_bap pointers have been set
 
-    /* fixed vs. float function pointers */
-    void (*mdct_end)(struct AC3EncodeContext *s);
-    int  (*mdct_init)(struct AC3EncodeContext *s);
-
-    /* fixed vs. float templated function pointers */
-    int  (*allocate_sample_buffers)(struct AC3EncodeContext *s);
+    /** fixed vs. float function pointers */
+    void (*encode_frame)(struct AC3EncodeContext *s, uint8_t * const *samples);
 
     /* AC-3 vs. E-AC-3 function pointers */
-    void (*output_frame_header)(struct AC3EncodeContext *s);
+    void (*output_frame_header)(struct AC3EncodeContext *s, struct PutBitContext *pb);
+
+    union {
+        DECLARE_ALIGNED(32, float,   mdct_window_float)[AC3_BLOCK_SIZE];
+        DECLARE_ALIGNED(32, int32_t, mdct_window_fixed)[AC3_BLOCK_SIZE];
+    };
+    union {
+        DECLARE_ALIGNED(32, float,   windowed_samples_float)[AC3_WINDOW_SIZE];
+        DECLARE_ALIGNED(32, int32_t, windowed_samples_fixed)[AC3_WINDOW_SIZE];
+    };
 } AC3EncodeContext;
 
-
-extern const uint64_t ff_ac3_channel_layouts[19];
+extern const AVChannelLayout ff_ac3_ch_layouts[19];
+extern const AVOption ff_ac3_enc_options[];
+extern const AVClass ff_ac3enc_class;
+extern const FFCodecDefault ff_ac3_enc_defaults[];
 
 int ff_ac3_encode_init(AVCodecContext *avctx);
 int ff_ac3_float_encode_init(AVCodecContext *avctx);
 
 int ff_ac3_encode_close(AVCodecContext *avctx);
 
-int ff_ac3_validate_metadata(AC3EncodeContext *s);
-
-void ff_ac3_adjust_frame_size(AC3EncodeContext *s);
 
 void ff_ac3_compute_coupling_strategy(AC3EncodeContext *s);
 
-void ff_ac3_apply_rematrixing(AC3EncodeContext *s);
-
-void ff_ac3_process_exponents(AC3EncodeContext *s);
-
-int ff_ac3_compute_bit_allocation(AC3EncodeContext *s);
-
-void ff_ac3_group_exponents(AC3EncodeContext *s);
-
-void ff_ac3_quantize_mantissas(AC3EncodeContext *s);
-
-void ff_ac3_output_frame(AC3EncodeContext *s, unsigned char *frame);
-
-
-/* prototypes for functions in ac3enc_fixed.c and ac3enc_float.c */
-
-void ff_ac3_fixed_mdct_end(AC3EncodeContext *s);
-void ff_ac3_float_mdct_end(AC3EncodeContext *s);
-
-int ff_ac3_fixed_mdct_init(AC3EncodeContext *s);
-int ff_ac3_float_mdct_init(AC3EncodeContext *s);
-
-
-/* prototypes for functions in ac3enc_template.c */
-
-int ff_ac3_fixed_allocate_sample_buffers(AC3EncodeContext *s);
-int ff_ac3_float_allocate_sample_buffers(AC3EncodeContext *s);
-
-int ff_ac3_fixed_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
-                              const AVFrame *frame, int *got_packet_ptr);
-int ff_ac3_float_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
-                              const AVFrame *frame, int *got_packet_ptr);
+int ff_ac3_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
+                        const AVFrame *frame, int *got_packet_ptr);
 
 #endif /* AVCODEC_AC3ENC_H */

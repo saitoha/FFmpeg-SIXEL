@@ -22,6 +22,7 @@
 #include "libavutil/attributes.h"
 #include "libavutil/avassert.h"
 #include "libavutil/common.h"
+#include "libavutil/mem.h"
 #include "me_cmp.h"
 #include "snow_dwt.h"
 
@@ -35,7 +36,7 @@ int ff_slice_buffer_init(slice_buffer *buf, int line_count,
     buf->line_count  = line_count;
     buf->line_width  = line_width;
     buf->data_count  = max_allocated_lines;
-    buf->line        = av_mallocz_array(line_count, sizeof(IDWTELEM *));
+    buf->line        = av_calloc(line_count, sizeof(*buf->line));
     if (!buf->line)
         return AVERROR(ENOMEM);
     buf->data_stack  = av_malloc_array(max_allocated_lines, sizeof(IDWTELEM *));
@@ -462,7 +463,7 @@ static void spatial_compose53i_dy(DWTCompose *cs, IDWTELEM *buffer,
     cs->y  += 2;
 }
 
-void ff_snow_horizontal_compose97i(IDWTELEM *b, IDWTELEM *temp, int width)
+static void snow_horizontal_compose97i(IDWTELEM *b, IDWTELEM *temp, int width)
 {
     const int w2 = (width + 1) >> 1;
     int x;
@@ -526,9 +527,9 @@ static void vertical_compose97iL1(IDWTELEM *b0, IDWTELEM *b1, IDWTELEM *b2,
         b1[i] -= (W_DM * (b0[i] + b2[i]) + W_DO) >> W_DS;
 }
 
-void ff_snow_vertical_compose97i(IDWTELEM *b0, IDWTELEM *b1, IDWTELEM *b2,
-                                 IDWTELEM *b3, IDWTELEM *b4, IDWTELEM *b5,
-                                 int width)
+static void snow_vertical_compose97i(IDWTELEM *b0, IDWTELEM *b1, IDWTELEM *b2,
+                                     IDWTELEM *b3, IDWTELEM *b4, IDWTELEM *b5,
+                                     int width)
 {
     int i;
 
@@ -625,9 +626,9 @@ static void spatial_compose97i_dy(DWTCompose *cs, IDWTELEM *buffer,
         vertical_compose97iH0(b0, b1, b2, width);
 
     if (y - 1 < (unsigned)height)
-        ff_snow_horizontal_compose97i(b0, temp, width);
+        snow_horizontal_compose97i(b0, temp, width);
     if (y + 0 < (unsigned)height)
-        ff_snow_horizontal_compose97i(b1, temp, width);
+        snow_horizontal_compose97i(b1, temp, width);
 
     cs->b0  = b2;
     cs->b1  = b3;
@@ -740,7 +741,7 @@ void ff_spatial_idwt(IDWTELEM *buffer, IDWTELEM *temp, int width, int height,
                               decomposition_count, y);
 }
 
-static inline int w_c(struct MpegEncContext *v, uint8_t *pix1, uint8_t *pix2, ptrdiff_t line_size,
+static inline int w_c(MPVEncContext *v, const uint8_t *pix1, const uint8_t *pix2, ptrdiff_t line_size,
                       int w, int h, int type)
 {
     int s, i, j;
@@ -778,10 +779,10 @@ static inline int w_c(struct MpegEncContext *v, uint8_t *pix1, uint8_t *pix2, pt
 
     for (i = 0; i < h; i++) {
         for (j = 0; j < w; j += 4) {
-            tmp[32 * i + j + 0] = (pix1[j + 0] - pix2[j + 0]) << 4;
-            tmp[32 * i + j + 1] = (pix1[j + 1] - pix2[j + 1]) << 4;
-            tmp[32 * i + j + 2] = (pix1[j + 2] - pix2[j + 2]) << 4;
-            tmp[32 * i + j + 3] = (pix1[j + 3] - pix2[j + 3]) << 4;
+            tmp[32 * i + j + 0] = (pix1[j + 0] - pix2[j + 0]) * (1 << 4);
+            tmp[32 * i + j + 1] = (pix1[j + 1] - pix2[j + 1]) * (1 << 4);
+            tmp[32 * i + j + 2] = (pix1[j + 2] - pix2[j + 2]) * (1 << 4);
+            tmp[32 * i + j + 3] = (pix1[j + 3] - pix2[j + 3]) * (1 << 4);
         }
         pix1 += line_size;
         pix2 += line_size;
@@ -809,32 +810,32 @@ static inline int w_c(struct MpegEncContext *v, uint8_t *pix1, uint8_t *pix2, pt
     return s >> 9;
 }
 
-static int w53_8_c(struct MpegEncContext *v, uint8_t *pix1, uint8_t *pix2, ptrdiff_t line_size, int h)
+static int w53_8_c(MPVEncContext *v, const uint8_t *pix1, const uint8_t *pix2, ptrdiff_t line_size, int h)
 {
     return w_c(v, pix1, pix2, line_size, 8, h, 1);
 }
 
-static int w97_8_c(struct MpegEncContext *v, uint8_t *pix1, uint8_t *pix2, ptrdiff_t line_size, int h)
+static int w97_8_c(MPVEncContext *v, const uint8_t *pix1, const uint8_t *pix2, ptrdiff_t line_size, int h)
 {
     return w_c(v, pix1, pix2, line_size, 8, h, 0);
 }
 
-static int w53_16_c(struct MpegEncContext *v, uint8_t *pix1, uint8_t *pix2, ptrdiff_t line_size, int h)
+static int w53_16_c(MPVEncContext *v, const uint8_t *pix1, const uint8_t *pix2, ptrdiff_t line_size, int h)
 {
     return w_c(v, pix1, pix2, line_size, 16, h, 1);
 }
 
-static int w97_16_c(struct MpegEncContext *v, uint8_t *pix1, uint8_t *pix2, ptrdiff_t line_size, int h)
+static int w97_16_c(MPVEncContext *v, const uint8_t *pix1, const uint8_t *pix2, ptrdiff_t line_size, int h)
 {
     return w_c(v, pix1, pix2, line_size, 16, h, 0);
 }
 
-int ff_w53_32_c(struct MpegEncContext *v, uint8_t *pix1, uint8_t *pix2, ptrdiff_t line_size, int h)
+int ff_w53_32_c(MPVEncContext *v, const uint8_t *pix1, const uint8_t *pix2, ptrdiff_t line_size, int h)
 {
     return w_c(v, pix1, pix2, line_size, 32, h, 1);
 }
 
-int ff_w97_32_c(struct MpegEncContext *v, uint8_t *pix1, uint8_t *pix2, ptrdiff_t line_size, int h)
+int ff_w97_32_c(MPVEncContext *v, const uint8_t *pix1, const uint8_t *pix2, ptrdiff_t line_size, int h)
 {
     return w_c(v, pix1, pix2, line_size, 32, h, 0);
 }
@@ -849,12 +850,11 @@ av_cold void ff_dsputil_init_dwt(MECmpContext *c)
 
 av_cold void ff_dwt_init(SnowDWTContext *c)
 {
-    c->vertical_compose97i   = ff_snow_vertical_compose97i;
-    c->horizontal_compose97i = ff_snow_horizontal_compose97i;
+    c->vertical_compose97i   = snow_vertical_compose97i;
+    c->horizontal_compose97i = snow_horizontal_compose97i;
     c->inner_add_yblock      = ff_snow_inner_add_yblock;
 
-    if (HAVE_MMX)
-        ff_dwt_init_x86(c);
+#if ARCH_X86 && HAVE_MMX
+    ff_dwt_init_x86(c);
+#endif
 }
-
-

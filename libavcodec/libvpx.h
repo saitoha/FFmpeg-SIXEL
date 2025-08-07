@@ -21,8 +21,6 @@
 #ifndef AVCODEC_LIBVPX_H
 #define AVCODEC_LIBVPX_H
 
-#include "avcodec.h"
-
-void ff_vp9_init_static(AVCodec *codec);
+#define MAX_VPX_THREADS 64
 
 #endif /* AVCODEC_LIBVPX_H */

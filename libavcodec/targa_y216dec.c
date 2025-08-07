@@ -20,7 +20,8 @@
  */
 
 #include "avcodec.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 
 static av_cold int y216_decode_init(AVCodecContext *avctx)
 {
@@ -30,12 +31,12 @@ static av_cold int y216_decode_init(AVCodecContext *avctx)
     return 0;
 }
 
-static int y216_decode_frame(AVCodecContext *avctx, void *data,
+static int y216_decode_frame(AVCodecContext *avctx, AVFrame *pic,
                              int *got_frame, AVPacket *avpkt)
 {
-    AVFrame *pic = data;
     const uint16_t *src = (uint16_t *)avpkt->data;
-    uint16_t *y, *u, *v, aligned_width = FFALIGN(avctx->width, 4);
+    uint16_t *y, *u, *v;
+    int aligned_width = FFALIGN(avctx->width, 4);
     int i, j, ret;
 
     if (avpkt->size < 4 * avctx->height * aligned_width) {
@@ -45,9 +46,6 @@ static int y216_decode_frame(AVCodecContext *avctx, void *data,
 
     if ((ret = ff_get_buffer(avctx, pic, 0)) < 0)
         return ret;
-
-    pic->key_frame = 1;
-    pic->pict_type = AV_PICTURE_TYPE_I;
 
     y = (uint16_t *)pic->data[0];
     u = (uint16_t *)pic->data[1];
@@ -72,12 +70,12 @@ static int y216_decode_frame(AVCodecContext *avctx, void *data,
     return avpkt->size;
 }
 
-AVCodec ff_targa_y216_decoder = {
-    .name         = "targa_y216",
-    .long_name    = NULL_IF_CONFIG_SMALL("Pinnacle TARGA CineWave YUV16"),
-    .type         = AVMEDIA_TYPE_VIDEO,
-    .id           = AV_CODEC_ID_TARGA_Y216,
+const FFCodec ff_targa_y216_decoder = {
+    .p.name       = "targa_y216",
+    CODEC_LONG_NAME("Pinnacle TARGA CineWave YUV16"),
+    .p.type       = AVMEDIA_TYPE_VIDEO,
+    .p.id         = AV_CODEC_ID_TARGA_Y216,
     .init         = y216_decode_init,
-    .decode       = y216_decode_frame,
-    .capabilities = CODEC_CAP_DR1,
+    FF_CODEC_DECODE_CB(y216_decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1,
 };

@@ -22,12 +22,13 @@
 #include "libavutil/intreadwrite.h"
 #include "libavutil/internal.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 #include "rawdec.h"
 
 #define LOAS_SYNC_WORD 0x2b7
 
-static int loas_probe(AVProbeData *p)
+static int loas_probe(const AVProbeData *p)
 {
     int max_frames = 0, first_frames = 0;
     int fsize, frames;
@@ -73,9 +74,9 @@ static int loas_read_header(AVFormatContext *s)
     if (!st)
         return AVERROR(ENOMEM);
 
-    st->codec->codec_type = AVMEDIA_TYPE_AUDIO;
-    st->codec->codec_id = s->iformat->raw_codec_id;
-    st->need_parsing = AVSTREAM_PARSE_FULL_RAW;
+    st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
+    st->codecpar->codec_id   = AV_CODEC_ID_AAC_LATM;
+    ffstream(st)->need_parsing = AVSTREAM_PARSE_FULL_RAW;
 
     //LCM of all possible AAC sample rates
     avpriv_set_pts_info(st, 64, 1, 28224000);
@@ -83,12 +84,14 @@ static int loas_read_header(AVFormatContext *s)
     return 0;
 }
 
-AVInputFormat ff_loas_demuxer = {
-    .name           = "loas",
-    .long_name      = NULL_IF_CONFIG_SMALL("LOAS AudioSyncStream"),
+const FFInputFormat ff_loas_demuxer = {
+    .p.name         = "loas",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("LOAS AudioSyncStream"),
+    .p.flags        = AVFMT_GENERIC_INDEX,
+    .p.priv_class   = &ff_raw_demuxer_class,
     .read_probe     = loas_probe,
     .read_header    = loas_read_header,
     .read_packet    = ff_raw_read_partial_packet,
-    .flags= AVFMT_GENERIC_INDEX,
     .raw_codec_id = AV_CODEC_ID_AAC_LATM,
+    .priv_data_size = sizeof(FFRawDemuxerContext),
 };

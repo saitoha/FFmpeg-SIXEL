@@ -23,6 +23,11 @@
 #include <pulse/error.h>
 #include "libavformat/avformat.h"
 #include "libavformat/internal.h"
+#include "libavformat/mux.h"
+#include "libavformat/version.h"
+#include "libavutil/channel_layout.h"
+#include "libavutil/frame.h"
+#include "libavutil/internal.h"
 #include "libavutil/opt.h"
 #include "libavutil/time.h"
 #include "libavutil/log.h"
@@ -333,7 +338,7 @@ static int pulse_set_volume(PulseData *s, double volume)
     pa_volume_t vol;
     const pa_sample_spec *ss = pa_stream_get_sample_spec(s->stream);
 
-    vol = pa_sw_volume_multiply(lround(volume * PA_VOLUME_NORM), s->base_volume);
+    vol = pa_sw_volume_multiply(lrint(volume * PA_VOLUME_NORM), s->base_volume);
     pa_cvolume_set(&cvol, ss->channels, PA_VOLUME_NORM);
     pa_sw_cvolume_multiply_scalar(&cvol, &cvol, vol);
     pa_threaded_mainloop_lock(s->mainloop);
@@ -351,58 +356,58 @@ static int pulse_subscribe_events(PulseData *s)
     return pulse_finish_context_operation(s, op, "pa_context_subscribe");
 }
 
-static void pulse_map_channels_to_pulse(int64_t channel_layout, pa_channel_map *channel_map)
+static void pulse_map_channels_to_pulse(const AVChannelLayout *channel_layout, pa_channel_map *channel_map)
 {
     channel_map->channels = 0;
-    if (channel_layout & AV_CH_FRONT_LEFT)
+    if (av_channel_layout_index_from_channel(channel_layout, AV_CHAN_FRONT_LEFT) >= 0)
         channel_map->map[channel_map->channels++] = PA_CHANNEL_POSITION_FRONT_LEFT;
-    if (channel_layout & AV_CH_FRONT_RIGHT)
+    if (av_channel_layout_index_from_channel(channel_layout, AV_CHAN_FRONT_RIGHT) >= 0)
         channel_map->map[channel_map->channels++] = PA_CHANNEL_POSITION_FRONT_RIGHT;
-    if (channel_layout & AV_CH_FRONT_CENTER)
+    if (av_channel_layout_index_from_channel(channel_layout, AV_CHAN_FRONT_CENTER) >= 0)
         channel_map->map[channel_map->channels++] = PA_CHANNEL_POSITION_FRONT_CENTER;
-    if (channel_layout & AV_CH_LOW_FREQUENCY)
+    if (av_channel_layout_index_from_channel(channel_layout, AV_CHAN_LOW_FREQUENCY) >= 0)
         channel_map->map[channel_map->channels++] = PA_CHANNEL_POSITION_LFE;
-    if (channel_layout & AV_CH_BACK_LEFT)
+    if (av_channel_layout_index_from_channel(channel_layout, AV_CHAN_BACK_LEFT) >= 0)
         channel_map->map[channel_map->channels++] = PA_CHANNEL_POSITION_REAR_LEFT;
-    if (channel_layout & AV_CH_BACK_RIGHT)
+    if (av_channel_layout_index_from_channel(channel_layout, AV_CHAN_BACK_RIGHT) >= 0)
         channel_map->map[channel_map->channels++] = PA_CHANNEL_POSITION_REAR_RIGHT;
-    if (channel_layout & AV_CH_FRONT_LEFT_OF_CENTER)
+    if (av_channel_layout_index_from_channel(channel_layout, AV_CHAN_FRONT_LEFT_OF_CENTER) >= 0)
         channel_map->map[channel_map->channels++] = PA_CHANNEL_POSITION_FRONT_LEFT_OF_CENTER;
-    if (channel_layout & AV_CH_FRONT_RIGHT_OF_CENTER)
+    if (av_channel_layout_index_from_channel(channel_layout, AV_CHAN_FRONT_RIGHT_OF_CENTER) >= 0)
         channel_map->map[channel_map->channels++] = PA_CHANNEL_POSITION_FRONT_RIGHT_OF_CENTER;
-    if (channel_layout & AV_CH_BACK_CENTER)
+    if (av_channel_layout_index_from_channel(channel_layout, AV_CHAN_BACK_CENTER) >= 0)
         channel_map->map[channel_map->channels++] = PA_CHANNEL_POSITION_REAR_CENTER;
-    if (channel_layout & AV_CH_SIDE_LEFT)
+    if (av_channel_layout_index_from_channel(channel_layout, AV_CHAN_SIDE_LEFT) >= 0)
         channel_map->map[channel_map->channels++] = PA_CHANNEL_POSITION_SIDE_LEFT;
-    if (channel_layout & AV_CH_SIDE_RIGHT)
+    if (av_channel_layout_index_from_channel(channel_layout, AV_CHAN_SIDE_RIGHT) >= 0)
         channel_map->map[channel_map->channels++] = PA_CHANNEL_POSITION_SIDE_RIGHT;
-    if (channel_layout & AV_CH_TOP_CENTER)
+    if (av_channel_layout_index_from_channel(channel_layout, AV_CHAN_TOP_CENTER) >= 0)
         channel_map->map[channel_map->channels++] = PA_CHANNEL_POSITION_TOP_CENTER;
-    if (channel_layout & AV_CH_TOP_FRONT_LEFT)
+    if (av_channel_layout_index_from_channel(channel_layout, AV_CHAN_TOP_FRONT_LEFT) >= 0)
         channel_map->map[channel_map->channels++] = PA_CHANNEL_POSITION_TOP_FRONT_LEFT;
-    if (channel_layout & AV_CH_TOP_FRONT_CENTER)
+    if (av_channel_layout_index_from_channel(channel_layout, AV_CHAN_TOP_FRONT_CENTER) >= 0)
         channel_map->map[channel_map->channels++] = PA_CHANNEL_POSITION_TOP_FRONT_CENTER;
-    if (channel_layout & AV_CH_TOP_FRONT_RIGHT)
+    if (av_channel_layout_index_from_channel(channel_layout, AV_CHAN_TOP_FRONT_RIGHT) >= 0)
         channel_map->map[channel_map->channels++] = PA_CHANNEL_POSITION_TOP_FRONT_RIGHT;
-    if (channel_layout & AV_CH_TOP_BACK_LEFT)
+    if (av_channel_layout_index_from_channel(channel_layout, AV_CHAN_TOP_BACK_LEFT) >= 0)
         channel_map->map[channel_map->channels++] = PA_CHANNEL_POSITION_TOP_REAR_LEFT;
-    if (channel_layout & AV_CH_TOP_BACK_CENTER)
+    if (av_channel_layout_index_from_channel(channel_layout, AV_CHAN_TOP_BACK_CENTER) >= 0)
         channel_map->map[channel_map->channels++] = PA_CHANNEL_POSITION_TOP_REAR_CENTER;
-    if (channel_layout & AV_CH_TOP_BACK_RIGHT)
+    if (av_channel_layout_index_from_channel(channel_layout, AV_CHAN_TOP_BACK_RIGHT) >= 0)
         channel_map->map[channel_map->channels++] = PA_CHANNEL_POSITION_TOP_REAR_RIGHT;
-    if (channel_layout & AV_CH_STEREO_LEFT)
+    if (av_channel_layout_index_from_channel(channel_layout, AV_CHAN_STEREO_LEFT) >= 0)
         channel_map->map[channel_map->channels++] = PA_CHANNEL_POSITION_FRONT_LEFT;
-    if (channel_layout & AV_CH_STEREO_RIGHT)
+    if (av_channel_layout_index_from_channel(channel_layout, AV_CHAN_STEREO_RIGHT) >= 0)
         channel_map->map[channel_map->channels++] = PA_CHANNEL_POSITION_FRONT_RIGHT;
-    if (channel_layout & AV_CH_WIDE_LEFT)
+    if (av_channel_layout_index_from_channel(channel_layout, AV_CHAN_WIDE_LEFT) >= 0)
         channel_map->map[channel_map->channels++] = PA_CHANNEL_POSITION_AUX0;
-    if (channel_layout & AV_CH_WIDE_RIGHT)
+    if (av_channel_layout_index_from_channel(channel_layout, AV_CHAN_WIDE_RIGHT) >= 0)
         channel_map->map[channel_map->channels++] = PA_CHANNEL_POSITION_AUX1;
-    if (channel_layout & AV_CH_SURROUND_DIRECT_LEFT)
+    if (av_channel_layout_index_from_channel(channel_layout, AV_CHAN_SURROUND_DIRECT_LEFT) >= 0)
         channel_map->map[channel_map->channels++] = PA_CHANNEL_POSITION_AUX2;
-    if (channel_layout & AV_CH_SURROUND_DIRECT_RIGHT)
+    if (av_channel_layout_index_from_channel(channel_layout, AV_CHAN_SURROUND_DIRECT_RIGHT) >= 0)
         channel_map->map[channel_map->channels++] = PA_CHANNEL_POSITION_AUX3;
-    if (channel_layout & AV_CH_LOW_FREQUENCY_2)
+    if (av_channel_layout_index_from_channel(channel_layout, AV_CHAN_LOW_FREQUENCY_2) >= 0)
         channel_map->map[channel_map->channels++] = PA_CHANNEL_POSITION_LFE;
 }
 
@@ -451,25 +456,26 @@ static av_cold int pulse_write_header(AVFormatContext *h)
                                                   PA_STREAM_AUTO_TIMING_UPDATE |
                                                   PA_STREAM_NOT_MONOTONIC;
 
-    if (h->nb_streams != 1 || h->streams[0]->codec->codec_type != AVMEDIA_TYPE_AUDIO) {
+    if (h->nb_streams != 1 || h->streams[0]->codecpar->codec_type != AVMEDIA_TYPE_AUDIO) {
         av_log(s, AV_LOG_ERROR, "Only a single audio stream is supported.\n");
         return AVERROR(EINVAL);
     }
     st = h->streams[0];
 
     if (!stream_name) {
-        if (h->filename[0])
-            stream_name = h->filename;
+        if (h->url[0])
+            stream_name = h->url;
         else
             stream_name = "Playback";
     }
     s->nonblocking = (h->flags & AVFMT_FLAG_NONBLOCK);
 
     if (s->buffer_duration) {
-        int64_t bytes = s->buffer_duration;
-        bytes *= st->codec->channels * st->codec->sample_rate *
-                 av_get_bytes_per_sample(st->codec->sample_fmt);
-        bytes /= 1000;
+        int64_t bytes = av_rescale(s->buffer_duration,
+                                   st->codecpar->ch_layout.nb_channels *
+                                    (int64_t)st->codecpar->sample_rate *
+                                    av_get_bytes_per_sample(st->codecpar->format),
+                                   1000);
         buffer_attributes.tlength = FFMAX(s->buffer_size, av_clip64(bytes, 0, UINT32_MAX - 1));
         av_log(s, AV_LOG_DEBUG,
                "Buffer duration: %ums recalculated into %"PRId64" bytes buffer.\n",
@@ -482,9 +488,9 @@ static av_cold int pulse_write_header(AVFormatContext *h)
     if (s->minreq)
         buffer_attributes.minreq = s->minreq;
 
-    sample_spec.format = ff_codec_id_to_pulse_format(st->codec->codec_id);
-    sample_spec.rate = st->codec->sample_rate;
-    sample_spec.channels = st->codec->channels;
+    sample_spec.format = ff_codec_id_to_pulse_format(st->codecpar->codec_id);
+    sample_spec.rate = st->codecpar->sample_rate;
+    sample_spec.channels = st->codecpar->ch_layout.nb_channels;
     if (!pa_sample_spec_valid(&sample_spec)) {
         av_log(s, AV_LOG_ERROR, "Invalid sample spec.\n");
         return AVERROR(EINVAL);
@@ -493,13 +499,13 @@ static av_cold int pulse_write_header(AVFormatContext *h)
     if (sample_spec.channels == 1) {
         channel_map.channels = 1;
         channel_map.map[0] = PA_CHANNEL_POSITION_MONO;
-    } else if (st->codec->channel_layout) {
-        if (av_get_channel_layout_nb_channels(st->codec->channel_layout) != st->codec->channels)
+    } else if (st->codecpar->ch_layout.order != AV_CHANNEL_ORDER_UNSPEC) {
+        if (!av_channel_layout_check(&st->codecpar->ch_layout))
             return AVERROR(EINVAL);
-        pulse_map_channels_to_pulse(st->codec->channel_layout, &channel_map);
+        pulse_map_channels_to_pulse(&st->codecpar->ch_layout, &channel_map);
         /* Unknown channel is present in channel_layout, let PulseAudio use its default. */
         if (channel_map.channels != sample_spec.channels) {
-            av_log(s, AV_LOG_WARNING, "Unknown channel. Using defaul channel map.\n");
+            av_log(s, AV_LOG_WARNING, "Unknown channel. Using default channel map.\n");
             channel_map.channels = 0;
         }
     } else
@@ -636,9 +642,8 @@ static int pulse_write_packet(AVFormatContext *h, AVPacket *pkt)
         s->timestamp += pkt->duration;
     } else {
         AVStream *st = h->streams[0];
-        AVCodecContext *codec_ctx = st->codec;
-        AVRational r = { 1, codec_ctx->sample_rate };
-        int64_t samples = pkt->size / (av_get_bytes_per_sample(codec_ctx->sample_fmt) * codec_ctx->channels);
+        AVRational r = { 1, st->codecpar->sample_rate };
+        int64_t samples = pkt->size / (av_get_bytes_per_sample(st->codecpar->format) * st->codecpar->ch_layout.nb_channels);
         s->timestamp += av_rescale_q(samples, r, st->time_base);
     }
 
@@ -677,13 +682,13 @@ static int pulse_write_frame(AVFormatContext *h, int stream_index,
 
     /* Planar formats are not supported yet. */
     if (flags & AV_WRITE_UNCODED_FRAME_QUERY)
-        return av_sample_fmt_is_planar(h->streams[stream_index]->codec->sample_fmt) ?
+        return av_sample_fmt_is_planar(h->streams[stream_index]->codecpar->format) ?
                AVERROR(EINVAL) : 0;
 
     pkt.data     = (*frame)->data[0];
-    pkt.size     = (*frame)->nb_samples * av_get_bytes_per_sample((*frame)->format) * av_frame_get_channels(*frame);
+    pkt.size     = (*frame)->nb_samples * av_get_bytes_per_sample((*frame)->format) * (*frame)->ch_layout.nb_channels;
     pkt.dts      = (*frame)->pkt_dts;
-    pkt.duration = av_frame_get_pkt_duration(*frame);
+    pkt.duration = (*frame)->duration;
     return pulse_write_packet(h, &pkt);
 }
 
@@ -771,19 +776,19 @@ static const AVOption options[] = {
 };
 
 static const AVClass pulse_muxer_class = {
-    .class_name     = "PulseAudio muxer",
+    .class_name     = "PulseAudio outdev",
     .item_name      = av_default_item_name,
     .option         = options,
     .version        = LIBAVUTIL_VERSION_INT,
     .category       = AV_CLASS_CATEGORY_DEVICE_AUDIO_OUTPUT,
 };
 
-AVOutputFormat ff_pulse_muxer = {
-    .name                 = "pulse",
-    .long_name            = NULL_IF_CONFIG_SMALL("Pulse audio output"),
+const FFOutputFormat ff_pulse_muxer = {
+    .p.name               = "pulse",
+    .p.long_name          = NULL_IF_CONFIG_SMALL("Pulse audio output"),
     .priv_data_size       = sizeof(PulseData),
-    .audio_codec          = AV_NE(AV_CODEC_ID_PCM_S16BE, AV_CODEC_ID_PCM_S16LE),
-    .video_codec          = AV_CODEC_ID_NONE,
+    .p.audio_codec        = AV_NE(AV_CODEC_ID_PCM_S16BE, AV_CODEC_ID_PCM_S16LE),
+    .p.video_codec        = AV_CODEC_ID_NONE,
     .write_header         = pulse_write_header,
     .write_packet         = pulse_write_packet,
     .write_uncoded_frame  = pulse_write_frame,
@@ -791,6 +796,7 @@ AVOutputFormat ff_pulse_muxer = {
     .get_output_timestamp = pulse_get_output_timestamp,
     .get_device_list      = pulse_get_device_list,
     .control_message      = pulse_control_message,
-    .flags                = AVFMT_NOFILE | AVFMT_ALLOW_FLUSH,
-    .priv_class           = &pulse_muxer_class,
+    .p.flags              = AVFMT_NOFILE,
+    .p.priv_class         = &pulse_muxer_class,
+    .flags_internal       = FF_OFMT_FLAG_ALLOW_FLUSH,
 };

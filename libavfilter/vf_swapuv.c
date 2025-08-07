@@ -25,15 +25,14 @@
 
 #include "libavutil/pixdesc.h"
 #include "avfilter.h"
+#include "filters.h"
 #include "formats.h"
-#include "internal.h"
 #include "video.h"
 
 static void do_swap(AVFrame *frame)
 {
     FFSWAP(uint8_t*,     frame->data[1],     frame->data[2]);
     FFSWAP(int,          frame->linesize[1], frame->linesize[2]);
-    FFSWAP(uint64_t,     frame->error[1],    frame->error[2]);
     FFSWAP(AVBufferRef*, frame->buf[1],      frame->buf[2]);
 }
 
@@ -56,10 +55,10 @@ static int is_planar_yuv(const AVPixFmtDescriptor *desc)
 
     if (desc->flags & ~(AV_PIX_FMT_FLAG_BE | AV_PIX_FMT_FLAG_PLANAR | AV_PIX_FMT_FLAG_ALPHA) ||
         desc->nb_components < 3 ||
-        (desc->comp[1].depth_minus1 != desc->comp[2].depth_minus1))
+        (desc->comp[1].depth != desc->comp[2].depth))
         return 0;
     for (i = 0; i < desc->nb_components; i++) {
-        if (desc->comp[i].offset_plus1 != 1 ||
+        if (desc->comp[i].offset != 0 ||
             desc->comp[i].shift != 0 ||
             desc->comp[i].plane != i)
             return 0;
@@ -68,42 +67,36 @@ static int is_planar_yuv(const AVPixFmtDescriptor *desc)
     return 1;
 }
 
-static int query_formats(AVFilterContext *ctx)
+static int query_formats(const AVFilterContext *ctx,
+                         AVFilterFormatsConfig **cfg_in,
+                         AVFilterFormatsConfig **cfg_out)
 {
     AVFilterFormats *formats = NULL;
-    int fmt;
+    int fmt, ret;
 
     for (fmt = 0; av_pix_fmt_desc_get(fmt); fmt++) {
         const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(fmt);
-        if (is_planar_yuv(desc))
-            ff_add_format(&formats, fmt);
+        if (is_planar_yuv(desc) && (ret = ff_add_format(&formats, fmt)) < 0)
+            return ret;
     }
 
-    return ff_set_common_formats(ctx, formats);
+    return ff_set_common_formats2(ctx, cfg_in, cfg_out, formats);
 }
 
 static const AVFilterPad swapuv_inputs[] = {
     {
         .name             = "default",
         .type             = AVMEDIA_TYPE_VIDEO,
-        .get_video_buffer = get_video_buffer,
+        .get_buffer.video = get_video_buffer,
         .filter_frame     = filter_frame,
     },
-    { NULL }
 };
 
-static const AVFilterPad swapuv_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-    { NULL }
-};
-
-AVFilter ff_vf_swapuv = {
-    .name          = "swapuv",
-    .description   = NULL_IF_CONFIG_SMALL("Swap U and V components."),
-    .query_formats = query_formats,
-    .inputs        = swapuv_inputs,
-    .outputs       = swapuv_outputs,
+const FFFilter ff_vf_swapuv = {
+    .p.name        = "swapuv",
+    .p.description = NULL_IF_CONFIG_SMALL("Swap U and V components."),
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
+    FILTER_INPUTS(swapuv_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_QUERY_FUNC2(query_formats),
 };

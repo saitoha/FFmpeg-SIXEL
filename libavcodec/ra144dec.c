@@ -24,8 +24,9 @@
 
 #include "libavutil/channel_layout.h"
 #include "avcodec.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include "get_bits.h"
-#include "internal.h"
 #include "ra144.h"
 
 
@@ -39,8 +40,8 @@ static av_cold int ra144_decode_init(AVCodecContext * avctx)
     ractx->lpc_coef[0] = ractx->lpc_tables[0];
     ractx->lpc_coef[1] = ractx->lpc_tables[1];
 
-    avctx->channels       = 1;
-    avctx->channel_layout = AV_CH_LAYOUT_MONO;
+    av_channel_layout_uninit(&avctx->ch_layout);
+    avctx->ch_layout      = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
     avctx->sample_fmt     = AV_SAMPLE_FMT_S16;
 
     return 0;
@@ -59,10 +60,9 @@ static void do_output_subblock(RA144Context *ractx, const int16_t  *lpc_coefs,
 }
 
 /** Uncompress one block (20 bytes -> 160*2 bytes). */
-static int ra144_decode_frame(AVCodecContext * avctx, void *data,
+static int ra144_decode_frame(AVCodecContext * avctx, AVFrame *frame,
                               int *got_frame_ptr, AVPacket *avpkt)
 {
-    AVFrame *frame     = data;
     const uint8_t *buf = avpkt->data;
     int buf_size = avpkt->size;
     static const uint8_t sizes[LPC_ORDER] = {6, 5, 5, 4, 4, 3, 3, 3, 3, 2};
@@ -113,7 +113,7 @@ static int ra144_decode_frame(AVCodecContext * avctx, void *data,
         do_output_subblock(ractx, block_coefs[i], refl_rms[i], &gb);
 
         for (j=0; j < BLOCKSIZE; j++)
-            *samples++ = av_clip_int16(ractx->curr_sblock[j + 10] << 2);
+            *samples++ = av_clip_int16(ractx->curr_sblock[j + 10] * (1 << 2));
     }
 
     ractx->old_energy = energy;
@@ -126,13 +126,13 @@ static int ra144_decode_frame(AVCodecContext * avctx, void *data,
     return FRAME_SIZE;
 }
 
-AVCodec ff_ra_144_decoder = {
-    .name           = "real_144",
-    .long_name      = NULL_IF_CONFIG_SMALL("RealAudio 1.0 (14.4K)"),
-    .type           = AVMEDIA_TYPE_AUDIO,
-    .id             = AV_CODEC_ID_RA_144,
+const FFCodec ff_ra_144_decoder = {
+    .p.name         = "real_144",
+    CODEC_LONG_NAME("RealAudio 1.0 (14.4K)"),
+    .p.type         = AVMEDIA_TYPE_AUDIO,
+    .p.id           = AV_CODEC_ID_RA_144,
     .priv_data_size = sizeof(RA144Context),
     .init           = ra144_decode_init,
-    .decode         = ra144_decode_frame,
-    .capabilities   = CODEC_CAP_DR1,
+    FF_CODEC_DECODE_CB(ra144_decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_CHANNEL_CONF,
 };

@@ -23,6 +23,7 @@
 #include "avio_internal.h"
 #include "internal.h"
 #include "ast.h"
+#include "mux.h"
 #include "libavutil/mathematics.h"
 #include "libavutil/opt.h"
 
@@ -37,7 +38,7 @@ typedef struct ASTMuxContext {
 
 #define CHECK_LOOP(type) \
     if (ast->loop ## type > 0) { \
-        ast->loop ## type = av_rescale_rnd(ast->loop ## type, enc->sample_rate, 1000, AV_ROUND_DOWN); \
+        ast->loop ## type = av_rescale_rnd(ast->loop ## type, par->sample_rate, 1000, AV_ROUND_DOWN); \
         if (ast->loop ## type < 0 || ast->loop ## type > UINT_MAX) { \
             av_log(s, AV_LOG_ERROR, "Invalid loop" #type " value\n"); \
             return AVERROR(EINVAL);  \
@@ -48,22 +49,15 @@ static int ast_write_header(AVFormatContext *s)
 {
     ASTMuxContext *ast = s->priv_data;
     AVIOContext *pb = s->pb;
-    AVCodecContext *enc;
+    AVCodecParameters *par = s->streams[0]->codecpar;
     unsigned int codec_tag;
 
-    if (s->nb_streams == 1) {
-        enc = s->streams[0]->codec;
-    } else {
-        av_log(s, AV_LOG_ERROR, "only one stream is supported\n");
-        return AVERROR(EINVAL);
-    }
-
-    if (enc->codec_id == AV_CODEC_ID_ADPCM_AFC) {
+    if (par->codec_id == AV_CODEC_ID_ADPCM_AFC) {
         av_log(s, AV_LOG_ERROR, "muxing ADPCM AFC is not implemented\n");
         return AVERROR_PATCHWELCOME;
     }
 
-    codec_tag = ff_codec_get_tag(ff_codec_ast_tags, enc->codec_id);
+    codec_tag = ff_codec_get_tag(ff_codec_ast_tags, par->codec_id);
     if (!codec_tag) {
         av_log(s, AV_LOG_ERROR, "unsupported codec\n");
         return AVERROR(EINVAL);
@@ -84,9 +78,9 @@ static int ast_write_header(AVFormatContext *s)
     avio_wb32(pb, 0); /* File size minus header */
     avio_wb16(pb, codec_tag);
     avio_wb16(pb, 16); /* Bit depth */
-    avio_wb16(pb, enc->channels);
+    avio_wb16(pb, par->ch_layout.nb_channels);
     avio_wb16(pb, 0); /* Loop flag */
-    avio_wb32(pb, enc->sample_rate);
+    avio_wb32(pb, par->sample_rate);
 
     ast->samples = avio_tell(pb);
     avio_wb32(pb, 0); /* Number of samples */
@@ -101,8 +95,6 @@ static int ast_write_header(AVFormatContext *s)
     avio_wb64(pb, 0);
     avio_wb32(pb, 0);
 
-    avio_flush(pb);
-
     return 0;
 }
 
@@ -110,8 +102,8 @@ static int ast_write_packet(AVFormatContext *s, AVPacket *pkt)
 {
     AVIOContext *pb = s->pb;
     ASTMuxContext *ast = s->priv_data;
-    AVCodecContext *enc = s->streams[0]->codec;
-    int size = pkt->size / enc->channels;
+    AVCodecParameters *par = s->streams[0]->codecpar;
+    int size = pkt->size / par->ch_layout.nb_channels;
 
     if (s->streams[0]->nb_frames == 0)
         ast->fbs = size;
@@ -120,9 +112,7 @@ static int ast_write_packet(AVFormatContext *s, AVPacket *pkt)
     avio_wb32(pb, size); /* Block size */
 
     /* padding */
-    avio_wb64(pb, 0);
-    avio_wb64(pb, 0);
-    avio_wb64(pb, 0);
+    ffio_fill(pb, 0, 24);
 
     avio_write(pb, pkt->data, pkt->size);
 
@@ -133,27 +123,29 @@ static int ast_write_trailer(AVFormatContext *s)
 {
     AVIOContext *pb = s->pb;
     ASTMuxContext *ast = s->priv_data;
-    AVCodecContext *enc = s->streams[0]->codec;
+    AVCodecParameters *par = s->streams[0]->codecpar;
     int64_t file_size = avio_tell(pb);
-    int64_t samples = (file_size - 64 - (32 * s->streams[0]->nb_frames)) / enc->block_align; /* PCM_S16BE_PLANAR */
+    int64_t samples = (file_size - 64 - (32 * s->streams[0]->nb_frames)) / par->block_align; /* PCM_S16BE_PLANAR */
 
     av_log(s, AV_LOG_DEBUG, "total samples: %"PRId64"\n", samples);
 
-    if (s->pb->seekable) {
+    if (s->pb->seekable & AVIO_SEEKABLE_NORMAL) {
         /* Number of samples */
         avio_seek(pb, ast->samples, SEEK_SET);
         avio_wb32(pb, samples);
 
         /* Loopstart if provided */
         if (ast->loopstart > 0) {
-        if (ast->loopstart >= samples) {
-            av_log(s, AV_LOG_WARNING, "Loopstart value is out of range and will be ignored\n");
-            ast->loopstart = -1;
+            if (ast->loopstart >= samples) {
+                av_log(s, AV_LOG_WARNING, "Loopstart value is out of range and will be ignored\n");
+                ast->loopstart = -1;
+                avio_skip(pb, 4);
+            } else {
+                avio_wb32(pb, ast->loopstart);
+            }
+        } else {
             avio_skip(pb, 4);
-        } else
-        avio_wb32(pb, ast->loopstart);
-        } else
-            avio_skip(pb, 4);
+        }
 
         /* Loopend if provided. Otherwise number of samples again */
         if (ast->loopend && ast->loopstart >= 0) {
@@ -180,7 +172,6 @@ static int ast_write_trailer(AVFormatContext *s)
         }
 
         avio_seek(pb, file_size, SEEK_SET);
-        avio_flush(pb);
     }
     return 0;
 }
@@ -199,16 +190,18 @@ static const AVClass ast_muxer_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-AVOutputFormat ff_ast_muxer = {
-    .name              = "ast",
-    .long_name         = NULL_IF_CONFIG_SMALL("AST (Audio Stream)"),
-    .extensions        = "ast",
+const FFOutputFormat ff_ast_muxer = {
+    .p.name            = "ast",
+    .p.long_name       = NULL_IF_CONFIG_SMALL("AST (Audio Stream)"),
+    .p.extensions      = "ast",
     .priv_data_size    = sizeof(ASTMuxContext),
-    .audio_codec       = AV_CODEC_ID_PCM_S16BE_PLANAR,
-    .video_codec       = AV_CODEC_ID_NONE,
+    .p.audio_codec     = AV_CODEC_ID_PCM_S16BE_PLANAR,
+    .p.video_codec     = AV_CODEC_ID_NONE,
+    .p.subtitle_codec  = AV_CODEC_ID_NONE,
+    .flags_internal    = FF_OFMT_FLAG_MAX_ONE_OF_EACH,
     .write_header      = ast_write_header,
     .write_packet      = ast_write_packet,
     .write_trailer     = ast_write_trailer,
-    .priv_class        = &ast_muxer_class,
-    .codec_tag         = (const AVCodecTag* const []){ff_codec_ast_tags, 0},
+    .p.priv_class      = &ast_muxer_class,
+    .p.codec_tag       = ff_ast_codec_tags_list,
 };

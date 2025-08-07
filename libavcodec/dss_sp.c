@@ -21,19 +21,19 @@
 
 #include "libavutil/channel_layout.h"
 #include "libavutil/common.h"
-#include "libavutil/mem.h"
-#include "libavutil/opt.h"
+#include "libavutil/mem_internal.h"
 
 #include "avcodec.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include "get_bits.h"
-#include "internal.h"
 
 #define SUBFRAMES 4
 #define PULSE_MAX 8
 
 #define DSS_SP_FRAME_SIZE        42
 #define DSS_SP_SAMPLE_COUNT     (66 * SUBFRAMES)
-#define DSS_SP_FORMULA(a, b, c) (((((a) << 15) + (b) * (c)) + 0x4000) >> 15)
+#define DSS_SP_FORMULA(a, b, c) ((int)((((a) * (1 << 15)) + (b) * (unsigned)(c)) + 0x4000) >> 15)
 
 typedef struct DssSpSubframe {
     int16_t gain;
@@ -66,7 +66,7 @@ typedef struct DssSpContext {
     int pulse_dec_mode;
 
     DECLARE_ALIGNED(16, uint8_t, bits)[DSS_SP_FRAME_SIZE +
-                                       FF_INPUT_BUFFER_PADDING_SIZE];
+                                       AV_INPUT_BUFFER_PADDING_SIZE];
 } DssSpContext;
 
 /*
@@ -290,12 +290,11 @@ static const int32_t dss_sp_sinc[67] = {
 static av_cold int dss_sp_decode_init(AVCodecContext *avctx)
 {
     DssSpContext *p = avctx->priv_data;
-    avctx->channel_layout = AV_CH_LAYOUT_MONO;
     avctx->sample_fmt     = AV_SAMPLE_FMT_S16;
-    avctx->channels       = 1;
     avctx->sample_rate    = 11025;
+    av_channel_layout_uninit(&avctx->ch_layout);
+    avctx->ch_layout      = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
 
-    memset(p->history, 0, sizeof(p->history));
     p->pulse_dec_mode = 1;
     p->avctx          = avctx;
 
@@ -499,7 +498,7 @@ static void dss_sp_scale_vector(int32_t *vec, int bits, int size)
             vec[i] = vec[i] >> -bits;
     else
         for (i = 0; i < size; i++)
-            vec[i] = vec[i] << bits;
+            vec[i] = vec[i] * (1 << bits);
 }
 
 static void dss_sp_update_buf(int32_t *hist, int32_t *vector)
@@ -524,12 +523,12 @@ static void dss_sp_shift_sq_sub(const int32_t *filter_buf,
         tmp = dst[a] * filter_buf[0];
 
         for (i = 14; i > 0; i--)
-            tmp -= error_buf[i] * filter_buf[i];
+            tmp -= error_buf[i] * (unsigned)filter_buf[i];
 
         for (i = 14; i > 0; i--)
             error_buf[i] = error_buf[i - 1];
 
-        tmp = (tmp + 4096) >> 13;
+        tmp = (int)(tmp + 4096U) >> 13;
 
         error_buf[1] = tmp;
 
@@ -740,11 +739,10 @@ static int dss_sp_decode_one_frame(DssSpContext *p,
     return 0;
 }
 
-static int dss_sp_decode_frame(AVCodecContext *avctx, void *data,
+static int dss_sp_decode_frame(AVCodecContext *avctx, AVFrame *frame,
                                int *got_frame_ptr, AVPacket *avpkt)
 {
     DssSpContext *p    = avctx->priv_data;
-    AVFrame *frame     = data;
     const uint8_t *buf = avpkt->data;
     int buf_size       = avpkt->size;
 
@@ -761,10 +759,8 @@ static int dss_sp_decode_frame(AVCodecContext *avctx, void *data,
     }
 
     frame->nb_samples = DSS_SP_SAMPLE_COUNT;
-    if ((ret = ff_get_buffer(avctx, frame, 0)) < 0) {
-        av_log(avctx, AV_LOG_ERROR, "get_buffer() failed.\n");
+    if ((ret = ff_get_buffer(avctx, frame, 0)) < 0)
         return ret;
-    }
 
     out = (int16_t *)frame->data[0];
 
@@ -775,13 +771,13 @@ static int dss_sp_decode_frame(AVCodecContext *avctx, void *data,
     return DSS_SP_FRAME_SIZE;
 }
 
-AVCodec ff_dss_sp_decoder = {
-    .name           = "dss_sp",
-    .long_name      = NULL_IF_CONFIG_SMALL("Digital Speech Standard - Standard Play mode (DSS SP)"),
-    .type           = AVMEDIA_TYPE_AUDIO,
-    .id             = AV_CODEC_ID_DSS_SP,
+const FFCodec ff_dss_sp_decoder = {
+    .p.name         = "dss_sp",
+    CODEC_LONG_NAME("Digital Speech Standard - Standard Play mode (DSS SP)"),
+    .p.type         = AVMEDIA_TYPE_AUDIO,
+    .p.id           = AV_CODEC_ID_DSS_SP,
     .priv_data_size = sizeof(DssSpContext),
     .init           = dss_sp_decode_init,
-    .decode         = dss_sp_decode_frame,
-    .capabilities   = CODEC_CAP_DR1,
+    FF_CODEC_DECODE_CB(dss_sp_decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_CHANNEL_CONF,
 };

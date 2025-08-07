@@ -26,11 +26,13 @@
  * @author Denes Balatoni  ( dbalatoni programozo hu )
  */
 
-#define BITSTREAM_READER_LE
-#include "avcodec.h"
-#include "get_bits.h"
+#include "libavutil/common.h"
+#include "libavutil/error.h"
+#include "libavutil/log.h"
+#include "libavutil/macros.h"
 
 #include "vorbis.h"
+#include "vorbis_data.h"
 
 
 /* Helper functions */
@@ -57,14 +59,9 @@ unsigned int ff_vorbis_nth_root(unsigned int x, unsigned int n)
 int ff_vorbis_len2vlc(uint8_t *bits, uint32_t *codes, unsigned num)
 {
     uint32_t exit_at_level[33] = { 404 };
-
     unsigned i, j, p, code;
 
-#ifdef DEBUG
-    GetBitContext gb;
-#endif
-
-    for (p = 0; (bits[p] == 0) && (p < num); ++p)
+    for (p = 0; (p < num) && (bits[p] == 0); ++p)
         ;
     if (p == num)
         return 0;
@@ -73,19 +70,11 @@ int ff_vorbis_len2vlc(uint8_t *bits, uint32_t *codes, unsigned num)
     if (bits[p] > 32)
         return AVERROR_INVALIDDATA;
     for (i = 0; i < bits[p]; ++i)
-        exit_at_level[i+1] = 1 << i;
-
-#ifdef DEBUG
-    av_log(NULL, AV_LOG_INFO, " %u. of %u code len %d code %d - ", p, num, bits[p], codes[p]);
-    init_get_bits(&gb, (uint8_t *)&codes[p], bits[p]);
-    for (i = 0; i < bits[p]; ++i)
-        av_log(NULL, AV_LOG_INFO, "%s", get_bits1(&gb) ? "1" : "0");
-    av_log(NULL, AV_LOG_INFO, "\n");
-#endif
+        exit_at_level[i+1] = 1u << i;
 
     ++p;
 
-    for (i = p; (bits[i] == 0) && (i < num); ++i)
+    for (i = p; (i < num) && (bits[i] == 0); ++i)
         ;
     if (i == num)
         return 0;
@@ -105,17 +94,8 @@ int ff_vorbis_len2vlc(uint8_t *bits, uint32_t *codes, unsigned num)
         exit_at_level[i] = 0;
         // construct code (append 0s to end) and introduce new exits
         for (j = i + 1 ;j <= bits[p]; ++j)
-            exit_at_level[j] = code + (1 << (j - 1));
+            exit_at_level[j] = code + (1u << (j - 1));
         codes[p] = code;
-
-#ifdef DEBUG
-        av_log(NULL, AV_LOG_INFO, " %d. code len %d code %d - ", p, bits[p], codes[p]);
-        init_get_bits(&gb, (uint8_t *)&codes[p], bits[p]);
-        for (i = 0; i < bits[p]; ++i)
-            av_log(NULL, AV_LOG_INFO, "%s", get_bits1(&gb) ? "1" : "0");
-        av_log(NULL, AV_LOG_INFO, "\n");
-#endif
-
     }
 
     //no exits should be left (underspecified tree - ie. unused valid vlcs - not allowed by SPEC)
@@ -126,7 +106,7 @@ int ff_vorbis_len2vlc(uint8_t *bits, uint32_t *codes, unsigned num)
     return 0;
 }
 
-int ff_vorbis_ready_floor1_list(AVCodecContext *avctx,
+int ff_vorbis_ready_floor1_list(void *logctx,
                                 vorbis_floor1_entry *list, int values)
 {
     int i;
@@ -152,7 +132,7 @@ int ff_vorbis_ready_floor1_list(AVCodecContext *avctx,
         int j;
         for (j = i + 1; j < values; j++) {
             if (list[i].x == list[j].x) {
-                av_log(avctx, AV_LOG_ERROR,
+                av_log(logctx, AV_LOG_ERROR,
                        "Duplicate value found in floor 1 X coordinates\n");
                 return AVERROR_INVALIDDATA;
             }

@@ -21,8 +21,10 @@
 
 #include <stdint.h>
 
+#include "libavutil/channel_layout.h"
 #include "libavutil/crc.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/thread.h"
 #include "mlp.h"
 
 const uint8_t ff_mlp_huffman_tables[3][18][2] = {
@@ -41,7 +43,27 @@ const uint8_t ff_mlp_huffman_tables[3][18][2] = {
     }
 };
 
-static int crc_init = 0;
+const ChannelInformation ff_mlp_ch_info[21] = {
+    { 0x01, 0x01, 0x00, 0x1f }, { 0x03, 0x02, 0x00, 0x1b },
+    { 0x07, 0x02, 0x01, 0x1f }, { 0x0F, 0x02, 0x02, 0x19 },
+    { 0x07, 0x02, 0x01, 0x03 }, { 0x0F, 0x02, 0x02, 0x1f },
+    { 0x1F, 0x02, 0x03, 0x01 }, { 0x07, 0x02, 0x01, 0x1a },
+    { 0x0F, 0x02, 0x02, 0x1f }, { 0x1F, 0x02, 0x03, 0x18 },
+    { 0x0F, 0x02, 0x02, 0x02 }, { 0x1F, 0x02, 0x03, 0x1f },
+    { 0x3F, 0x02, 0x04, 0x00 }, { 0x0F, 0x03, 0x01, 0x1f },
+    { 0x1F, 0x03, 0x02, 0x18 }, { 0x0F, 0x03, 0x01, 0x02 },
+    { 0x1F, 0x03, 0x02, 0x1f }, { 0x3F, 0x03, 0x03, 0x00 },
+    { 0x1F, 0x04, 0x01, 0x01 }, { 0x1F, 0x04, 0x01, 0x18 },
+    { 0x3F, 0x04, 0x02, 0x00 },
+};
+
+const AVChannelLayout ff_mlp_ch_layouts[12] = {
+    AV_CHANNEL_LAYOUT_MONO, AV_CHANNEL_LAYOUT_STEREO, AV_CHANNEL_LAYOUT_2_1,
+    AV_CHANNEL_LAYOUT_QUAD, AV_CHANNEL_LAYOUT_2POINT1, AV_CHANNEL_LAYOUT_SURROUND,
+    AV_CHANNEL_LAYOUT_4POINT0, AV_CHANNEL_LAYOUT_5POINT0_BACK, AV_CHANNEL_LAYOUT_3POINT1,
+    AV_CHANNEL_LAYOUT_4POINT1, AV_CHANNEL_LAYOUT_5POINT1_BACK, { 0 },
+};
+
 #if CONFIG_SMALL
 #define CRC_TABLE_SIZE 257
 #else
@@ -51,14 +73,17 @@ static AVCRC crc_63[CRC_TABLE_SIZE];
 static AVCRC crc_1D[CRC_TABLE_SIZE];
 static AVCRC crc_2D[CRC_TABLE_SIZE];
 
+static av_cold void mlp_init_crc(void)
+{
+    av_crc_init(crc_63, 0,  8,   0x63, sizeof(crc_63));
+    av_crc_init(crc_1D, 0,  8,   0x1D, sizeof(crc_1D));
+    av_crc_init(crc_2D, 0, 16, 0x002D, sizeof(crc_2D));
+}
+
 av_cold void ff_mlp_init_crc(void)
 {
-    if (!crc_init) {
-        av_crc_init(crc_63, 0,  8,   0x63, sizeof(crc_63));
-        av_crc_init(crc_1D, 0,  8,   0x1D, sizeof(crc_1D));
-        av_crc_init(crc_2D, 0, 16, 0x002D, sizeof(crc_2D));
-        crc_init = 1;
-    }
+    static AVOnce init_static_once = AV_ONCE_INIT;
+    ff_thread_once(&init_static_once, mlp_init_crc);
 }
 
 uint16_t ff_mlp_checksum16(const uint8_t *buf, unsigned int buf_size)

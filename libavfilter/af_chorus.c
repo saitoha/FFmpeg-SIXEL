@@ -30,10 +30,11 @@
  */
 
 #include "libavutil/avstring.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "audio.h"
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
 #include "generate_wave_table.h"
 
 typedef struct ChorusContext {
@@ -96,7 +97,8 @@ static void fill_items(char *item_str, int *nb_items, float *items)
     for (i = 0; i < *nb_items; i++) {
         char *tstr = av_strtok(p, "|", &saveptr);
         p = NULL;
-        new_nb_items += sscanf(tstr, "%f", &items[i]) == 1;
+        if (tstr)
+            new_nb_items += sscanf(tstr, "%f", &items[new_nb_items]) == 1;
     }
 
     *nb_items = new_nb_items;
@@ -153,35 +155,6 @@ static av_cold int init(AVFilterContext *ctx)
     return 0;
 }
 
-static int query_formats(AVFilterContext *ctx)
-{
-    AVFilterFormats *formats;
-    AVFilterChannelLayouts *layouts;
-    static const enum AVSampleFormat sample_fmts[] = {
-        AV_SAMPLE_FMT_FLTP, AV_SAMPLE_FMT_NONE
-    };
-    int ret;
-
-    layouts = ff_all_channel_layouts();
-    if (!layouts)
-        return AVERROR(ENOMEM);
-    ret = ff_set_common_channel_layouts(ctx, layouts);
-    if (ret < 0)
-        return ret;
-
-    formats = ff_make_format_list(sample_fmts);
-    if (!formats)
-        return AVERROR(ENOMEM);
-    ret = ff_set_common_formats(ctx, formats);
-    if (ret < 0)
-        return ret;
-
-    formats = ff_all_samplerates();
-    if (!formats)
-        return AVERROR(ENOMEM);
-    return ff_set_common_samplerates(ctx, formats);
-}
-
 static int config_output(AVFilterLink *outlink)
 {
     AVFilterContext *ctx = outlink->src;
@@ -189,7 +162,7 @@ static int config_output(AVFilterLink *outlink)
     float sum_in_volume = 1.0;
     int n;
 
-    s->channels = outlink->channels;
+    s->channels = outlink->ch_layout.nb_channels;
 
     for (n = 0; n < s->num_chorus; n++) {
         int samples = (int) ((s->delays[n] + s->depths[n]) * outlink->sample_rate / 1000.0);
@@ -212,15 +185,15 @@ static int config_output(AVFilterLink *outlink)
     if (s->in_gain * (sum_in_volume) > 1.0 / s->out_gain)
         av_log(ctx, AV_LOG_WARNING, "output gain can cause saturation or clipping of output\n");
 
-    s->counter = av_calloc(outlink->channels, sizeof(*s->counter));
+    s->counter = av_calloc(outlink->ch_layout.nb_channels, sizeof(*s->counter));
     if (!s->counter)
         return AVERROR(ENOMEM);
 
-    s->phase = av_calloc(outlink->channels, sizeof(*s->phase));
+    s->phase = av_calloc(outlink->ch_layout.nb_channels, sizeof(*s->phase));
     if (!s->phase)
         return AVERROR(ENOMEM);
 
-    for (n = 0; n < outlink->channels; n++) {
+    for (n = 0; n < outlink->ch_layout.nb_channels; n++) {
         s->phase[n] = av_calloc(s->num_chorus, sizeof(int));
         if (!s->phase[n])
             return AVERROR(ENOMEM);
@@ -229,7 +202,7 @@ static int config_output(AVFilterLink *outlink)
     s->fade_out = s->max_samples;
 
     return av_samples_alloc_array_and_samples(&s->chorusbuf, NULL,
-                                              outlink->channels,
+                                              outlink->ch_layout.nb_channels,
                                               s->max_samples,
                                               outlink->format, 0);
 }
@@ -246,13 +219,15 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
     if (av_frame_is_writable(frame)) {
         out_frame = frame;
     } else {
-        out_frame = ff_get_audio_buffer(inlink, frame->nb_samples);
-        if (!out_frame)
+        out_frame = ff_get_audio_buffer(ctx->outputs[0], frame->nb_samples);
+        if (!out_frame) {
+            av_frame_free(&frame);
             return AVERROR(ENOMEM);
+        }
         av_frame_copy_props(out_frame, frame);
     }
 
-    for (c = 0; c < inlink->channels; c++) {
+    for (c = 0; c < inlink->ch_layout.nb_channels; c++) {
         const float *src = (const float *)frame->extended_data[c];
         float *dst = (float *)out_frame->extended_data[c];
         float *chorusbuf = (float *)s->chorusbuf[c];
@@ -306,7 +281,7 @@ static int request_frame(AVFilterLink *outlink)
 
         av_samples_set_silence(frame->extended_data, 0,
                                frame->nb_samples,
-                               outlink->channels,
+                               outlink->ch_layout.nb_channels,
                                frame->format);
 
         frame->pts = s->next_pts;
@@ -353,7 +328,6 @@ static const AVFilterPad chorus_inputs[] = {
         .type         = AVMEDIA_TYPE_AUDIO,
         .filter_frame = filter_frame,
     },
-    { NULL }
 };
 
 static const AVFilterPad chorus_outputs[] = {
@@ -363,17 +337,16 @@ static const AVFilterPad chorus_outputs[] = {
         .request_frame = request_frame,
         .config_props  = config_output,
     },
-    { NULL }
 };
 
-AVFilter ff_af_chorus = {
-    .name          = "chorus",
-    .description   = NULL_IF_CONFIG_SMALL("Add a chorus effect to the audio."),
-    .query_formats = query_formats,
+const FFFilter ff_af_chorus = {
+    .p.name        = "chorus",
+    .p.description = NULL_IF_CONFIG_SMALL("Add a chorus effect to the audio."),
+    .p.priv_class  = &chorus_class,
     .priv_size     = sizeof(ChorusContext),
-    .priv_class    = &chorus_class,
     .init          = init,
     .uninit        = uninit,
-    .inputs        = chorus_inputs,
-    .outputs       = chorus_outputs,
+    FILTER_INPUTS(chorus_inputs),
+    FILTER_OUTPUTS(chorus_outputs),
+    FILTER_SINGLE_SAMPLEFMT(AV_SAMPLE_FMT_FLTP),
 };

@@ -23,11 +23,15 @@
  * ReplayGain scanner
  */
 
+#include <float.h>
+
 #include "libavutil/avassert.h"
 #include "libavutil/channel_layout.h"
+#include "libavutil/opt.h"
 #include "audio.h"
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
+#include "formats.h"
 
 #define HISTOGRAM_SLOTS 12000
 #define BUTTER_ORDER        2
@@ -306,8 +310,11 @@ static const ReplayGainFreqInfo freqinfos[] =
 };
 
 typedef struct ReplayGainContext {
+    const AVClass *class;
+
     uint32_t histogram[HISTOGRAM_SLOTS];
     float peak;
+    float gain;
     int yule_hist_i, butter_hist_i;
     const double *yule_coeff_a;
     const double *yule_coeff_b;
@@ -319,27 +326,43 @@ typedef struct ReplayGainContext {
     float butter_hist_b[256];
 } ReplayGainContext;
 
-static int query_formats(AVFilterContext *ctx)
+static int query_formats(const AVFilterContext *ctx,
+                         AVFilterFormatsConfig **cfg_in,
+                         AVFilterFormatsConfig **cfg_out)
 {
-    AVFilterFormats *formats = NULL;
-    AVFilterChannelLayouts *layout = NULL;
-    int i;
+    static const enum AVSampleFormat formats[] = {
+        AV_SAMPLE_FMT_FLT,
+        AV_SAMPLE_FMT_NONE,
+    };
+    static const AVChannelLayout layouts[] = {
+        AV_CHANNEL_LAYOUT_STEREO,
+        { .nb_channels = 0 },
+    };
 
-    ff_add_format(&formats, AV_SAMPLE_FMT_FLT);
-    ff_set_common_formats(ctx, formats);
-    ff_add_channel_layout(&layout, AV_CH_LAYOUT_STEREO);
-    ff_set_common_channel_layouts(ctx, layout);
+    AVFilterFormats *rates;
 
-    formats = NULL;
-    for (i = 0; i < FF_ARRAY_ELEMS(freqinfos); i++)
-        ff_add_format(&formats, freqinfos[i].sample_rate);
-    ff_set_common_samplerates(ctx, formats);
+    int i, ret;
 
-    return 0;
+    ret = ff_set_common_formats_from_list2(ctx, cfg_in, cfg_out, formats);
+    if (ret < 0)
+        return ret;
+
+    ret = ff_set_common_channel_layouts_from_list2(ctx, cfg_in, cfg_out, layouts);
+    if (ret < 0)
+        return ret;
+
+    rates = NULL;
+    for (i = 0; i < FF_ARRAY_ELEMS(freqinfos); i++) {
+        if ((ret = ff_add_format(&rates, freqinfos[i].sample_rate)) < 0)
+            return ret;
+    }
+
+    return ff_set_common_samplerates2(ctx, cfg_in, cfg_out, rates);
 }
 
 static int config_input(AVFilterLink *inlink)
 {
+    FilterLink *l = ff_filter_link(inlink);
     AVFilterContext *ctx = inlink->dst;
     ReplayGainContext *s = ctx->priv;
     int i;
@@ -357,9 +380,8 @@ static int config_input(AVFilterLink *inlink)
 
     s->yule_hist_i   = 20;
     s->butter_hist_i = 4;
-    inlink->partial_buf_size =
-    inlink->min_samples =
-    inlink->max_samples = inlink->sample_rate / 20;
+    l->min_samples =
+    l->max_samples = inlink->sample_rate / 20;
 
     return 0;
 }
@@ -427,7 +449,7 @@ static void butter_filter_stereo_samples(ReplayGainContext *s,
     // (slowing us down).
 
     for (j = -4; j < 0; ++j)
-        if (fabs(hist_a[i + j]) > 1e-10 || fabs(hist_b[i + j]) > 1e-10)
+        if (fabsf(hist_a[i + j]) > 1e-10f || fabsf(hist_b[i + j]) > 1e-10f)
             break;
 
     if (!j) {
@@ -476,7 +498,7 @@ static void yule_filter_stereo_samples(ReplayGainContext *s, const float *src,
     // (slowing us down).
 
     for (j = -20; j < 0; ++j)
-        if (fabs(hist_a[i + j]) > 1e-10 || fabs(hist_b[i + j]) > 1e-10)
+        if (fabsf(hist_a[i + j]) > 1e-10f || fabsf(hist_b[i + j]) > 1e-10f)
             break;
 
     if (!j) {
@@ -549,10 +571,10 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     AVFilterContext *ctx = inlink->dst;
     AVFilterLink *outlink = ctx->outputs[0];
     ReplayGainContext *s = ctx->priv;
-    uint32_t level;
+    int64_t level;
     AVFrame *out;
 
-    out = ff_get_audio_buffer(inlink, in->nb_samples);
+    out = ff_get_audio_buffer(outlink, in->nb_samples);
     if (!out) {
         av_frame_free(&in);
         return AVERROR(ENOMEM);
@@ -565,9 +587,9 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
                                                  out->nb_samples);
     butter_filter_stereo_samples(s, (float *)out->data[0],
                                              out->nb_samples);
-    level = (uint32_t)floor(100 * calc_stereo_rms((float *)out->data[0],
-                                                           out->nb_samples));
-    level = av_clip(level, 0, HISTOGRAM_SLOTS - 1);
+    level = lrint(floor(100 * calc_stereo_rms((float *)out->data[0],
+                                                           out->nb_samples)));
+    level = av_clip64(level, 0, HISTOGRAM_SLOTS - 1);
 
     s->histogram[level]++;
 
@@ -575,13 +597,22 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     return ff_filter_frame(outlink, in);
 }
 
-static av_cold void uninit(AVFilterContext *ctx)
+static int request_frame(AVFilterLink *outlink)
 {
+    AVFilterContext *ctx = outlink->src;
     ReplayGainContext *s = ctx->priv;
-    float gain = calc_replaygain(s->histogram);
+    int ret = 0;
 
-    av_log(ctx, AV_LOG_INFO, "track_gain = %+.2f dB\n", gain);
-    av_log(ctx, AV_LOG_INFO, "track_peak = %.6f\n", s->peak);
+    ret = ff_request_frame(ctx->inputs[0]);
+
+    if (ret == AVERROR_EOF) {
+        s->gain = calc_replaygain(s->histogram);
+
+        av_log(ctx, AV_LOG_INFO, "track_gain = %+.2f dB\n", s->gain);
+        av_log(ctx, AV_LOG_INFO, "track_peak = %.6f\n", s->peak);
+    }
+
+    return ret;
 }
 
 static const AVFilterPad replaygain_inputs[] = {
@@ -591,23 +622,34 @@ static const AVFilterPad replaygain_inputs[] = {
         .filter_frame = filter_frame,
         .config_props = config_input,
     },
-    { NULL }
 };
 
 static const AVFilterPad replaygain_outputs[] = {
     {
         .name = "default",
         .type = AVMEDIA_TYPE_AUDIO,
+        .request_frame = request_frame,
     },
+};
+
+#define OFFSET(x) offsetof(ReplayGainContext, x)
+#define FLAGS AV_OPT_FLAG_AUDIO_PARAM|AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_EXPORT|AV_OPT_FLAG_READONLY
+
+static const AVOption replaygain_options[] = {
+    { "track_gain", "track gain (dB)", OFFSET(gain), AV_OPT_TYPE_FLOAT,{.dbl=0}, -FLT_MAX, FLT_MAX, FLAGS },
+    { "track_peak", "track peak",      OFFSET(peak), AV_OPT_TYPE_FLOAT,{.dbl=0}, -FLT_MAX, FLT_MAX, FLAGS },
     { NULL }
 };
 
-AVFilter ff_af_replaygain = {
-    .name          = "replaygain",
-    .description   = NULL_IF_CONFIG_SMALL("ReplayGain scanner."),
-    .query_formats = query_formats,
-    .uninit        = uninit,
+AVFILTER_DEFINE_CLASS(replaygain);
+
+const FFFilter ff_af_replaygain = {
+    .p.name        = "replaygain",
+    .p.description = NULL_IF_CONFIG_SMALL("ReplayGain scanner."),
+    .p.priv_class  = &replaygain_class,
+    .p.flags       = AVFILTER_FLAG_METADATA_ONLY,
     .priv_size     = sizeof(ReplayGainContext),
-    .inputs        = replaygain_inputs,
-    .outputs       = replaygain_outputs,
+    FILTER_INPUTS(replaygain_inputs),
+    FILTER_OUTPUTS(replaygain_outputs),
+    FILTER_QUERY_FUNC2(query_formats),
 };

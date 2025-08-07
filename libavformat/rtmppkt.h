@@ -47,9 +47,9 @@ enum RTMPChannel {
 typedef enum RTMPPacketType {
     RTMP_PT_CHUNK_SIZE   =  1,  ///< chunk size change
     RTMP_PT_BYTES_READ   =  3,  ///< number of bytes read
-    RTMP_PT_PING,               ///< ping
-    RTMP_PT_SERVER_BW,          ///< server bandwidth
-    RTMP_PT_CLIENT_BW,          ///< client bandwidth
+    RTMP_PT_USER_CONTROL,       ///< user control
+    RTMP_PT_WINDOW_ACK_SIZE,    ///< window acknowledgement size
+    RTMP_PT_SET_PEER_BW,        ///< peer bandwidth
     RTMP_PT_AUDIO        =  8,  ///< audio packet
     RTMP_PT_VIDEO,              ///< video packet
     RTMP_PT_FLEX_STREAM  = 15,  ///< Flex shared stream
@@ -245,6 +245,14 @@ void ff_amf_write_null(uint8_t **dst);
 void ff_amf_write_object_start(uint8_t **dst);
 
 /**
+ * Write marker and length for AMF array to buffer.
+ *
+ * @param dst pointer to the input buffer (will be modified)
+ * @param length value to write
+ */
+void ff_amf_write_array_start(uint8_t **dst, uint32_t length);
+
+/**
  * Write string used as field name in AMF object to buffer.
  *
  * @param dst pointer to the input buffer (will be modified)
@@ -258,15 +266,6 @@ void ff_amf_write_field_name(uint8_t **dst, const char *str);
  * @param dst pointer to the input buffer (will be modified)
  */
 void ff_amf_write_object_end(uint8_t **dst);
-
-/**
- * Read AMF boolean value.
- *
- *@param[in,out] gbc GetByteContext initialized with AMF-formatted data
- *@param[out]    val 0 or 1
- *@return 0 on success or an AVERROR code on failure
-*/
-int ff_amf_read_bool(GetByteContext *gbc, int *val);
 
 /**
  * Read AMF number value.

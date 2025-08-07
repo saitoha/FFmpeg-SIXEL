@@ -20,10 +20,13 @@
 
 #define BITSTREAM_WRITER_LE
 
+#include "libavutil/channel_layout.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "avcodec.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "encode.h"
 #include "put_bits.h"
 #include "bytestream.h"
 #include "wavpackenc.h"
@@ -128,6 +131,11 @@ static av_cold int wavpack_encode_init(AVCodecContext *avctx)
 
     s->avctx = avctx;
 
+    if (avctx->ch_layout.nb_channels > 255) {
+        av_log(avctx, AV_LOG_ERROR, "Invalid channel count: %d\n", avctx->ch_layout.nb_channels);
+        return AVERROR(EINVAL);
+    }
+
     if (!avctx->frame_size) {
         int block_samples;
         if (!(avctx->sample_rate & 1))
@@ -135,10 +143,10 @@ static av_cold int wavpack_encode_init(AVCodecContext *avctx)
         else
             block_samples = avctx->sample_rate;
 
-        while (block_samples * avctx->channels > WV_MAX_SAMPLES)
+        while (block_samples * avctx->ch_layout.nb_channels > WV_MAX_SAMPLES)
             block_samples /= 2;
 
-        while (block_samples * avctx->channels < 40000)
+        while (block_samples * avctx->ch_layout.nb_channels < 40000)
             block_samples *= 2;
         avctx->frame_size = block_samples;
     } else if (avctx->frame_size && (avctx->frame_size < 128 ||
@@ -524,9 +532,9 @@ static int8_t store_weight(int weight)
 
 static int restore_weight(int8_t weight)
 {
-    int result;
+    int result = 8 * weight;
 
-    if ((result = (int) weight << 3) > 0)
+    if (result > 0)
         result += (result + 64) >> 7;
 
     return result;
@@ -632,22 +640,16 @@ static void reverse_mono_decorr(struct Decorr *dpp)
     }
 }
 
+#define count_bits(av) ((av) ? 32 - ff_clz(av) : 0)
+
 static uint32_t log2sample(uint32_t v, int limit, uint32_t *result)
 {
-    uint32_t dbits;
+    uint32_t dbits = count_bits(v);
 
     if ((v += v >> 9) < (1 << 8)) {
-        dbits = nbits_table[v];
-        *result += (dbits << 8) + wp_log2_table[(v << (9 - dbits)) & 0xff];
+        *result += (dbits << 8) + ff_wp_log2_table[(v << (9 - dbits)) & 0xff];
     } else {
-        if (v < (1 << 16))
-            dbits = nbits_table[v >> 8] + 8;
-        else if (v < (1 << 24))
-            dbits = nbits_table[v >> 16] + 16;
-        else
-            dbits = nbits_table[v >> 24] + 24;
-
-        *result += dbits = (dbits << 8) + wp_log2_table[(v >> (dbits - 9)) & 0xff];
+        *result += dbits = (dbits << 8) + ff_wp_log2_table[(v >> (dbits - 9)) & 0xff];
 
         if (limit && dbits >= limit)
             return 1;
@@ -1829,9 +1831,9 @@ static int wv_stereo(WavPackEncodeContext *s,
     log_limit = (((s->flags & MAG_MASK) >> MAG_LSB) + 4) * 256;
     log_limit = FFMIN(6912, log_limit);
 
-    if (s->joint) {
-        force_js = s->joint > 0;
-        force_ts = s->joint < 0;
+    if (s->joint != -1) {
+        force_js =  s->joint;
+        force_ts = !s->joint;
     }
 
     if ((ret = allocate_buffers(s)) < 0)
@@ -1964,14 +1966,6 @@ static int wv_stereo(WavPackEncodeContext *s,
     return 0;
 }
 
-#define count_bits(av) ( \
- (av) < (1 << 8) ? nbits_table[av] : \
-  ( \
-   (av) < (1 << 16) ? nbits_table[(av) >> 8] + 8 : \
-   ((av) < (1 << 24) ? nbits_table[(av) >> 16] + 16 : nbits_table[(av) >> 24] + 24) \
-  ) \
-)
-
 static void encode_flush(WavPackEncodeContext *s)
 {
     WavPackWords *w = &s->w;
@@ -1985,7 +1979,7 @@ static void encode_flush(WavPackEncodeContext *s)
                 put_bits(pb, 31, 0x7FFFFFFF);
                 cbits -= 31;
             } else {
-                put_bits(pb, cbits, (1 << cbits) - 1);
+                put_bits(pb, cbits, (1U << cbits) - 1);
                 cbits = 0;
             }
         } while (cbits);
@@ -2014,7 +2008,7 @@ static void encode_flush(WavPackEncodeContext *s)
                     put_bits(pb, 31, 0x7FFFFFFF);
                     cbits -= 31;
                 } else {
-                    put_bits(pb, cbits, (1 << cbits) - 1);
+                    put_bits(pb, cbits, (1U << cbits) - 1);
                     cbits = 0;
                 }
             } while (cbits);
@@ -2211,8 +2205,7 @@ static void pack_float_sample(WavPackEncodeContext *s, int32_t *sample)
         }
     } else if (shift_count) {
         if (s->float_flags & FLOAT_SHIFT_SENT) {
-            int32_t data = get_mantissa(*sample) & ((1 << shift_count) - 1);
-            put_bits(pb, shift_count, data);
+            put_sbits(pb, shift_count, get_mantissa(*sample));
         } else if (s->float_flags & FLOAT_SHIFT_SAME) {
             put_bits(pb, 1, get_mantissa(*sample) & 1);
         }
@@ -2567,7 +2560,7 @@ static int wavpack_encode_block(WavPackEncodeContext *s,
             ret = wv_mono(s, samples_l, !s->num_terms, 1);
     } else {
         for (i = 0; i < nb_samples; i++)
-            crc += (crc << 3) + (samples_l[i] << 1) + samples_l[i] + samples_r[i];
+            crc += (crc << 3) + ((uint32_t)samples_l[i] << 1) + samples_l[i] + samples_r[i];
 
         if (s->num_passes)
             ret = wv_stereo(s, samples_l, samples_r, !s->num_terms, 1);
@@ -2580,7 +2573,7 @@ static int wavpack_encode_block(WavPackEncodeContext *s,
 
     s->ch_offset += 1 + !(s->flags & WV_MONO);
 
-    if (s->ch_offset == s->avctx->channels)
+    if (s->ch_offset == s->avctx->ch_layout.nb_channels)
         s->flags |= WV_FINAL_BLOCK;
 
     bytestream2_init_writer(&pb, out, out_size);
@@ -2595,11 +2588,21 @@ static int wavpack_encode_block(WavPackEncodeContext *s,
     bytestream2_put_le32(&pb, crc);
 
     if (s->flags & WV_INITIAL_BLOCK &&
-        s->avctx->channel_layout != AV_CH_LAYOUT_MONO &&
-        s->avctx->channel_layout != AV_CH_LAYOUT_STEREO) {
+        s->avctx->ch_layout.order == AV_CHANNEL_ORDER_NATIVE &&
+        s->avctx->ch_layout.u.mask != AV_CH_LAYOUT_MONO &&
+        s->avctx->ch_layout.u.mask != AV_CH_LAYOUT_STEREO) {
         put_metadata_block(&pb, WP_ID_CHANINFO, 5);
-        bytestream2_put_byte(&pb, s->avctx->channels);
-        bytestream2_put_le32(&pb, s->avctx->channel_layout);
+        bytestream2_put_byte(&pb, s->avctx->ch_layout.nb_channels);
+        if (s->avctx->ch_layout.u.mask >> 32)
+            bytestream2_put_le32(&pb, 0);
+        else
+            bytestream2_put_le32(&pb, s->avctx->ch_layout.u.mask);
+        bytestream2_put_byte(&pb, 0);
+    } else if (s->flags & WV_INITIAL_BLOCK &&
+               s->avctx->ch_layout.order == AV_CHANNEL_ORDER_UNSPEC) {
+        put_metadata_block(&pb, WP_ID_CHANINFO, 5);
+        bytestream2_put_byte(&pb, s->avctx->ch_layout.nb_channels);
+        bytestream2_put_le32(&pb, 0);
         bytestream2_put_byte(&pb, 0);
     }
 
@@ -2787,7 +2790,7 @@ static int wavpack_encode_block(WavPackEncodeContext *s,
     }
     encode_flush(s);
     flush_put_bits(&s->pb);
-    data_size = put_bits_count(&s->pb) >> 3;
+    data_size = put_bytes_output(&s->pb);
     bytestream2_put_le24(&pb, (data_size + 1) >> 1);
     bytestream2_skip_p(&pb, data_size);
     if (data_size & 1)
@@ -2801,7 +2804,7 @@ static int wavpack_encode_block(WavPackEncodeContext *s,
         else
             pack_int32(s, s->orig_l, s->orig_r, nb_samples);
         flush_put_bits(&s->pb);
-        data_size = put_bits_count(&s->pb) >> 3;
+        data_size = put_bytes_output(&s->pb);
         bytestream2_put_le24(&pb, (data_size + 5) >> 1);
         bytestream2_put_le32(&pb, s->crc_x);
         bytestream2_skip_p(&pb, data_size);
@@ -2831,7 +2834,7 @@ static void fill_buffer(WavPackEncodeContext *s,
 
     switch (s->avctx->sample_fmt) {
     case AV_SAMPLE_FMT_U8P:
-        COPY_SAMPLES(int8_t, 0x80, 0);
+        COPY_SAMPLES(uint8_t, 0x80, 0);
         break;
     case AV_SAMPLE_FMT_S16P:
         COPY_SAMPLES(int16_t, 0, 0);
@@ -2870,20 +2873,20 @@ static int wavpack_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
                           sizeof(int32_t) * s->block_samples);
     if (!s->samples[0])
         return AVERROR(ENOMEM);
-    if (avctx->channels > 1) {
+    if (avctx->ch_layout.nb_channels > 1) {
         av_fast_padded_malloc(&s->samples[1], &s->samples_size[1],
                               sizeof(int32_t) * s->block_samples);
         if (!s->samples[1])
             return AVERROR(ENOMEM);
     }
 
-    buf_size = s->block_samples * avctx->channels * 8
-             + 200 /* for headers */;
-    if ((ret = ff_alloc_packet2(avctx, avpkt, buf_size)) < 0)
+    buf_size = s->block_samples * avctx->ch_layout.nb_channels * 8
+             + 200 * avctx->ch_layout.nb_channels /* for headers */;
+    if ((ret = ff_alloc_packet(avctx, avpkt, buf_size)) < 0)
         return ret;
     buf = avpkt->data;
 
-    for (s->ch_offset = 0; s->ch_offset < avctx->channels;) {
+    for (s->ch_offset = 0; s->ch_offset < avctx->ch_layout.nb_channels;) {
         set_samplerate(s);
 
         switch (s->avctx->sample_fmt) {
@@ -2893,7 +2896,7 @@ static int wavpack_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
         }
 
         fill_buffer(s, frame->extended_data[s->ch_offset], s->samples[0], s->block_samples);
-        if (avctx->channels - s->ch_offset == 1) {
+        if (avctx->ch_layout.nb_channels - s->ch_offset == 1) {
             s->flags |= WV_MONO;
         } else {
             s->flags |= WV_CROSS_DECORR;
@@ -2911,9 +2914,7 @@ static int wavpack_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
     }
     s->sample_index += frame->nb_samples;
 
-    avpkt->pts      = frame->pts;
     avpkt->size     = buf - avpkt->data;
-    avpkt->duration = ff_samples_to_time_base(avctx, frame->nb_samples);
     *got_packet_ptr = 1;
     return 0;
 }
@@ -2955,13 +2956,8 @@ static av_cold int wavpack_encode_close(AVCodecContext *avctx)
 #define OFFSET(x) offsetof(WavPackEncodeContext, x)
 #define FLAGS AV_OPT_FLAG_ENCODING_PARAM | AV_OPT_FLAG_AUDIO_PARAM
 static const AVOption options[] = {
-    { "joint_stereo",  "", OFFSET(joint), AV_OPT_TYPE_INT, {.i64=0},-1, 1, FLAGS, "joint" },
-    { "on",   "mid/side",   0, AV_OPT_TYPE_CONST, {.i64= 1}, 0, 0, FLAGS, "joint"},
-    { "off",  "left/right", 0, AV_OPT_TYPE_CONST, {.i64=-1}, 0, 0, FLAGS, "joint"},
-    { "auto", NULL, 0, AV_OPT_TYPE_CONST, {.i64= 0}, 0, 0, FLAGS, "joint"},
-    { "optimize_mono",        "", OFFSET(optimize_mono), AV_OPT_TYPE_INT, {.i64=0}, 0, 1, FLAGS, "opt_mono" },
-    { "on",   NULL, 0, AV_OPT_TYPE_CONST, {.i64=1}, 0, 0, FLAGS, "opt_mono"},
-    { "off",  NULL, 0, AV_OPT_TYPE_CONST, {.i64=0}, 0, 0, FLAGS, "opt_mono"},
+    { "joint_stereo",  "", OFFSET(joint), AV_OPT_TYPE_BOOL, {.i64=-1}, -1, 1, FLAGS },
+    { "optimize_mono", "", OFFSET(optimize_mono), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS },
     { NULL },
 };
 
@@ -2972,20 +2968,18 @@ static const AVClass wavpack_encoder_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-AVCodec ff_wavpack_encoder = {
-    .name           = "wavpack",
-    .long_name      = NULL_IF_CONFIG_SMALL("WavPack"),
-    .type           = AVMEDIA_TYPE_AUDIO,
-    .id             = AV_CODEC_ID_WAVPACK,
+const FFCodec ff_wavpack_encoder = {
+    .p.name         = "wavpack",
+    CODEC_LONG_NAME("WavPack"),
+    .p.type         = AVMEDIA_TYPE_AUDIO,
+    .p.id           = AV_CODEC_ID_WAVPACK,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_SMALL_LAST_FRAME |
+                      AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
     .priv_data_size = sizeof(WavPackEncodeContext),
-    .priv_class     = &wavpack_encoder_class,
+    .p.priv_class   = &wavpack_encoder_class,
     .init           = wavpack_encode_init,
-    .encode2        = wavpack_encode_frame,
+    FF_CODEC_ENCODE_CB(wavpack_encode_frame),
     .close          = wavpack_encode_close,
-    .capabilities   = CODEC_CAP_SMALL_LAST_FRAME,
-    .sample_fmts    = (const enum AVSampleFormat[]){ AV_SAMPLE_FMT_U8P,
-                                                     AV_SAMPLE_FMT_S16P,
-                                                     AV_SAMPLE_FMT_S32P,
-                                                     AV_SAMPLE_FMT_FLTP,
-                                                     AV_SAMPLE_FMT_NONE },
+    CODEC_SAMPLEFMTS(AV_SAMPLE_FMT_U8P,  AV_SAMPLE_FMT_S16P,
+                     AV_SAMPLE_FMT_S32P, AV_SAMPLE_FMT_FLTP),
 };

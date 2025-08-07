@@ -20,8 +20,9 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include <stdlib.h>
 #define CONFIG_HARDCODED_TABLES 0
+#define BUILD_TABLES
+
 #define SINETABLE_CONST
 #define SINETABLE(size) \
     float ff_sine_##size[size]
@@ -31,11 +32,9 @@
 
 int main(void)
 {
-    int i;
-
     write_fileheader();
 
-    for (i = 5; i <= 13; i++) {
+    for (int i = 5; i <= 13; i++) {
         ff_init_ff_sine_windows(i);
         printf("SINETABLE(%4i) = {\n", 1 << i);
         write_float_array(ff_sine_windows[i], 1 << i);

@@ -20,20 +20,16 @@
 
 %include "libavutil/x86/x86util.asm"
 
-SECTION_TEXT
+SECTION .text
 
-%macro SCALARPRODUCT 0
 ; int ff_scalarproduct_and_madd_int16(int16_t *v1, int16_t *v2, int16_t *v3,
 ;                                     int order, int mul)
+INIT_XMM sse2
 cglobal scalarproduct_and_madd_int16, 4,4,8, v1, v2, v3, order, mul
-    shl orderq, 1
+    shl orderd, 1
     movd    m7, mulm
-%if mmsize == 16
     pshuflw m7, m7, 0
     punpcklqdq m7, m7
-%else
-    pshufw  m7, m7, 0
-%endif
     pxor    m6, m6
     add v1q, orderq
     add v2q, orderq
@@ -61,12 +57,39 @@ cglobal scalarproduct_and_madd_int16, 4,4,8, v1, v2, v3, order, mul
     HADDD   m6, m0
     movd   eax, m6
     RET
-%endmacro
 
-INIT_MMX mmxext
-SCALARPRODUCT
-INIT_XMM sse2
-SCALARPRODUCT
+INIT_XMM sse4
+; int ff_scalarproduct_and_madd_int32(int16_t *v1, int32_t *v2, int16_t *v3,
+;                                     int order, int mul)
+cglobal scalarproduct_and_madd_int32, 4,4,8, v1, v2, v3, order, mul
+    shl orderd, 1
+    movd    m7, mulm
+    SPLATW  m7, m7
+    pxor    m6, m6
+    add v1q, orderq
+    lea v2q, [v2q + 2*orderq]
+    add v3q, orderq
+    neg orderq
+.loop:
+    mova    m3, [v1q + orderq]
+    movu    m0, [v2q + 2*orderq]
+    pmovsxwd m4, m3
+    movu    m1, [v2q + 2*orderq + mmsize]
+    movhlps m5, m3
+    movu    m2, [v3q + orderq]
+    pmovsxwd m5, m5
+    pmullw  m2, m7
+    pmulld  m0, m4
+    pmulld  m1, m5
+    paddw   m2, m3
+    paddd   m6, m0
+    paddd   m6, m1
+    mova    [v1q + orderq], m2
+    add     orderq, 16
+    jl .loop
+    HADDD   m6, m0
+    movd   eax, m6
+    RET
 
 %macro SCALARPRODUCT_LOOP 1
 align 16
@@ -117,7 +140,7 @@ align 16
 ;                                     int order, int mul)
 INIT_XMM ssse3
 cglobal scalarproduct_and_madd_int16, 4,5,10, v1, v2, v3, order, mul
-    shl orderq, 1
+    shl orderd, 1
     movd    m7, mulm
     pshuflw m7, m7, 0
     punpcklqdq m7, m7

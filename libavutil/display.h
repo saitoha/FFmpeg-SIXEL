@@ -18,21 +18,32 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+/**
+ * @file
+ * @ingroup lavu_video_display
+ * Display matrix
+ */
+
 #ifndef AVUTIL_DISPLAY_H
 #define AVUTIL_DISPLAY_H
 
 #include <stdint.h>
 
 /**
+ * @defgroup lavu_video_display Display transformation matrix functions
+ * @ingroup lavu_video
+ *
  * The display transformation matrix specifies an affine transformation that
  * should be applied to video frames for correct presentation. It is compatible
  * with the matrices stored in the ISO/IEC 14496-12 container format.
  *
  * The data is a 3x3 matrix represented as a 9-element array:
  *
+ * @code{.unparsed}
  *                                  | a b u |
  *   (a, b, u, c, d, v, x, y, w) -> | c d v |
  *                                  | x y w |
+ * @endcode
  *
  * All numbers are stored in native endianness, as 16.16 fixed-point values,
  * except for u, v and w, which are stored as 2.30 fixed-point values.
@@ -40,15 +51,23 @@
  * The transformation maps a point (p, q) in the source (pre-transformation)
  * frame to the point (p', q') in the destination (post-transformation) frame as
  * follows:
+ *
+ * @code{.unparsed}
  *               | a b u |
  *   (p, q, 1) . | c d v | = z * (p', q', 1)
  *               | x y w |
+ * @endcode
  *
  * The transformation can also be more explicitly written in components as
  * follows:
+ *
+ * @code{.unparsed}
  *   p' = (a * p + c * q + x) / z;
  *   q' = (b * p + d * q + y) / z;
  *   z  =  u * p + v * q + w
+ * @endcode
+ *
+ * @{
  */
 
 /**
@@ -65,11 +84,11 @@
 double av_display_rotation_get(const int32_t matrix[9]);
 
 /**
- * Initialize a transformation matrix describing a pure counterclockwise
+ * Initialize a transformation matrix describing a pure clockwise
  * rotation by the specified angle (in degrees).
  *
- * @param matrix an allocated transformation matrix (will be fully overwritten
- *               by this function)
+ * @param[out] matrix a transformation matrix (will be fully overwritten
+ *                    by this function)
  * @param angle rotation angle in degrees.
  */
 void av_display_rotation_set(int32_t matrix[9], double angle);
@@ -77,10 +96,14 @@ void av_display_rotation_set(int32_t matrix[9], double angle);
 /**
  * Flip the input matrix horizontally and/or vertically.
  *
- * @param matrix an allocated transformation matrix
+ * @param[in,out] matrix a transformation matrix
  * @param hflip whether the matrix should be flipped horizontally
  * @param vflip whether the matrix should be flipped vertically
  */
 void av_display_matrix_flip(int32_t matrix[9], int hflip, int vflip);
+
+/**
+ * @}
+ */
 
 #endif /* AVUTIL_DISPLAY_H */

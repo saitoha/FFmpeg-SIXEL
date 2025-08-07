@@ -19,6 +19,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "libavutil/attributes.h"
@@ -34,28 +35,32 @@ void ff_add_pixels_clamped_arm(const int16_t *block, uint8_t *dest,
 
 /* XXX: those functions should be suppressed ASAP when all IDCTs are
  * converted */
-static void j_rev_dct_arm_put(uint8_t *dest, int line_size, int16_t *block)
+static void j_rev_dct_arm_put(uint8_t *dest, ptrdiff_t line_size,
+                              int16_t *block)
 {
     ff_j_rev_dct_arm(block);
-    ff_put_pixels_clamped(block, dest, line_size);
+    ff_put_pixels_clamped_c(block, dest, line_size);
 }
 
-static void j_rev_dct_arm_add(uint8_t *dest, int line_size, int16_t *block)
+static void j_rev_dct_arm_add(uint8_t *dest, ptrdiff_t line_size,
+                              int16_t *block)
 {
     ff_j_rev_dct_arm(block);
-    ff_add_pixels_clamped(block, dest, line_size);
+    ff_add_pixels_clamped_arm(block, dest, line_size);
 }
 
-static void simple_idct_arm_put(uint8_t *dest, int line_size, int16_t *block)
+static void simple_idct_arm_put(uint8_t *dest, ptrdiff_t line_size,
+                                int16_t *block)
 {
     ff_simple_idct_arm(block);
-    ff_put_pixels_clamped(block, dest, line_size);
+    ff_put_pixels_clamped_c(block, dest, line_size);
 }
 
-static void simple_idct_arm_add(uint8_t *dest, int line_size, int16_t *block)
+static void simple_idct_arm_add(uint8_t *dest, ptrdiff_t line_size,
+                                int16_t *block)
 {
     ff_simple_idct_arm(block);
-    ff_add_pixels_clamped(block, dest, line_size);
+    ff_add_pixels_clamped_arm(block, dest, line_size);
 }
 
 av_cold void ff_idctdsp_init_arm(IDCTDSPContext *c, AVCodecContext *avctx,
@@ -64,7 +69,7 @@ av_cold void ff_idctdsp_init_arm(IDCTDSPContext *c, AVCodecContext *avctx,
     int cpu_flags = av_get_cpu_flags();
 
     if (!avctx->lowres && !high_bit_depth) {
-        if ((avctx->idct_algo == FF_IDCT_AUTO && !(avctx->flags & CODEC_FLAG_BITEXACT)) ||
+        if ((avctx->idct_algo == FF_IDCT_AUTO && !(avctx->flags & AV_CODEC_FLAG_BITEXACT)) ||
             avctx->idct_algo == FF_IDCT_ARM) {
             c->idct_put  = j_rev_dct_arm_put;
             c->idct_add  = j_rev_dct_arm_add;

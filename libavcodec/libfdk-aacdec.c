@@ -21,13 +21,21 @@
 
 #include "libavutil/channel_layout.h"
 #include "libavutil/common.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "avcodec.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 
-/* The version macro is introduced the same time as the setting enum was
- * changed, so this check should suffice. */
-#ifndef AACDECODER_LIB_VL0
+#ifdef AACDECODER_LIB_VL0
+#define FDKDEC_VER_AT_LEAST(vl0, vl1) \
+    ((AACDECODER_LIB_VL0 > vl0) || \
+     (AACDECODER_LIB_VL0 == vl0 && AACDECODER_LIB_VL1 >= vl1))
+#else
+#define FDKDEC_VER_AT_LEAST(vl0, vl1) 0
+#endif
+
+#if !FDKDEC_VER_AT_LEAST(2, 5) // < 2.5.10
 #define AAC_PCM_MAX_OUTPUT_CHANNELS AAC_PCM_OUTPUT_CHANNELS
 #endif
 
@@ -41,48 +49,69 @@ enum ConcealMethod {
 typedef struct FDKAACDecContext {
     const AVClass *class;
     HANDLE_AACDECODER handle;
-    int initialized;
     uint8_t *decoder_buffer;
+    int decoder_buffer_size;
     uint8_t *anc_buffer;
     int conceal_method;
     int drc_level;
     int drc_boost;
     int drc_heavy;
+    int drc_effect;
     int drc_cut;
+    int album_mode;
     int level_limit;
+#if FDKDEC_VER_AT_LEAST(2, 5) // 2.5.10
+    int output_delay_set;
+    int flush_samples;
+    int delay_samples;
+#endif
+    AVChannelLayout downmix_layout;
 } FDKAACDecContext;
 
 
 #define DMX_ANC_BUFFSIZE       128
-#define DECODER_MAX_CHANNELS     6
+#define DECODER_MAX_CHANNELS     8
 #define DECODER_BUFFSIZE      2048 * sizeof(INT_PCM)
 
 #define OFFSET(x) offsetof(FDKAACDecContext, x)
 #define AD AV_OPT_FLAG_AUDIO_PARAM | AV_OPT_FLAG_DECODING_PARAM
 static const AVOption fdk_aac_dec_options[] = {
-    { "conceal", "Error concealment method", OFFSET(conceal_method), AV_OPT_TYPE_INT, { .i64 = CONCEAL_METHOD_NOISE_SUBSTITUTION }, CONCEAL_METHOD_SPECTRAL_MUTING, CONCEAL_METHOD_NB - 1, AD, "conceal" },
-    { "spectral", "Spectral muting",      0, AV_OPT_TYPE_CONST, { .i64 = CONCEAL_METHOD_SPECTRAL_MUTING },      INT_MIN, INT_MAX, AD, "conceal" },
-    { "noise",    "Noise Substitution",   0, AV_OPT_TYPE_CONST, { .i64 = CONCEAL_METHOD_NOISE_SUBSTITUTION },   INT_MIN, INT_MAX, AD, "conceal" },
-    { "energy",   "Energy Interpolation", 0, AV_OPT_TYPE_CONST, { .i64 = CONCEAL_METHOD_ENERGY_INTERPOLATION }, INT_MIN, INT_MAX, AD, "conceal" },
+    { "conceal", "Error concealment method", OFFSET(conceal_method), AV_OPT_TYPE_INT, { .i64 = CONCEAL_METHOD_NOISE_SUBSTITUTION }, CONCEAL_METHOD_SPECTRAL_MUTING, CONCEAL_METHOD_NB - 1, AD, .unit = "conceal" },
+    { "spectral", "Spectral muting",      0, AV_OPT_TYPE_CONST, { .i64 = CONCEAL_METHOD_SPECTRAL_MUTING },      INT_MIN, INT_MAX, AD, .unit = "conceal" },
+    { "noise",    "Noise Substitution",   0, AV_OPT_TYPE_CONST, { .i64 = CONCEAL_METHOD_NOISE_SUBSTITUTION },   INT_MIN, INT_MAX, AD, .unit = "conceal" },
+    { "energy",   "Energy Interpolation", 0, AV_OPT_TYPE_CONST, { .i64 = CONCEAL_METHOD_ENERGY_INTERPOLATION }, INT_MIN, INT_MAX, AD, .unit = "conceal" },
     { "drc_boost", "Dynamic Range Control: boost, where [0] is none and [127] is max boost",
-                     OFFSET(drc_boost),      AV_OPT_TYPE_INT,   { .i64 = -1 }, -1, 127, AD, NULL    },
+                     OFFSET(drc_boost),      AV_OPT_TYPE_INT,   { .i64 = -1 }, -1, 127, AD, .unit = NULL    },
     { "drc_cut",   "Dynamic Range Control: attenuation factor, where [0] is none and [127] is max compression",
-                     OFFSET(drc_cut),        AV_OPT_TYPE_INT,   { .i64 = -1 }, -1, 127, AD, NULL    },
-    { "drc_level", "Dynamic Range Control: reference level, quantized to 0.25dB steps where [0] is 0dB and [127] is -31.75dB",
-                     OFFSET(drc_level),      AV_OPT_TYPE_INT,   { .i64 = -1},  -1, 127, AD, NULL    },
+                     OFFSET(drc_cut),        AV_OPT_TYPE_INT,   { .i64 = -1 }, -1, 127, AD, .unit = NULL    },
+    { "drc_level", "Dynamic Range Control: reference level, quantized to 0.25dB steps where [0] is 0dB and [127] is -31.75dB, -1 for auto, and -2 for disabled",
+                     OFFSET(drc_level),      AV_OPT_TYPE_INT,   { .i64 = -1},  -2, 127, AD, .unit = NULL    },
     { "drc_heavy", "Dynamic Range Control: heavy compression, where [1] is on (RF mode) and [0] is off",
-                     OFFSET(drc_heavy),      AV_OPT_TYPE_INT,   { .i64 = -1},  -1, 1,   AD, NULL    },
-#ifdef AACDECODER_LIB_VL0
-    { "level_limit", "Signal level limiting", OFFSET(level_limit), AV_OPT_TYPE_INT, { .i64 = 0 }, -1, 1, AD },
+                     OFFSET(drc_heavy),      AV_OPT_TYPE_INT,   { .i64 = -1},  -1, 1,   AD, .unit = NULL    },
+#if FDKDEC_VER_AT_LEAST(2, 5) // 2.5.10
+    { "level_limit", "Signal level limiting",
+                     OFFSET(level_limit),    AV_OPT_TYPE_BOOL,  { .i64 = -1 }, -1, 1, AD },
 #endif
+#if FDKDEC_VER_AT_LEAST(3, 0) // 3.0.0
+    { "drc_effect","Dynamic Range Control: effect type, where e.g. [0] is none and [6] is general",
+                     OFFSET(drc_effect),     AV_OPT_TYPE_INT,   { .i64 = -1},  -1, 8,   AD, .unit = NULL    },
+#endif
+#if FDKDEC_VER_AT_LEAST(3, 1) // 3.1.0
+    { "album_mode","Dynamic Range Control: album mode, where [0] is off and [1] is on",
+                     OFFSET(album_mode),     AV_OPT_TYPE_INT,   { .i64 = -1},  -1, 1,   AD, .unit = NULL    },
+#endif
+    { "downmix", "Request a specific channel layout from the decoder", OFFSET(downmix_layout), AV_OPT_TYPE_CHLAYOUT, {.str = NULL}, .flags = AD },
     { NULL }
 };
 
 static const AVClass fdk_aac_dec_class = {
-    "libfdk-aac decoder", av_default_item_name, fdk_aac_dec_options, LIBAVUTIL_VERSION_INT
+    .class_name = "libfdk-aac decoder",
+    .item_name  = av_default_item_name,
+    .option     = fdk_aac_dec_options,
+    .version    = LIBAVUTIL_VERSION_INT,
 };
 
-static int get_stream_info(AVCodecContext *avctx)
+static int get_stream_info(AVCodecContext *avctx, AVFrame *frame)
 {
     FDKAACDecContext *s   = avctx->priv_data;
     CStreamInfo *info     = aacDecoder_GetStreamInfo(s->handle);
@@ -101,6 +130,17 @@ static int get_stream_info(AVCodecContext *avctx)
     }
     avctx->sample_rate = info->sampleRate;
     avctx->frame_size  = info->frameSize;
+    avctx->profile     = info->aot - 1;
+
+    frame->flags |= AV_FRAME_FLAG_KEY * !!(info->flags & AC_INDEP);
+#if FDKDEC_VER_AT_LEAST(2, 5) // 2.5.10
+    if (!s->output_delay_set && info->outputDelay) {
+        // Set this only once.
+        s->flush_samples    = info->outputDelay;
+        s->delay_samples    = info->outputDelay;
+        s->output_delay_set = 1;
+    }
+#endif
 
     for (i = 0; i < info->numChannels; i++) {
         AUDIO_CHANNEL_TYPE ctype = info->pChannelType[i];
@@ -178,17 +218,15 @@ static int get_stream_info(AVCodecContext *avctx)
             ch_error = 1;
         }
     }
-    if (!ch_error &&
-        av_get_channel_layout_nb_channels(ch_layout) != info->numChannels) {
+
+    av_channel_layout_uninit(&avctx->ch_layout);
+    av_channel_layout_from_mask(&avctx->ch_layout, ch_layout);
+    if (!ch_error && avctx->ch_layout.nb_channels != info->numChannels) {
         av_log(avctx, AV_LOG_WARNING, "unsupported channel configuration\n");
         ch_error = 1;
     }
     if (ch_error)
-        avctx->channel_layout = 0;
-    else
-        avctx->channel_layout = ch_layout;
-
-    avctx->channels = info->numChannels;
+        avctx->ch_layout.order = AV_CHANNEL_ORDER_UNSPEC;
 
     return 0;
 }
@@ -209,7 +247,6 @@ static av_cold int fdk_aac_decode_init(AVCodecContext *avctx)
 {
     FDKAACDecContext *s = avctx->priv_data;
     AAC_DECODER_ERROR err;
-    int ret;
 
     s->handle = aacDecoder_Open(avctx->extradata_size ? TT_MP4_RAW : TT_MP4_ADTS, 1);
     if (!s->handle) {
@@ -231,11 +268,11 @@ static av_cold int fdk_aac_decode_init(AVCodecContext *avctx)
         return AVERROR_UNKNOWN;
     }
 
-    if (avctx->request_channel_layout > 0 &&
-        avctx->request_channel_layout != AV_CH_LAYOUT_NATIVE) {
+    if (s->downmix_layout.nb_channels > 0 &&
+        s->downmix_layout.order != AV_CHANNEL_ORDER_NATIVE) {
         int downmix_channels = -1;
 
-        switch (avctx->request_channel_layout) {
+        switch (s->downmix_layout.u.mask) {
         case AV_CH_LAYOUT_STEREO:
         case AV_CH_LAYOUT_STEREO_DOWNMIX:
             downmix_channels = 2;
@@ -244,7 +281,7 @@ static av_cold int fdk_aac_decode_init(AVCodecContext *avctx)
             downmix_channels = 1;
             break;
         default:
-            av_log(avctx, AV_LOG_WARNING, "Invalid request_channel_layout\n");
+            av_log(avctx, AV_LOG_WARNING, "Invalid downmix option\n");
             break;
         }
 
@@ -256,13 +293,11 @@ static av_cold int fdk_aac_decode_init(AVCodecContext *avctx)
                s->anc_buffer = av_malloc(DMX_ANC_BUFFSIZE);
                if (!s->anc_buffer) {
                    av_log(avctx, AV_LOG_ERROR, "Unable to allocate ancillary buffer for the decoder\n");
-                   ret = AVERROR(ENOMEM);
-                   goto fail;
+                   return AVERROR(ENOMEM);
                }
                if (aacDecoder_AncDataInit(s->handle, s->anc_buffer, DMX_ANC_BUFFSIZE)) {
                    av_log(avctx, AV_LOG_ERROR, "Unable to register downmix ancillary buffer in the decoder\n");
-                   ret = AVERROR_UNKNOWN;
-                   goto fail;
+                   return AVERROR_UNKNOWN;
                }
             }
         }
@@ -283,6 +318,12 @@ static av_cold int fdk_aac_decode_init(AVCodecContext *avctx)
     }
 
     if (s->drc_level != -1) {
+        // This option defaults to -1, i.e. not calling
+        // aacDecoder_SetParam(AAC_DRC_REFERENCE_LEVEL) at all, which defaults
+        // to the level from DRC metadata, if available. The user can set
+        // -drc_level -2, which calls aacDecoder_SetParam(
+        // AAC_DRC_REFERENCE_LEVEL) with a negative value, which then
+        // explicitly disables the feature.
         if (aacDecoder_SetParam(s->handle, AAC_DRC_REFERENCE_LEVEL, s->drc_level) != AAC_DEC_OK) {
             av_log(avctx, AV_LOG_ERROR, "Unable to set DRC reference level in the decoder\n");
             return AVERROR_UNKNOWN;
@@ -296,63 +337,74 @@ static av_cold int fdk_aac_decode_init(AVCodecContext *avctx)
         }
     }
 
-#ifdef AACDECODER_LIB_VL0
+#if FDKDEC_VER_AT_LEAST(2, 5) // 2.5.10
+    // Setting this parameter to -1 enables the auto behaviour in the library.
     if (aacDecoder_SetParam(s->handle, AAC_PCM_LIMITER_ENABLE, s->level_limit) != AAC_DEC_OK) {
         av_log(avctx, AV_LOG_ERROR, "Unable to set in signal level limiting in the decoder\n");
         return AVERROR_UNKNOWN;
     }
 #endif
 
+#if FDKDEC_VER_AT_LEAST(3, 0) // 3.0.0
+    if (s->drc_effect != -1) {
+        if (aacDecoder_SetParam(s->handle, AAC_UNIDRC_SET_EFFECT, s->drc_effect) != AAC_DEC_OK) {
+            av_log(avctx, AV_LOG_ERROR, "Unable to set DRC effect type in the decoder\n");
+            return AVERROR_UNKNOWN;
+        }
+    }
+#endif
+
+#if FDKDEC_VER_AT_LEAST(3, 1) // 3.1.0
+    if (s->album_mode != -1) {
+        if (aacDecoder_SetParam(s->handle, AAC_UNIDRC_ALBUM_MODE, s->album_mode) != AAC_DEC_OK) {
+            av_log(avctx, AV_LOG_ERROR, "Unable to set album mode in the decoder\n");
+            return AVERROR_UNKNOWN;
+        }
+    }
+#endif
+
     avctx->sample_fmt = AV_SAMPLE_FMT_S16;
 
+    s->decoder_buffer_size = DECODER_BUFFSIZE * DECODER_MAX_CHANNELS;
+    s->decoder_buffer = av_malloc(s->decoder_buffer_size);
+    if (!s->decoder_buffer)
+        return AVERROR(ENOMEM);
+
     return 0;
-fail:
-    fdk_aac_decode_close(avctx);
-    return ret;
 }
 
-static int fdk_aac_decode_frame(AVCodecContext *avctx, void *data,
+static int fdk_aac_decode_frame(AVCodecContext *avctx, AVFrame *frame,
                                 int *got_frame_ptr, AVPacket *avpkt)
 {
     FDKAACDecContext *s = avctx->priv_data;
-    AVFrame *frame = data;
     int ret;
     AAC_DECODER_ERROR err;
     UINT valid = avpkt->size;
-    uint8_t *buf, *tmpptr = NULL;
-    int buf_size;
+    UINT flags = 0;
+    int input_offset = 0;
 
-    err = aacDecoder_Fill(s->handle, &avpkt->data, &avpkt->size, &valid);
-    if (err != AAC_DEC_OK) {
-        av_log(avctx, AV_LOG_ERROR, "aacDecoder_Fill() failed: %x\n", err);
-        return AVERROR_INVALIDDATA;
-    }
-
-    if (s->initialized) {
-        frame->nb_samples = avctx->frame_size;
-        if ((ret = ff_get_buffer(avctx, frame, 0)) < 0)
-            return ret;
-
-        if (s->anc_buffer) {
-            buf_size = DECODER_BUFFSIZE * DECODER_MAX_CHANNELS;
-            buf = s->decoder_buffer;
-        } else {
-            buf = frame->extended_data[0];
-            buf_size = avctx->channels * frame->nb_samples *
-                       av_get_bytes_per_sample(avctx->sample_fmt);
+    if (avpkt->size) {
+        err = aacDecoder_Fill(s->handle, &avpkt->data, &avpkt->size, &valid);
+        if (err != AAC_DEC_OK) {
+            av_log(avctx, AV_LOG_ERROR, "aacDecoder_Fill() failed: %x\n", err);
+            return AVERROR_INVALIDDATA;
         }
     } else {
-        buf_size = DECODER_BUFFSIZE * DECODER_MAX_CHANNELS;
-
-        if (!s->decoder_buffer)
-            s->decoder_buffer = av_malloc(buf_size);
-        if (!s->decoder_buffer)
-            return AVERROR(ENOMEM);
-
-        buf = tmpptr = s->decoder_buffer;
+#if FDKDEC_VER_AT_LEAST(2, 5) // 2.5.10
+        /* Handle decoder draining */
+        if (s->flush_samples > 0) {
+            flags |= AACDEC_FLUSH;
+        } else {
+            return AVERROR_EOF;
+        }
+#else
+        return AVERROR_EOF;
+#endif
     }
 
-    err = aacDecoder_DecodeFrame(s->handle, (INT_PCM *) buf, buf_size, 0);
+    err = aacDecoder_DecodeFrame(s->handle, (INT_PCM *) s->decoder_buffer,
+                                 s->decoder_buffer_size / sizeof(INT_PCM),
+                                 flags);
     if (err == AAC_DEC_NOT_ENOUGH_BITS) {
         ret = avpkt->size - valid;
         goto end;
@@ -364,26 +416,41 @@ static int fdk_aac_decode_frame(AVCodecContext *avctx, void *data,
         goto end;
     }
 
-    if (!s->initialized) {
-        if ((ret = get_stream_info(avctx)) < 0)
-            goto end;
-        s->initialized = 1;
-        frame->nb_samples = avctx->frame_size;
-    }
+    if ((ret = get_stream_info(avctx, frame)) < 0)
+        goto end;
+    frame->nb_samples = avctx->frame_size;
 
-    if (tmpptr) {
-        frame->nb_samples = avctx->frame_size;
-        if ((ret = ff_get_buffer(avctx, frame, 0)) < 0)
-            goto end;
+#if FDKDEC_VER_AT_LEAST(2, 5) // 2.5.10
+    if (flags & AACDEC_FLUSH) {
+        // Only return the right amount of samples at the end; if calling the
+        // decoder with AACDEC_FLUSH, it will keep returning frames indefinitely.
+        frame->nb_samples = FFMIN(s->flush_samples, frame->nb_samples);
+        av_log(s, AV_LOG_DEBUG, "Returning %d/%d delayed samples.\n",
+                                frame->nb_samples, s->flush_samples);
+        s->flush_samples -= frame->nb_samples;
+    } else {
+        // Trim off samples from the start to compensate for extra decoder
+        // delay. We could also just adjust the pts, but this avoids
+        // including the extra samples in the output altogether.
+        if (s->delay_samples) {
+            int drop_samples = FFMIN(s->delay_samples, frame->nb_samples);
+            av_log(s, AV_LOG_DEBUG, "Dropping %d/%d delayed samples.\n",
+                                    drop_samples, s->delay_samples);
+            s->delay_samples  -= drop_samples;
+            frame->nb_samples -= drop_samples;
+            input_offset = drop_samples * avctx->ch_layout.nb_channels;
+            if (frame->nb_samples <= 0)
+                return 0;
+        }
     }
-    if (s->decoder_buffer) {
-        memcpy(frame->extended_data[0], buf,
-               avctx->channels * avctx->frame_size *
-               av_get_bytes_per_sample(avctx->sample_fmt));
+#endif
 
-        if (!s->anc_buffer)
-            av_freep(&s->decoder_buffer);
-    }
+    if ((ret = ff_get_buffer(avctx, frame, 0)) < 0)
+        goto end;
+
+    memcpy(frame->extended_data[0], s->decoder_buffer + input_offset,
+           avctx->ch_layout.nb_channels * frame->nb_samples *
+           av_get_bytes_per_sample(avctx->sample_fmt));
 
     *got_frame_ptr = 1;
     ret = avpkt->size - valid;
@@ -405,16 +472,22 @@ static av_cold void fdk_aac_decode_flush(AVCodecContext *avctx)
         av_log(avctx, AV_LOG_WARNING, "failed to clear buffer when flushing\n");
 }
 
-AVCodec ff_libfdk_aac_decoder = {
-    .name           = "libfdk_aac",
-    .long_name      = NULL_IF_CONFIG_SMALL("Fraunhofer FDK AAC"),
-    .type           = AVMEDIA_TYPE_AUDIO,
-    .id             = AV_CODEC_ID_AAC,
+const FFCodec ff_libfdk_aac_decoder = {
+    .p.name         = "libfdk_aac",
+    CODEC_LONG_NAME("Fraunhofer FDK AAC"),
+    .p.type         = AVMEDIA_TYPE_AUDIO,
+    .p.id           = AV_CODEC_ID_AAC,
     .priv_data_size = sizeof(FDKAACDecContext),
     .init           = fdk_aac_decode_init,
-    .decode         = fdk_aac_decode_frame,
+    FF_CODEC_DECODE_CB(fdk_aac_decode_frame),
     .close          = fdk_aac_decode_close,
     .flush          = fdk_aac_decode_flush,
-    .capabilities   = CODEC_CAP_DR1 | CODEC_CAP_CHANNEL_CONF,
-    .priv_class     = &fdk_aac_dec_class,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_CHANNEL_CONF
+#if FDKDEC_VER_AT_LEAST(2, 5) // 2.5.10
+                      | AV_CODEC_CAP_DELAY
+#endif
+    ,
+    .p.priv_class   = &fdk_aac_dec_class,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
+    .p.wrapper_name = "libfdk",
 };

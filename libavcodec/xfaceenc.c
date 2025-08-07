@@ -26,7 +26,8 @@
 
 #include "xface.h"
 #include "avcodec.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "encode.h"
 #include "libavutil/avassert.h"
 
 typedef struct XFaceContext {
@@ -124,16 +125,6 @@ static void encode_block(char *bitmap, int w, int h, int level, ProbRangesQueue 
     }
 }
 
-static av_cold int xface_encode_init(AVCodecContext *avctx)
-{
-    avctx->coded_frame = av_frame_alloc();
-    if (!avctx->coded_frame)
-        return AVERROR(ENOMEM);
-    avctx->coded_frame->pict_type = AV_PICTURE_TYPE_I;
-
-    return 0;
-}
-
 static void push_integer(BigInt *b, const ProbRange *prange)
 {
     uint8_t r;
@@ -205,7 +196,7 @@ static int xface_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
         intbuf[i++] = r + XFACE_FIRST_PRINT;
     }
 
-    if ((ret = ff_alloc_packet2(avctx, pkt, i+2)) < 0)
+    if ((ret = ff_get_encode_buffer(avctx, pkt, i + 2, 0)) < 0)
         return ret;
 
     /* revert the number, and close the buffer */
@@ -215,27 +206,18 @@ static int xface_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     *(p++) = '\n';
     *(p++) = 0;
 
-    pkt->flags |= AV_PKT_FLAG_KEY;
     *got_packet = 1;
 
     return 0;
 }
 
-static av_cold int xface_encode_close(AVCodecContext *avctx)
-{
-    av_frame_free(&avctx->coded_frame);
-
-    return 0;
-}
-
-AVCodec ff_xface_encoder = {
-    .name           = "xface",
-    .long_name      = NULL_IF_CONFIG_SMALL("X-face image"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_XFACE,
+const FFCodec ff_xface_encoder = {
+    .p.name         = "xface",
+    CODEC_LONG_NAME("X-face image"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_XFACE,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
+    CODEC_PIXFMTS(AV_PIX_FMT_MONOWHITE),
     .priv_data_size = sizeof(XFaceContext),
-    .init           = xface_encode_init,
-    .close          = xface_encode_close,
-    .encode2        = xface_encode_frame,
-    .pix_fmts       = (const enum AVPixelFormat[]) { AV_PIX_FMT_MONOWHITE, AV_PIX_FMT_NONE },
+    FF_CODEC_ENCODE_CB(xface_encode_frame),
 };

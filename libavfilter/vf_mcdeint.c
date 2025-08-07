@@ -1,6 +1,8 @@
 /*
  * Copyright (c) 2006 Michael Niedermayer <michaelni@gmx.at>
  *
+ * This file is part of FFmpeg.
+ *
  * FFmpeg is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation; either version 2 of the License, or
@@ -36,7 +38,7 @@
  *
  * Only past frames are used, we should ideally use future frames too,
  * something like filtering the whole movie in forward and then
- * backward direction seems like a interesting idea but the current
+ * backward direction seems like an interesting idea but the current
  * filter framework is FAR from supporting such things.
  *
  * Combining the motion compensated image with the input image also is
@@ -48,11 +50,11 @@
  */
 
 #include "libavutil/opt.h"
-#include "libavutil/pixdesc.h"
 #include "libavcodec/avcodec.h"
+#include "libavutil/pixdesc.h"
 #include "avfilter.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
+#include "video.h"
 
 enum MCDeintMode {
     MODE_FAST = 0,
@@ -67,17 +69,19 @@ enum MCDeintParity {
     PARITY_BFF  =  1, ///< bottom field first
 };
 
-typedef struct {
+typedef struct MCDeintContext {
     const AVClass *class;
     int mode;           ///< MCDeintMode
     int parity;         ///< MCDeintParity
     int qp;
+    AVPacket *pkt;
+    AVFrame *frame_dec;
     AVCodecContext *enc_ctx;
 } MCDeintContext;
 
 #define OFFSET(x) offsetof(MCDeintContext, x)
 #define FLAGS AV_OPT_FLAG_VIDEO_PARAM|AV_OPT_FLAG_FILTERING_PARAM
-#define CONST(name, help, val, unit) { name, help, 0, AV_OPT_TYPE_CONST, {.i64=val}, INT_MIN, INT_MAX, FLAGS, unit }
+#define CONST(name, help, val, u) { name, help, 0, AV_OPT_TYPE_CONST, {.i64=val}, INT_MIN, INT_MAX, FLAGS, .unit = u }
 
 static const AVOption mcdeint_options[] = {
     { "mode", "set mode", OFFSET(mode), AV_OPT_TYPE_INT, {.i64=MODE_FAST}, 0, MODE_NB-1, FLAGS, .unit="mode" },
@@ -86,7 +90,7 @@ static const AVOption mcdeint_options[] = {
     CONST("slow",       NULL, MODE_SLOW,       "mode"),
     CONST("extra_slow", NULL, MODE_EXTRA_SLOW, "mode"),
 
-    { "parity", "set the assumed picture field parity", OFFSET(parity), AV_OPT_TYPE_INT, {.i64=PARITY_BFF}, -1, 1, FLAGS, "parity" },
+    { "parity", "set the assumed picture field parity", OFFSET(parity), AV_OPT_TYPE_INT, {.i64=PARITY_BFF}, -1, 1, FLAGS, .unit = "parity" },
     CONST("tff", "assume top field first",    PARITY_TFF, "parity"),
     CONST("bff", "assume bottom field first", PARITY_BFF, "parity"),
 
@@ -100,7 +104,7 @@ static int config_props(AVFilterLink *inlink)
 {
     AVFilterContext *ctx = inlink->dst;
     MCDeintContext *mcdeint = ctx->priv;
-    AVCodec *enc;
+    const AVCodec *enc;
     AVCodecContext *enc_ctx;
     AVDictionary *opts = NULL;
     int ret;
@@ -110,6 +114,12 @@ static int config_props(AVFilterLink *inlink)
         return AVERROR(EINVAL);
     }
 
+    mcdeint->pkt = av_packet_alloc();
+    if (!mcdeint->pkt)
+        return AVERROR(ENOMEM);
+    mcdeint->frame_dec = av_frame_alloc();
+    if (!mcdeint->frame_dec)
+        return AVERROR(ENOMEM);
     mcdeint->enc_ctx = avcodec_alloc_context3(enc);
     if (!mcdeint->enc_ctx)
         return AVERROR(ENOMEM);
@@ -119,8 +129,8 @@ static int config_props(AVFilterLink *inlink)
     enc_ctx->time_base = (AVRational){1,25};  // meaningless
     enc_ctx->gop_size = INT_MAX;
     enc_ctx->max_b_frames = 0;
-    enc_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
-    enc_ctx->flags = CODEC_FLAG_QSCALE | CODEC_FLAG_LOW_DELAY;
+    enc_ctx->pix_fmt = inlink->format;
+    enc_ctx->flags = AV_CODEC_FLAG_QSCALE | AV_CODEC_FLAG_LOW_DELAY | AV_CODEC_FLAG_RECON_FRAME;
     enc_ctx->strict_std_compliance = FF_COMPLIANCE_EXPERIMENTAL;
     enc_ctx->global_quality = 1;
     enc_ctx->me_cmp = enc_ctx->me_sub_cmp = FF_CMP_SAD;
@@ -132,12 +142,12 @@ static int config_props(AVFilterLink *inlink)
     case MODE_EXTRA_SLOW:
         enc_ctx->refs = 3;
     case MODE_SLOW:
-        enc_ctx->me_method = ME_ITER;
+        av_dict_set(&opts, "motion_est", "iter", 0);
     case MODE_MEDIUM:
-        enc_ctx->flags |= CODEC_FLAG_4MV;
+        enc_ctx->flags |= AV_CODEC_FLAG_4MV;
         enc_ctx->dia_size = 2;
     case MODE_FAST:
-        enc_ctx->flags |= CODEC_FLAG_QPEL;
+        enc_ctx->flags |= AV_CODEC_FLAG_QPEL;
     }
 
     ret = avcodec_open2(enc_ctx, enc, &opts);
@@ -152,30 +162,19 @@ static av_cold void uninit(AVFilterContext *ctx)
 {
     MCDeintContext *mcdeint = ctx->priv;
 
-    if (mcdeint->enc_ctx) {
-        avcodec_close(mcdeint->enc_ctx);
-        av_freep(&mcdeint->enc_ctx);
-    }
-}
-
-static int query_formats(AVFilterContext *ctx)
-{
-    static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_YUV420P, AV_PIX_FMT_NONE
-    };
-    AVFilterFormats *fmts_list = ff_make_format_list(pix_fmts);
-    if (!fmts_list)
-        return AVERROR(ENOMEM);
-    return ff_set_common_formats(ctx, fmts_list);
+    av_packet_free(&mcdeint->pkt);
+    avcodec_free_context(&mcdeint->enc_ctx);
+    av_frame_free(&mcdeint->frame_dec);
 }
 
 static int filter_frame(AVFilterLink *inlink, AVFrame *inpic)
 {
     MCDeintContext *mcdeint = inlink->dst->priv;
     AVFilterLink *outlink = inlink->dst->outputs[0];
-    AVFrame *outpic, *frame_dec;
-    AVPacket pkt = {0};
-    int x, y, i, ret, got_frame = 0;
+    AVFrame *outpic, *frame_dec = mcdeint->frame_dec;
+    AVPacket *pkt = mcdeint->pkt;
+    const AVPixFmtDescriptor *pix_fmt_desc = av_pix_fmt_desc_get(inlink->format);
+    int x, y, i, ret;
 
     outpic = ff_get_video_buffer(outlink, outlink->w, outlink->h);
     if (!outpic) {
@@ -185,18 +184,33 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *inpic)
     av_frame_copy_props(outpic, inpic);
     inpic->quality = mcdeint->qp * FF_QP2LAMBDA;
 
-    av_init_packet(&pkt);
-
-    ret = avcodec_encode_video2(mcdeint->enc_ctx, &pkt, inpic, &got_frame);
-    if (ret < 0)
+    ret = avcodec_send_frame(mcdeint->enc_ctx, inpic);
+    if (ret < 0) {
+        av_log(mcdeint->enc_ctx, AV_LOG_ERROR, "Error sending a frame for encoding\n");
         goto end;
-
-    frame_dec = mcdeint->enc_ctx->coded_frame;
+    }
+    ret = avcodec_receive_packet(mcdeint->enc_ctx, pkt);
+    if (ret < 0) {
+        av_log(mcdeint->enc_ctx, AV_LOG_ERROR, "Error receiving a packet from encoding\n");
+        goto end;
+    }
+    av_packet_unref(pkt);
+    ret = avcodec_receive_frame(mcdeint->enc_ctx, frame_dec);
+    if (ret < 0) {
+        av_log(mcdeint->enc_ctx, AV_LOG_ERROR, "Error receiving a frame from encoding\n");
+        goto end;
+    }
 
     for (i = 0; i < 3; i++) {
         int is_chroma = !!i;
-        int w = FF_CEIL_RSHIFT(inlink->w, is_chroma);
-        int h = FF_CEIL_RSHIFT(inlink->h, is_chroma);
+        int w, h;
+        if (is_chroma) {
+            w = AV_CEIL_RSHIFT(inlink->w, pix_fmt_desc->log2_chroma_w);
+            h = AV_CEIL_RSHIFT(inlink->h, pix_fmt_desc->log2_chroma_h);
+        } else {
+            w = inlink->w;
+            h = inlink->h;
+        }
         int fils = frame_dec->linesize[i];
         int srcs = inpic    ->linesize[i];
         int dsts = outpic   ->linesize[i];
@@ -275,7 +289,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *inpic)
     mcdeint->parity ^= 1;
 
 end:
-    av_free_packet(&pkt);
+    av_packet_unref(pkt);
     av_frame_free(&inpic);
     if (ret < 0) {
         av_frame_free(&outpic);
@@ -291,24 +305,15 @@ static const AVFilterPad mcdeint_inputs[] = {
         .filter_frame = filter_frame,
         .config_props = config_props,
     },
-    { NULL }
 };
 
-static const AVFilterPad mcdeint_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-    { NULL }
-};
-
-AVFilter ff_vf_mcdeint = {
-    .name          = "mcdeint",
-    .description   = NULL_IF_CONFIG_SMALL("Apply motion compensating deinterlacing."),
+const FFFilter ff_vf_mcdeint = {
+    .p.name        = "mcdeint",
+    .p.description = NULL_IF_CONFIG_SMALL("Apply motion compensating deinterlacing."),
+    .p.priv_class  = &mcdeint_class,
     .priv_size     = sizeof(MCDeintContext),
     .uninit        = uninit,
-    .query_formats = query_formats,
-    .inputs        = mcdeint_inputs,
-    .outputs       = mcdeint_outputs,
-    .priv_class    = &mcdeint_class,
+    FILTER_INPUTS(mcdeint_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_PIXFMTS(AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV444P),
 };

@@ -21,6 +21,7 @@
 
 #include "libavutil/intreadwrite.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
 #define TXD_FILE            0x16
@@ -31,7 +32,7 @@
 #define TXD_MARKER          0x1803ffff
 #define TXD_MARKER2         0x1003ffff
 
-static int txd_probe(AVProbeData * pd) {
+static int txd_probe(const AVProbeData * pd) {
     if (AV_RL32(pd->buf  ) == TXD_FILE &&
        (AV_RL32(pd->buf+8) == TXD_MARKER || AV_RL32(pd->buf+8) == TXD_MARKER2))
         return AVPROBE_SCORE_MAX;
@@ -44,8 +45,8 @@ static int txd_read_header(AVFormatContext *s) {
     st = avformat_new_stream(s, NULL);
     if (!st)
         return AVERROR(ENOMEM);
-    st->codec->codec_type = AVMEDIA_TYPE_VIDEO;
-    st->codec->codec_id = AV_CODEC_ID_TXD;
+    st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+    st->codecpar->codec_id = AV_CODEC_ID_TXD;
     avpriv_set_pts_info(st, 64, 1, 5);
     st->avg_frame_rate = av_inv_q(st->time_base);
     /* the parameters will be extracted from the compressed bitstream */
@@ -92,9 +93,9 @@ next_chunk:
     return 0;
 }
 
-AVInputFormat ff_txd_demuxer = {
-    .name        = "txd",
-    .long_name   = NULL_IF_CONFIG_SMALL("Renderware TeXture Dictionary"),
+const FFInputFormat ff_txd_demuxer = {
+    .p.name      = "txd",
+    .p.long_name = NULL_IF_CONFIG_SMALL("Renderware TeXture Dictionary"),
     .read_probe  = txd_probe,
     .read_header = txd_read_header,
     .read_packet = txd_read_packet,

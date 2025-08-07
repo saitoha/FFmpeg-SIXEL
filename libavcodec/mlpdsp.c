@@ -79,7 +79,7 @@ void ff_mlp_rematrix_channel(int32_t *samples,
 
         if (matrix_noise_shift) {
             index &= access_unit_size_pow2 - 1;
-            accum += noise_buffer[index] << (matrix_noise_shift + 7);
+            accum += noise_buffer[index] * (1 << (matrix_noise_shift + 7));
             index += index2;
         }
 
@@ -113,11 +113,11 @@ int32_t ff_mlp_pack_output(int32_t lossless_check_data,
     for (i = 0; i < blockpos; i++) {
         for (out_ch = 0; out_ch <= max_matrix_channel; out_ch++) {
             int mat_ch = ch_assign[out_ch];
-            int32_t sample = sample_buffer[i][mat_ch]
-                          << output_shift[mat_ch];
+            int32_t sample = sample_buffer[i][mat_ch] *
+                          (1U << output_shift[mat_ch]);
             lossless_check_data ^= (sample & 0xffffff) << mat_ch;
             if (is32)
-                *data_32++ = sample << 8;
+                *data_32++ = sample * 256U;
             else
                 *data_16++ = sample >> 8;
         }
@@ -130,9 +130,9 @@ av_cold void ff_mlpdsp_init(MLPDSPContext *c)
     c->mlp_filter_channel = mlp_filter_channel;
     c->mlp_rematrix_channel = ff_mlp_rematrix_channel;
     c->mlp_select_pack_output = mlp_select_pack_output;
-    c->mlp_pack_output = ff_mlp_pack_output;
-    if (ARCH_ARM)
-        ff_mlpdsp_init_arm(c);
-    if (ARCH_X86)
-        ff_mlpdsp_init_x86(c);
+#if ARCH_ARM
+    ff_mlpdsp_init_arm(c);
+#elif ARCH_X86
+    ff_mlpdsp_init_x86(c);
+#endif
 }

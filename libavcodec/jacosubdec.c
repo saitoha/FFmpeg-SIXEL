@@ -26,6 +26,7 @@
 
 #include <time.h>
 #include "ass.h"
+#include "codec_internal.h"
 #include "jacosub.h"
 #include "libavutil/avstring.h"
 #include "libavutil/bprint.h"
@@ -161,12 +162,12 @@ static void jacosub_to_ass(AVCodecContext *avctx, AVBPrint *dst, const char *src
     }
 }
 
-static int jacosub_decode_frame(AVCodecContext *avctx,
-                                void *data, int *got_sub_ptr, AVPacket *avpkt)
+static int jacosub_decode_frame(AVCodecContext *avctx, AVSubtitle *sub,
+                                int *got_sub_ptr, const AVPacket *avpkt)
 {
     int ret;
-    AVSubtitle *sub = data;
     const char *ptr = avpkt->data;
+    FFASSDecoderContext *s = avctx->priv_data;
 
     if (avpkt->size <= 0)
         goto end;
@@ -181,7 +182,7 @@ static int jacosub_decode_frame(AVCodecContext *avctx,
 
         av_bprint_init(&buffer, JSS_MAX_LINESIZE, JSS_MAX_LINESIZE);
         jacosub_to_ass(avctx, &buffer, ptr);
-        ret = ff_ass_add_rect_bprint(sub, &buffer, avpkt->pts, avpkt->duration);
+        ret = ff_ass_add_rect(sub, buffer.str, s->readorder++, 0, NULL, NULL);
         av_bprint_finalize(&buffer, NULL);
         if (ret < 0)
             return ret;
@@ -192,11 +193,13 @@ end:
     return avpkt->size;
 }
 
-AVCodec ff_jacosub_decoder = {
-    .name           = "jacosub",
-    .long_name      = NULL_IF_CONFIG_SMALL("JACOsub subtitle"),
-    .type           = AVMEDIA_TYPE_SUBTITLE,
-    .id             = AV_CODEC_ID_JACOSUB,
+const FFCodec ff_jacosub_decoder = {
+    .p.name         = "jacosub",
+    CODEC_LONG_NAME("JACOsub subtitle"),
+    .p.type         = AVMEDIA_TYPE_SUBTITLE,
+    .p.id           = AV_CODEC_ID_JACOSUB,
     .init           = ff_ass_subtitle_header_default,
-    .decode         = jacosub_decode_frame,
+    FF_CODEC_DECODE_SUB_CB(jacosub_decode_frame),
+    .flush          = ff_ass_decoder_flush,
+    .priv_data_size = sizeof(FFASSDecoderContext),
 };

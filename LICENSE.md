@@ -1,4 +1,4 @@
-#FFmpeg:
+# License
 
 Most files in FFmpeg are under the GNU Lesser General Public License version 2.1
 or later (LGPL v2.1+). Read the file `COPYING.LGPLv2.1` for details. Some other
@@ -12,18 +12,19 @@ configure to activate them. In this case, FFmpeg's license changes to GPL v2+.
 
 Specifically, the GPL parts of FFmpeg are:
 
-- libpostproc
-- optional x86 optimizations in the files
-  - `libavcodec/x86/flac_dsp_gpl.asm`
-  - `libavcodec/x86/idct_mmx.c`
-- libutvideo encoding/decoding wrappers in
-  `libavcodec/libutvideo*.cpp`
-- the X11 grabber in `libavdevice/x11grab.c`
-- the swresample test app in
-  `libswresample/swresample-test.c`
-- the `texi2pod.pl` tool
+- optional x86 optimization in the files
+    - `libavcodec/x86/flac_dsp_gpl.asm`
+    - `libavcodec/x86/idct_mmx.c`
+    - `libavfilter/x86/vf_removegrain.asm`
+- the following building and testing tools
+    - `compat/solaris/make_sunver.pl`
+    - `doc/t2h.pm`
+    - `doc/texi2pod.pl`
+    - `libswresample/tests/swresample.c`
+    - `tests/checkasm/*`
+    - `tests/tiny_ssim.c`
 - the following filters in libavfilter:
-    - `f_ebur128.c`
+    - `signature_lookup.c`
     - `vf_blackframe.c`
     - `vf_boxblur.c`
     - `vf_colormatrix.c`
@@ -33,27 +34,28 @@ Specifically, the GPL parts of FFmpeg are:
     - `vf_eq.c`
     - `vf_find_rect.c`
     - `vf_fspp.c`
-    - `vf_geq.c`
     - `vf_histeq.c`
     - `vf_hqdn3d.c`
-    - `vf_interlace.c`
     - `vf_kerndeint.c`
+    - `vf_lensfun.c` (GPL version 3 or later)
     - `vf_mcdeint.c`
     - `vf_mpdecimate.c`
+    - `vf_nnedi.c`
     - `vf_owdenoise.c`
     - `vf_perspective.c`
     - `vf_phase.c`
-    - `vf_pp.c`
     - `vf_pp7.c`
     - `vf_pullup.c`
-    - `vf_sab.c`
-    - `vf_smartblur.c`
     - `vf_repeatfields.c`
+    - `vf_sab.c`
+    - `vf_signature.c`
+    - `vf_smartblur.c`
     - `vf_spp.c`
     - `vf_stereo3d.c`
     - `vf_super2xsai.c`
     - `vf_tinterlace.c`
     - `vf_uspp.c`
+    - `vf_vaguedenoiser.c`
     - `vsrc_mptestsrc.c`
 
 Should you, for whatever reason, prefer to use version 3 of the (L)GPL, then
@@ -72,41 +74,54 @@ There are a handful of files under other licensing terms, namely:
 * `tests/reference.pnm` is under the expat license.
 
 
-external libraries
-==================
+## External libraries
 
 FFmpeg can be combined with a number of external libraries, which sometimes
 affect the licensing of binaries resulting from the combination.
 
-compatible libraries
---------------------
+### Compatible libraries
 
-The following libraries are under GPL:
+The following libraries are under GPL version 2:
+- avisynth
 - frei0r
 - libcdio
-- libutvideo
+- libdavs2
+- librubberband
 - libvidstab
 - libx264
 - libx265
 - libxavs
+- libxavs2
 - libxvid
 
 When combining them with FFmpeg, FFmpeg needs to be licensed as GPL as well by
 passing `--enable-gpl` to configure.
 
-The OpenCORE and VisualOn libraries are under the Apache License 2.0. That
-license is incompatible with the LGPL v2.1 and the GPL v2, but not with
+The following libraries are under LGPL version 3:
+- gmp
+- libaribb24
+- liblensfun
+
+When combining them with FFmpeg, use the configure option `--enable-version3` to
+upgrade FFmpeg to the LGPL v3.
+
+The VMAF, mbedTLS, RK MPI, OpenCORE and VisualOn libraries are under the Apache License
+2.0. That license is incompatible with the LGPL v2.1 and the GPL v2, but not with
 version 3 of those licenses. So to combine these libraries with FFmpeg, the
 license version needs to be upgraded by passing `--enable-version3` to configure.
 
-incompatible libraries
-----------------------
+The smbclient library is under the GPL v3, to combine it with FFmpeg,
+the options `--enable-gpl` and `--enable-version3` have to be passed to
+configure to upgrade FFmpeg to the GPL v3.
 
-The Fraunhofer AAC library, FAAC and aacplus are under licenses which
-are incompatible with the GPLv2 and v3. We do not know for certain if their
-licenses are compatible with the LGPL.
-If you wish to enable these libraries, pass `--enable-nonfree` to configure.
-But note that if you enable any of these libraries the resulting binary will
-be under a complex license mix that is more restrictive than the LGPL and that
-may result in additional obligations. It is possible that these
-restrictions cause the resulting binary to be unredistributeable.
+### Incompatible libraries
+
+There are certain libraries you can combine with FFmpeg whose licenses are not
+compatible with the GPL and/or the LGPL. If you wish to enable these
+libraries, even in circumstances that their license may be incompatible, pass
+`--enable-nonfree` to configure. This will cause the resulting binary to be
+unredistributable.
+
+The Fraunhofer FDK AAC and OpenSSL libraries are under licenses which are
+incompatible with the GPLv2 and v3. To the best of our knowledge, they are
+compatible with the LGPL.

@@ -23,7 +23,6 @@
 #include <libbluray/bluray.h>
 
 #include "libavutil/avstring.h"
-#include "libavformat/avformat.h"
 #include "libavformat/url.h"
 #include "libavutil/opt.h"
 
@@ -198,7 +197,7 @@ static int bluray_read(URLContext *h, unsigned char *buf, int size)
 
     len = bd_read(bd->bd, buf, size);
 
-    return len;
+    return len == 0 ? AVERROR_EOF : len;
 }
 
 static int64_t bluray_seek(URLContext *h, int64_t pos, int whence)
@@ -224,7 +223,7 @@ static int64_t bluray_seek(URLContext *h, int64_t pos, int whence)
 }
 
 
-URLProtocol ff_bluray_protocol = {
+const URLProtocol ff_bluray_protocol = {
     .name            = "bluray",
     .url_close       = bluray_close,
     .url_open        = bluray_open,

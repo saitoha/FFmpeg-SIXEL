@@ -25,18 +25,17 @@
  */
 
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 #include "subtitles.h"
-#include "libavcodec/internal.h"
 #include "libavutil/avstring.h"
 #include "libavutil/bprint.h"
-#include "libavutil/intreadwrite.h"
 
 typedef struct {
     FFDemuxSubtitlesQueue q;
 } SAMIContext;
 
-static int sami_probe(AVProbeData *p)
+static int sami_probe(const AVProbeData *p)
 {
     char buf[6];
     FFTextReader tr;
@@ -59,8 +58,8 @@ static int sami_read_header(AVFormatContext *s)
     if (!st)
         return AVERROR(ENOMEM);
     avpriv_set_pts_info(st, 64, 1, 1000);
-    st->codec->codec_type = AVMEDIA_TYPE_SUBTITLE;
-    st->codec->codec_id   = AV_CODEC_ID_SAMI;
+    st->codecpar->codec_type = AVMEDIA_TYPE_SUBTITLE;
+    st->codecpar->codec_id   = AV_CODEC_ID_SAMI;
 
     av_bprint_init(&buf,     0, AV_BPRINT_SIZE_UNLIMITED);
     av_bprint_init(&hdr_buf, 0, AV_BPRINT_SIZE_UNLIMITED);
@@ -68,10 +67,20 @@ static int sami_read_header(AVFormatContext *s)
     while (!ff_text_eof(&tr)) {
         AVPacket *sub;
         const int64_t pos = ff_text_pos(&tr) - (c != 0);
-        int is_sync, n = ff_smil_extract_next_text_chunk(&tr, &buf, &c);
+        int is_sync, is_body, n = ff_smil_extract_next_text_chunk(&tr, &buf, &c);
 
+        if (n < 0) {
+            res = n;
+            goto end;
+        }
         if (n == 0)
             break;
+
+        is_body = !av_strncasecmp(buf.str, "</BODY", 6);
+        if (is_body) {
+             av_bprint_clear(&buf);
+             break;
+        }
 
         is_sync = !av_strncasecmp(buf.str, "<SYNC", 5);
         if (is_sync)
@@ -80,61 +89,48 @@ static int sami_read_header(AVFormatContext *s)
         if (!got_first_sync_point) {
             av_bprintf(&hdr_buf, "%s", buf.str);
         } else {
-            sub = ff_subtitles_queue_insert(&sami->q, buf.str, buf.len, !is_sync);
+            sub = ff_subtitles_queue_insert_bprint(&sami->q, &buf, !is_sync);
             if (!sub) {
                 res = AVERROR(ENOMEM);
+                av_bprint_finalize(&hdr_buf, NULL);
                 goto end;
             }
             if (is_sync) {
                 const char *p = ff_smil_get_attr_ptr(buf.str, "Start");
                 sub->pos      = pos;
                 sub->pts      = p ? strtol(p, NULL, 10) : 0;
+                if (sub->pts <= INT64_MIN/2 || sub->pts >= INT64_MAX/2) {
+                    res = AVERROR_PATCHWELCOME;
+                    av_bprint_finalize(&hdr_buf, NULL);
+                    goto end;
+                }
+
                 sub->duration = -1;
             }
         }
         av_bprint_clear(&buf);
     }
 
-    res = avpriv_bprint_to_extradata(st->codec, &hdr_buf);
+    res = ff_bprint_to_codecpar_extradata(st->codecpar, &hdr_buf);
     if (res < 0)
         goto end;
 
-    ff_subtitles_queue_finalize(&sami->q);
+    ff_subtitles_queue_finalize(s, &sami->q);
 
 end:
     av_bprint_finalize(&buf, NULL);
     return res;
 }
 
-static int sami_read_packet(AVFormatContext *s, AVPacket *pkt)
-{
-    SAMIContext *sami = s->priv_data;
-    return ff_subtitles_queue_read_packet(&sami->q, pkt);
-}
-
-static int sami_read_seek(AVFormatContext *s, int stream_index,
-                          int64_t min_ts, int64_t ts, int64_t max_ts, int flags)
-{
-    SAMIContext *sami = s->priv_data;
-    return ff_subtitles_queue_seek(&sami->q, s, stream_index,
-                                   min_ts, ts, max_ts, flags);
-}
-
-static int sami_read_close(AVFormatContext *s)
-{
-    SAMIContext *sami = s->priv_data;
-    ff_subtitles_queue_clean(&sami->q);
-    return 0;
-}
-
-AVInputFormat ff_sami_demuxer = {
-    .name           = "sami",
-    .long_name      = NULL_IF_CONFIG_SMALL("SAMI subtitle format"),
+const FFInputFormat ff_sami_demuxer = {
+    .p.name         = "sami",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("SAMI subtitle format"),
+    .p.extensions   = "smi,sami",
     .priv_data_size = sizeof(SAMIContext),
+    .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
     .read_probe     = sami_probe,
     .read_header    = sami_read_header,
-    .read_packet    = sami_read_packet,
-    .read_seek2     = sami_read_seek,
-    .read_close     = sami_read_close,
-    .extensions     = "smi,sami",
+    .read_packet    = ff_subtitles_read_packet,
+    .read_seek2     = ff_subtitles_read_seek,
+    .read_close     = ff_subtitles_read_close,
 };

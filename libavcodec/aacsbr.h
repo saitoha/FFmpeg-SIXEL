@@ -30,22 +30,81 @@
 #define AVCODEC_AACSBR_H
 
 #include "get_bits.h"
-#include "aac.h"
-#include "sbr.h"
+#include "aac/aacdec.h"
 
+#include "libavutil/attributes_internal.h"
+
+#define ENVELOPE_ADJUSTMENT_OFFSET 2
+#define NOISE_FLOOR_OFFSET 6
+
+/**
+ * SBR VLC tables
+ */
+enum {
+    T_HUFFMAN_ENV_1_5DB,
+    F_HUFFMAN_ENV_1_5DB,
+    T_HUFFMAN_ENV_BAL_1_5DB,
+    F_HUFFMAN_ENV_BAL_1_5DB,
+    T_HUFFMAN_ENV_3_0DB,
+    F_HUFFMAN_ENV_3_0DB,
+    T_HUFFMAN_ENV_BAL_3_0DB,
+    F_HUFFMAN_ENV_BAL_3_0DB,
+    T_HUFFMAN_NOISE_3_0DB,
+    T_HUFFMAN_NOISE_BAL_3_0DB,
+};
+
+/**
+ * bs_frame_class - frame class of current SBR frame (14496-3 sp04 p98)
+ */
+enum {
+    FIXFIX,
+    FIXVAR,
+    VARFIX,
+    VARVAR,
+};
+
+enum {
+    EXTENSION_ID_PS = 2,
+};
+
+FF_VISIBILITY_PUSH_HIDDEN
 /** Initialize SBR. */
 void ff_aac_sbr_init(void);
-/** Initialize one SBR context. */
-void ff_aac_sbr_ctx_init(AACContext *ac, SpectralBandReplication *sbr);
-/** Close one SBR context. */
-void ff_aac_sbr_ctx_close(SpectralBandReplication *sbr);
-/** Decode one SBR element. */
-int ff_decode_sbr_extension(AACContext *ac, SpectralBandReplication *sbr,
-                            GetBitContext *gb, int crc, int cnt, int id_aac);
-/** Apply one SBR element to one AAC element. */
-void ff_sbr_apply(AACContext *ac, SpectralBandReplication *sbr, int id_aac,
-                  float* L, float *R);
+void ff_aac_sbr_init_fixed(void);
+/**
+ * Allocate an ExtChannelElement (if necessary) and
+ * initialize the SBR context contained in it.
+ */
+int ff_aac_sbr_ctx_alloc_init(AACDecContext *ac, ChannelElement **che, int id_aac);
+int ff_aac_sbr_ctx_alloc_init_fixed(AACDecContext *ac, ChannelElement **che, int id_aac);
 
-void ff_aacsbr_func_ptr_init_mips(AACSBRContext *c);
+/** Close the SBR context implicitly contained in a ChannelElement. */
+void ff_aac_sbr_ctx_close(ChannelElement *che);
+void ff_aac_sbr_ctx_close_fixed(ChannelElement *che);
+
+/** Decode one SBR element. */
+int ff_aac_sbr_decode_extension(AACDecContext *ac, ChannelElement *che,
+                                GetBitContext *gb, int crc, int cnt, int id_aac);
+int ff_aac_sbr_decode_extension_fixed(AACDecContext *ac, ChannelElement *che,
+                                      GetBitContext *gb, int crc, int cnt, int id_aac);
+
+/** Due to channel allocation not being known upon SBR parameter transmission,
+ * supply the parameters separately.
+ * Functionally identical to ff_aac_sbr_decode_extension() */
+int ff_aac_sbr_config_usac(AACDecContext *ac, ChannelElement *che,
+                           AACUsacElemConfig *ue);
+
+/** Decode frame SBR data, USAC. */
+int ff_aac_sbr_decode_usac_data(AACDecContext *ac, ChannelElement *che,
+                                AACUsacElemConfig *ue, GetBitContext *gb,
+                                int sbr_ch, int indep_flag);
+
+/** Apply one SBR element to one AAC element. */
+void ff_aac_sbr_apply(AACDecContext *ac, ChannelElement *che,
+                      int id_aac, void /* float */ *L, void /* float */ *R);
+void ff_aac_sbr_apply_fixed(AACDecContext *ac, ChannelElement *che,
+                            int id_aac, void /* int */ *L, void /* int */ *R);
+
+FF_VISIBILITY_POP_HIDDEN
 
 #endif /* AVCODEC_AACSBR_H */

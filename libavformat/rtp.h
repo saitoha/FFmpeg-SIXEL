@@ -21,9 +21,11 @@
 #ifndef AVFORMAT_RTP_H
 #define AVFORMAT_RTP_H
 
+#include <stdint.h>
+#include "libavutil/avutil.h"
+#include "libavcodec/codec_id.h"
+#include "libavcodec/codec_par.h"
 #include "libavformat/avformat.h"
-#include "libavcodec/avcodec.h"
-#include "libavutil/mathematics.h"
 
 /**
  * Return the payload type for a given stream used in the given format context.
@@ -32,12 +34,12 @@
  * The format context private option payload_type overrides both.
  *
  * @param fmt   The context of the format
- * @param codec The context of the codec
+ * @param par   The codec parameters
  * @param idx   The stream index
  * @return The payload type (the 'PT' field in the RTP header).
  */
-int ff_rtp_get_payload_type(AVFormatContext *fmt, AVCodecContext *codec,
-                            int idx);
+int ff_rtp_get_payload_type(const AVFormatContext *fmt,
+                            const AVCodecParameters *par, int idx);
 
 /**
  * Initialize a codec context based on the payload type.
@@ -46,12 +48,12 @@ int ff_rtp_get_payload_type(AVFormatContext *fmt, AVCodecContext *codec,
  * information depending on the payload type; for audio codecs, the
  * channels and sample_rate fields are also filled.
  *
- * @param codec The context of the codec
+ * @param par The codec parameters
  * @param payload_type The payload type (the 'PT' field in the RTP header)
  * @return In case of unknown payload type or dynamic payload type, a
  * negative value is returned; otherwise, 0 is returned
  */
-int ff_rtp_get_codec_info(AVCodecContext *codec, int payload_type);
+int ff_rtp_get_codec_info(AVCodecParameters *par, int payload_type);
 
 /**
  * Return the encoding name (as defined in

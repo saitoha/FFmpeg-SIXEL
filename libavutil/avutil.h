@@ -23,7 +23,8 @@
 
 /**
  * @file
- * external API header
+ * @ingroup lavu
+ * Convenience header that includes @ref lavu "libavutil"'s core.
  */
 
 /**
@@ -40,7 +41,6 @@
  * @li @ref lavd "libavdevice" special devices muxing/demuxing library
  * @li @ref lavu "libavutil" common utility library
  * @li @ref lswr "libswresample" audio resampling, format conversion and mixing
- * @li @ref lpp  "libpostproc" post processing library
  * @li @ref libsws "libswscale" color conversion and scaling library
  *
  * @section ffmpeg_versioning Versioning and compatibility
@@ -78,14 +78,15 @@
  */
 
 /**
- * @defgroup lavu Common utility functions
+ * @defgroup lavu libavutil
+ * Common code shared across all FFmpeg libraries.
  *
- * @brief
- * libavutil contains the code shared across all the other FFmpeg
- * libraries
- *
- * @note In order to use the functions provided by avutil you must include
- * the specific header.
+ * @note
+ * libavutil is designed to be modular. In most cases, in order to use the
+ * functions provided by one component of libavutil you must explicitly include
+ * the specific header containing that feature. If you are only using
+ * media-related components, you could simply include libavutil/avutil.h, which
+ * brings in most of the "core" components.
  *
  * @{
  *
@@ -94,7 +95,7 @@
  * @{
  * @}
  *
- * @defgroup lavu_math Maths
+ * @defgroup lavu_math Mathematics
  * @{
  *
  * @}
@@ -112,6 +113,12 @@
  * @}
  *
  * @defgroup lavu_data Data Structures
+ * @{
+ *
+ * @}
+ *
+ * @defgroup lavu_video Video related
+ *
  * @{
  *
  * @}
@@ -138,14 +145,6 @@
  *
  * @{
  *
- * @defgroup lavu_internal Internal
- *
- * Not exported functions, for internal usage only
- *
- * @{
- *
- * @}
- *
  * @defgroup preproc_misc Preprocessor String Macros
  *
  * @{
@@ -169,6 +168,13 @@
  * Return the LIBAVUTIL_VERSION_INT constant.
  */
 unsigned avutil_version(void);
+
+/**
+ * Return an informative version string. This usually is the actual release
+ * version number or a git commit description. This string has no fixed format
+ * and can change any time. It should never be parsed by code.
+ */
+const char *av_version_info(void);
 
 /**
  * Return the libavutil build-time configuration.
@@ -250,7 +256,12 @@ const char *av_get_media_type_string(enum AVMediaType media_type);
  * Internal time base represented as fractional value
  */
 
+#ifdef __cplusplus
+/* ISO C++ forbids compound-literals. */
+#define AV_TIME_BASE_Q          av_make_q(1, AV_TIME_BASE)
+#else
 #define AV_TIME_BASE_Q          (AVRational){1, AV_TIME_BASE}
+#endif
 
 /**
  * @}
@@ -267,7 +278,7 @@ enum AVPictureType {
     AV_PICTURE_TYPE_I,     ///< Intra
     AV_PICTURE_TYPE_P,     ///< Predicted
     AV_PICTURE_TYPE_B,     ///< Bi-dir predicted
-    AV_PICTURE_TYPE_S,     ///< S(GMC)-VOP MPEG4
+    AV_PICTURE_TYPE_S,     ///< S(GMC)-VOP MPEG-4
     AV_PICTURE_TYPE_SI,    ///< Switching Intra
     AV_PICTURE_TYPE_SP,    ///< Switching Predicted
     AV_PICTURE_TYPE_BI,    ///< BI type
@@ -287,7 +298,6 @@ char av_get_picture_type_char(enum AVPictureType pict_type);
  */
 
 #include "common.h"
-#include "error.h"
 #include "rational.h"
 #include "version.h"
 #include "macros.h"
@@ -303,6 +313,7 @@ static inline void *av_x_if_null(const void *p, const void *x)
     return (void *)(intptr_t)(p ? p : x);
 }
 
+#if FF_API_OPT_INT_LIST
 /**
  * Compute the length of an integer list.
  *
@@ -311,6 +322,7 @@ static inline void *av_x_if_null(const void *p, const void *x)
  * @param list    pointer to the list
  * @return  length of the list, in elements, not counting the terminator
  */
+attribute_deprecated
 unsigned av_int_list_length_for_size(unsigned elsize,
                                      const void *list, uint64_t term) av_pure;
 
@@ -323,18 +335,26 @@ unsigned av_int_list_length_for_size(unsigned elsize,
  */
 #define av_int_list_length(list, term) \
     av_int_list_length_for_size(sizeof(*(list)), list, term)
-
-/**
- * Open a file using a UTF-8 filename.
- * The API of this function matches POSIX fopen(), errors are returned through
- * errno.
- */
-FILE *av_fopen_utf8(const char *path, const char *mode);
+#endif
 
 /**
  * Return the fractional representation of the internal time base.
  */
 AVRational av_get_time_base_q(void);
+
+#define AV_FOURCC_MAX_STRING_SIZE 32
+
+#define av_fourcc2str(fourcc) av_fourcc_make_string((char[AV_FOURCC_MAX_STRING_SIZE]){0}, fourcc)
+
+/**
+ * Fill the provided buffer with a string containing a FourCC (four-character
+ * code) representation.
+ *
+ * @param buf    a buffer with size in bytes of at least AV_FOURCC_MAX_STRING_SIZE
+ * @param fourcc the fourcc to represent
+ * @return the buffer in input
+ */
+char *av_fourcc_make_string(char *buf, uint32_t fourcc);
 
 /**
  * @}

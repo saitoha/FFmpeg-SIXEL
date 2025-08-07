@@ -36,29 +36,46 @@
  */
 
 #include "libavutil/avassert.h"
-#include "libavutil/imgutils.h"
+#include "libavutil/emms.h"
 #include "libavutil/internal.h"
-#include "libavutil/pixdesc.h"
+#include "libavutil/mem_internal.h"
+#include "libavutil/thread.h"
 
 #include "avcodec.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include "dv.h"
+#include "dv_internal.h"
 #include "dv_profile_internal.h"
 #include "dvdata.h"
 #include "get_bits.h"
 #include "idctdsp.h"
-#include "internal.h"
 #include "put_bits.h"
 #include "simple_idct.h"
+#include "thread.h"
 
 typedef struct BlockInfo {
     const uint32_t *factor_table;
     const uint8_t *scan_table;
     uint8_t pos; /* position in block */
-    void (*idct_put)(uint8_t *dest, int line_size, int16_t *block);
+    void (*idct_put)(uint8_t *dest, ptrdiff_t stride, int16_t *block);
     uint8_t partial_bit_count;
     uint32_t partial_bit_buffer;
     int shift_offset;
 } BlockInfo;
+
+typedef struct DVDecContext {
+    const AVDVProfile *sys;
+    const AVFrame     *frame;
+    const uint8_t     *buf;
+
+    uint8_t      dv_zigzag[2][64];
+    DVwork_chunk work_chunks[4 * 12 * 27];
+    uint32_t     idct_factor[2 * 4 * 16 * 64];
+    void       (*idct_put[2])(uint8_t *dest, ptrdiff_t stride, int16_t *block);
+
+    IDCTDSPContext idsp;
+} DVDecContext;
 
 static const int dv_iweight_bits = 14;
 
@@ -127,7 +144,62 @@ static const uint16_t dv_iweight_720_c[64] = {
     394, 406, 418, 438, 418, 464, 464, 492,
 };
 
-static void dv_init_weight_tables(DVVideoContext *ctx, const AVDVProfile *d)
+#define TEX_VLC_BITS 10
+
+/* XXX: also include quantization */
+static RL_VLC_ELEM dv_rl_vlc[1664];
+
+static av_cold void dv_init_static(void)
+{
+    VLCElem vlc_buf[FF_ARRAY_ELEMS(dv_rl_vlc)] = { 0 };
+    VLC dv_vlc = { .table = vlc_buf, .table_allocated = FF_ARRAY_ELEMS(vlc_buf) };
+    const unsigned offset = FF_ARRAY_ELEMS(dv_rl_vlc) - (2 * NB_DV_VLC - NB_DV_ZERO_LEVEL_ENTRIES);
+    RL_VLC_ELEM *tmp = dv_rl_vlc + offset;
+    int i, j;
+
+    /* it's faster to include sign bit in a generic VLC parsing scheme */
+    for (i = 0, j = 0; i < NB_DV_VLC; i++, j++) {
+        tmp[j].len8  = ff_dv_vlc_len[i];
+        tmp[j].run   = ff_dv_vlc_run[i];
+        tmp[j].level = ff_dv_vlc_level[i];
+
+        if (ff_dv_vlc_level[i]) {
+            tmp[j].len8++;
+
+            j++;
+            tmp[j].len8  =  ff_dv_vlc_len[i] + 1;
+            tmp[j].run   =  ff_dv_vlc_run[i];
+            tmp[j].level = -ff_dv_vlc_level[i];
+        }
+    }
+
+    /* NOTE: as a trick, we use the fact the no codes are unused
+     * to accelerate the parsing of partial codes */
+    ff_vlc_init_from_lengths(&dv_vlc, TEX_VLC_BITS, j,
+                             &tmp[0].len8, sizeof(tmp[0]),
+                             NULL, 0, 0, 0, VLC_INIT_USE_STATIC, NULL);
+    av_assert1(dv_vlc.table_size == 1664);
+
+    for (int i = 0; i < dv_vlc.table_size; i++) {
+        int code = dv_vlc.table[i].sym;
+        int len  = dv_vlc.table[i].len;
+        int level, run;
+
+        if (len < 0) { // more bits needed
+            run   = 0;
+            level = code;
+        } else {
+            av_assert1(i <= code + offset);
+            run   = tmp[code].run + 1;
+            level = tmp[code].level;
+        }
+        dv_rl_vlc[i].len8  = len;
+        dv_rl_vlc[i].level = level;
+        dv_rl_vlc[i].run   = run;
+    }
+}
+
+static void dv_init_weight_tables(DVDecContext *ctx, const AVDVProfile *d)
 {
     int j, i, c, s;
     uint32_t *factor1 = &ctx->idct_factor[0],
@@ -175,28 +247,31 @@ static void dv_init_weight_tables(DVVideoContext *ctx, const AVDVProfile *d)
 
 static av_cold int dvvideo_decode_init(AVCodecContext *avctx)
 {
-    DVVideoContext *s = avctx->priv_data;
-    IDCTDSPContext idsp;
+    static AVOnce init_static_once = AV_ONCE_INIT;
+    DVDecContext *s = avctx->priv_data;
     int i;
 
-    memset(&idsp,0, sizeof(idsp));
-    ff_idctdsp_init(&idsp, avctx);
+    avctx->chroma_sample_location = AVCHROMA_LOC_TOPLEFT;
+
+    ff_idctdsp_init(&s->idsp, avctx);
 
     for (i = 0; i < 64; i++)
-        s->dv_zigzag[0][i] = idsp.idct_permutation[ff_zigzag_direct[i]];
+        s->dv_zigzag[0][i] = s->idsp.idct_permutation[ff_zigzag_direct[i]];
 
     if (avctx->lowres){
         for (i = 0; i < 64; i++){
             int j = ff_dv_zigzag248_direct[i];
-            s->dv_zigzag[1][i] = idsp.idct_permutation[(j & 7) + (j & 8) * 4 + (j & 48) / 2];
+            s->dv_zigzag[1][i] = s->idsp.idct_permutation[(j & 7) + (j & 8) * 4 + (j & 48) / 2];
         }
     }else
         memcpy(s->dv_zigzag[1], ff_dv_zigzag248_direct, sizeof(s->dv_zigzag[1]));
 
-    s->idct_put[0] = idsp.idct_put;
+    s->idct_put[0] = s->idsp.idct_put;
     s->idct_put[1] = ff_simple_idct248_put;
 
-    return ff_dvvideo_init(avctx);
+    ff_thread_once(&init_static_once, dv_init_static);
+
+    return 0;
 }
 
 /* decode AC coefficients */
@@ -222,18 +297,18 @@ static void dv_decode_ac(GetBitContext *gb, BlockInfo *mb, int16_t *block)
 
     /* get the AC coefficients until last_index is reached */
     for (;;) {
-        ff_dlog(NULL, "%2d: bits=%04x index=%d\n", pos, SHOW_UBITS(re, gb, 16),
-                re_index);
+        ff_dlog(NULL, "%2d: bits=%04"PRIx32" index=%u\n",
+                pos, SHOW_UBITS(re, gb, 16), re_index);
         /* our own optimized GET_RL_VLC */
         index   = NEG_USR32(re_cache, TEX_VLC_BITS);
-        vlc_len = ff_dv_rl_vlc[index].len;
+        vlc_len = dv_rl_vlc[index].len8;
         if (vlc_len < 0) {
             index = NEG_USR32((unsigned) re_cache << TEX_VLC_BITS, -vlc_len) +
-                    ff_dv_rl_vlc[index].level;
+                    dv_rl_vlc[index].level;
             vlc_len = TEX_VLC_BITS - vlc_len;
         }
-        level = ff_dv_rl_vlc[index].level;
-        run   = ff_dv_rl_vlc[index].run;
+        level = dv_rl_vlc[index].level;
+        run   = dv_rl_vlc[index].run;
 
         /* gotta check if we're still within gb boundaries */
         if (re_index + vlc_len > last_index) {
@@ -271,10 +346,52 @@ static inline void bit_copy(PutBitContext *pb, GetBitContext *gb)
         put_bits(pb, bits_left, get_bits(gb, bits_left));
 }
 
+static av_always_inline void put_block_8x4(int16_t *block, uint8_t *restrict p, int stride)
+{
+    int i, j;
+
+    for (i = 0; i < 4; i++) {
+        for (j = 0; j < 8; j++)
+            p[j] = av_clip_uint8(block[j]);
+        block += 8;
+        p += stride;
+    }
+}
+
+static void dv100_idct_put_last_row_field_chroma(const DVDecContext *s, uint8_t *data,
+                                                 int stride, int16_t *blocks)
+{
+    s->idsp.idct(blocks + 0*64);
+    s->idsp.idct(blocks + 1*64);
+
+    put_block_8x4(blocks+0*64,       data,              stride<<1);
+    put_block_8x4(blocks+0*64 + 4*8, data + 8,          stride<<1);
+    put_block_8x4(blocks+1*64,       data + stride,     stride<<1);
+    put_block_8x4(blocks+1*64 + 4*8, data + 8 + stride, stride<<1);
+}
+
+static void dv100_idct_put_last_row_field_luma(const DVDecContext *s, uint8_t *data,
+                                               int stride, int16_t *blocks)
+{
+    s->idsp.idct(blocks + 0*64);
+    s->idsp.idct(blocks + 1*64);
+    s->idsp.idct(blocks + 2*64);
+    s->idsp.idct(blocks + 3*64);
+
+    put_block_8x4(blocks+0*64,       data,               stride<<1);
+    put_block_8x4(blocks+0*64 + 4*8, data + 16,          stride<<1);
+    put_block_8x4(blocks+1*64,       data + 8,           stride<<1);
+    put_block_8x4(blocks+1*64 + 4*8, data + 24,          stride<<1);
+    put_block_8x4(blocks+2*64,       data + stride,      stride<<1);
+    put_block_8x4(blocks+2*64 + 4*8, data + 16 + stride, stride<<1);
+    put_block_8x4(blocks+3*64,       data + 8  + stride, stride<<1);
+    put_block_8x4(blocks+3*64 + 4*8, data + 24 + stride, stride<<1);
+}
+
 /* mb_x and mb_y are in units of 8 pixels */
 static int dv_decode_video_segment(AVCodecContext *avctx, void *arg)
 {
-    DVVideoContext *s = avctx->priv_data;
+    const DVDecContext *s = avctx->priv_data;
     DVwork_chunk *work_chunk = arg;
     int quant, dc, dct_mode, class1, j;
     int mb_index, mb_x, mb_y, last_index;
@@ -287,13 +404,19 @@ static int dv_decode_video_segment(AVCodecContext *avctx, void *arg)
     GetBitContext gb;
     BlockInfo mb_data[5 * DV_MAX_BPM], *mb, *mb1;
     LOCAL_ALIGNED_16(int16_t, sblock, [5 * DV_MAX_BPM], [64]);
-    LOCAL_ALIGNED_16(uint8_t, mb_bit_buffer, [80     + FF_INPUT_BUFFER_PADDING_SIZE]); /* allow some slack */
-    LOCAL_ALIGNED_16(uint8_t, vs_bit_buffer, [80 * 5 + FF_INPUT_BUFFER_PADDING_SIZE]); /* allow some slack */
-    const int log2_blocksize = 3-s->avctx->lowres;
+    LOCAL_ALIGNED_16(uint8_t, mb_bit_buffer, [80     + AV_INPUT_BUFFER_PADDING_SIZE]); /* allow some slack */
+    LOCAL_ALIGNED_16(uint8_t, vs_bit_buffer, [80 * 5 + AV_INPUT_BUFFER_PADDING_SIZE]); /* allow some slack */
+    const int log2_blocksize = 3 - avctx->lowres;
     int is_field_mode[5];
+    int vs_bit_buffer_damaged = 0;
+    int mb_bit_buffer_damaged[5] = {0};
+    int retried = 0;
+    int sta;
 
-    av_assert1((((int) mb_bit_buffer) & 7) == 0);
-    av_assert1((((int) vs_bit_buffer) & 7) == 0);
+    av_assert1((((uintptr_t) mb_bit_buffer) & 7) == 0);
+    av_assert1((((uintptr_t) vs_bit_buffer) & 7) == 0);
+
+retry:
 
     memset(sblock, 0, 5 * DV_MAX_BPM * sizeof(*sblock));
 
@@ -305,6 +428,14 @@ static int dv_decode_video_segment(AVCodecContext *avctx, void *arg)
     for (mb_index = 0; mb_index < 5; mb_index++, mb1 += s->sys->bpm, block1 += s->sys->bpm * 64) {
         /* skip header */
         quant    = buf_ptr[3] & 0x0f;
+        if (avctx->error_concealment) {
+            if ((buf_ptr[3] >> 4) == 0x0E)
+                vs_bit_buffer_damaged = 1;
+            if (!mb_index) {
+                sta = buf_ptr[3] >> 4;
+            } else if (sta != (buf_ptr[3] >> 4))
+                vs_bit_buffer_damaged = 1;
+        }
         buf_ptr += 4;
         init_put_bits(&pb, mb_bit_buffer, 80);
         mb    = mb1;
@@ -333,7 +464,7 @@ static int dv_decode_video_segment(AVCodecContext *avctx, void *arg)
                                     dct_mode                        * 22 * 64 +
                                     (quant + ff_dv_quant_offset[class1]) * 64];
             }
-            dc = dc << 2;
+            dc = dc * 4;
             /* convert to unsigned because 128 is not added in the
              * standard IDCT */
             dc                   += 1024;
@@ -349,10 +480,15 @@ static int dv_decode_video_segment(AVCodecContext *avctx, void *arg)
              * block is finished */
             if (mb->pos >= 64)
                 bit_copy(&pb, &gb);
+            if (mb->pos >= 64 && mb->pos < 127)
+                vs_bit_buffer_damaged = mb_bit_buffer_damaged[mb_index] = 1;
 
             block += 64;
             mb++;
         }
+
+        if (mb_bit_buffer_damaged[mb_index] > 0)
+            continue;
 
         /* pass 2: we can do it just after */
         ff_dlog(avctx, "***pass 2 size=%d MB#=%d\n", put_bits_count(&pb), mb_index);
@@ -367,6 +503,8 @@ static int dv_decode_video_segment(AVCodecContext *avctx, void *arg)
                 /* if still not finished, no need to parse other blocks */
                 if (mb->pos < 64)
                     break;
+                if (mb->pos < 127)
+                    vs_bit_buffer_damaged = mb_bit_buffer_damaged[mb_index] = 1;
             }
         }
         /* all blocks are finished, so the extra bytes can be used at
@@ -384,23 +522,31 @@ static int dv_decode_video_segment(AVCodecContext *avctx, void *arg)
     flush_put_bits(&vs_pb);
     for (mb_index = 0; mb_index < 5; mb_index++) {
         for (j = 0; j < s->sys->bpm; j++) {
-            if (mb->pos < 64 && get_bits_left(&gb) > 0) {
+            if (mb->pos < 64 && get_bits_left(&gb) > 0 && !vs_bit_buffer_damaged) {
                 ff_dlog(avctx, "start %d:%d\n", mb_index, j);
                 dv_decode_ac(&gb, mb, block);
             }
-            if (mb->pos >= 64 && mb->pos < 127)
+
+            if (mb->pos >= 64 && mb->pos < 127) {
                 av_log(avctx, AV_LOG_ERROR,
                        "AC EOB marker is absent pos=%d\n", mb->pos);
+                vs_bit_buffer_damaged = 1;
+            }
             block += 64;
             mb++;
         }
+    }
+    if (vs_bit_buffer_damaged && !retried) {
+        av_log(avctx, AV_LOG_ERROR, "Concealing bitstream errors\n");
+        retried = 1;
+        goto retry;
     }
 
     /* compute idct and place blocks */
     block = &sblock[0][0];
     mb    = mb_data;
     for (mb_index = 0; mb_index < 5; mb_index++) {
-        dv_calculate_mb_xy(s, work_chunk, mb_index, &mb_x, &mb_y);
+        dv_calculate_mb_xy(s->sys, s->buf, work_chunk, mb_index, &mb_x, &mb_y);
 
         /* idct_put'ting luminance */
         if ((s->sys->pix_fmt == AV_PIX_FMT_YUV420P)                      ||
@@ -413,14 +559,18 @@ static int dv_decode_video_segment(AVCodecContext *avctx, void *arg)
         }
         y_ptr    = s->frame->data[0] +
                    ((mb_y * s->frame->linesize[0] + mb_x) << log2_blocksize);
-        linesize = s->frame->linesize[0] << is_field_mode[mb_index];
-        mb[0].idct_put(y_ptr, linesize, block + 0 * 64);
-        if (s->sys->video_stype == 4) { /* SD 422 */
-            mb[2].idct_put(y_ptr + (1 << log2_blocksize),            linesize, block + 2 * 64);
+        if (mb_y == 134 && is_field_mode[mb_index]) {
+            dv100_idct_put_last_row_field_luma(s, y_ptr, s->frame->linesize[0], block);
         } else {
-            mb[1].idct_put(y_ptr + (1 << log2_blocksize),            linesize, block + 1 * 64);
-            mb[2].idct_put(y_ptr                         + y_stride, linesize, block + 2 * 64);
-            mb[3].idct_put(y_ptr + (1 << log2_blocksize) + y_stride, linesize, block + 3 * 64);
+            linesize = s->frame->linesize[0] << is_field_mode[mb_index];
+            mb[0].idct_put(y_ptr, linesize, block + 0 * 64);
+            if (s->sys->video_stype == 4) { /* SD 422 */
+                mb[2].idct_put(y_ptr + (1 << log2_blocksize),            linesize, block + 2 * 64);
+            } else {
+                mb[1].idct_put(y_ptr + (1 << log2_blocksize),            linesize, block + 1 * 64);
+                mb[2].idct_put(y_ptr                         + y_stride, linesize, block + 2 * 64);
+                mb[3].idct_put(y_ptr + (1 << log2_blocksize) + y_stride, linesize, block + 3 * 64);
+            }
         }
         mb    += 4;
         block += 4 * 64;
@@ -448,13 +598,19 @@ static int dv_decode_video_segment(AVCodecContext *avctx, void *arg)
                 mb++;
             } else {
                 y_stride = (mb_y == 134) ? (1 << log2_blocksize) :
-                           s->frame->linesize[j] << ((!is_field_mode[mb_index]) * log2_blocksize);
-                linesize = s->frame->linesize[j] << is_field_mode[mb_index];
-                (mb++)->idct_put(c_ptr, linesize, block);
-                block += 64;
-                if (s->sys->bpm == 8) {
-                    (mb++)->idct_put(c_ptr + y_stride, linesize, block);
+                    s->frame->linesize[j] << ((!is_field_mode[mb_index]) * log2_blocksize);
+                if (mb_y == 134 && is_field_mode[mb_index]) {
+                    dv100_idct_put_last_row_field_chroma(s, c_ptr, s->frame->linesize[j], block);
+                    mb += 2;
+                    block += 2*64;
+                } else {
+                    linesize = s->frame->linesize[j] << is_field_mode[mb_index];
+                    (mb++)->idct_put(c_ptr, linesize, block);
                     block += 64;
+                    if (s->sys->bpm == 8) {
+                        (mb++)->idct_put(c_ptr + y_stride, linesize, block);
+                        block += 64;
+                    }
                 }
             }
         }
@@ -464,12 +620,12 @@ static int dv_decode_video_segment(AVCodecContext *avctx, void *arg)
 
 /* NOTE: exactly one frame must be given (120000 bytes for NTSC,
  * 144000 bytes for PAL - or twice those for 50Mbps) */
-static int dvvideo_decode_frame(AVCodecContext *avctx, void *data,
+static int dvvideo_decode_frame(AVCodecContext *avctx, AVFrame *frame,
                                 int *got_frame, AVPacket *avpkt)
 {
     uint8_t *buf = avpkt->data;
     int buf_size = avpkt->size;
-    DVVideoContext *s = avctx->priv_data;
+    DVDecContext *s = avctx->priv_data;
     const uint8_t *vsc_pack;
     int apt, is16_9, ret;
     const AVDVProfile *sys;
@@ -481,20 +637,17 @@ static int dvvideo_decode_frame(AVCodecContext *avctx, void *data,
     }
 
     if (sys != s->sys) {
-        ret = ff_dv_init_dynamic_tables(s, sys);
-        if (ret < 0) {
-            av_log(avctx, AV_LOG_ERROR, "Error initializing the work tables.\n");
-            return ret;
-        }
+        ff_dv_init_dynamic_tables(s->work_chunks, sys);
         dv_init_weight_tables(s, sys);
         s->sys = sys;
     }
 
-    s->frame            = data;
-    s->frame->key_frame = 1;
-    s->frame->pict_type = AV_PICTURE_TYPE_I;
+    s->frame            = frame;
     avctx->pix_fmt      = s->sys->pix_fmt;
     avctx->framerate    = av_inv_q(s->sys->time_base);
+    avctx->bit_rate     = av_rescale_q(s->sys->frame_size,
+                                       (AVRational) { 8, 1 },
+                                       s->sys->time_base);
 
     ret = ff_set_dimensions(avctx, s->sys->width, s->sys->height);
     if (ret < 0)
@@ -502,21 +655,28 @@ static int dvvideo_decode_frame(AVCodecContext *avctx, void *data,
 
     /* Determine the codec's sample_aspect ratio from the packet */
     vsc_pack = buf + 80 * 5 + 48 + 5;
-    if (*vsc_pack == dv_video_control) {
+    if (*vsc_pack == DV_VIDEO_CONTROL) {
         apt    = buf[4] & 0x07;
         is16_9 = (vsc_pack[2] & 0x07) == 0x02 ||
                  (!apt && (vsc_pack[2] & 0x07) == 0x07);
         ff_set_sar(avctx, s->sys->sar[is16_9]);
     }
 
-    if ((ret = ff_get_buffer(avctx, s->frame, 0)) < 0)
+    if ((ret = ff_thread_get_buffer(avctx, frame, 0)) < 0)
         return ret;
-    s->frame->interlaced_frame = 1;
-    s->frame->top_field_first  = 0;
 
     /* Determine the codec's field order from the packet */
-    if ( *vsc_pack == dv_video_control ) {
-        s->frame->top_field_first = !(vsc_pack[3] & 0x40);
+    if ( *vsc_pack == DV_VIDEO_CONTROL ) {
+        if (avctx->height == 720) {
+            frame->flags &= ~AV_FRAME_FLAG_INTERLACED;
+            frame->flags &= ~AV_FRAME_FLAG_TOP_FIELD_FIRST;
+        } else if (avctx->height == 1080) {
+            frame->flags |= AV_FRAME_FLAG_INTERLACED;
+            frame->flags |= AV_FRAME_FLAG_TOP_FIELD_FIRST * ((vsc_pack[3] & 0x40) == 0x40);
+        } else {
+            frame->flags |= AV_FRAME_FLAG_INTERLACED * ((vsc_pack[3] & 0x10) == 0x10);
+            frame->flags |= AV_FRAME_FLAG_TOP_FIELD_FIRST * !(vsc_pack[3] & 0x40);
+        }
     }
 
     s->buf = buf;
@@ -531,14 +691,14 @@ static int dvvideo_decode_frame(AVCodecContext *avctx, void *data,
     return s->sys->frame_size;
 }
 
-AVCodec ff_dvvideo_decoder = {
-    .name           = "dvvideo",
-    .long_name      = NULL_IF_CONFIG_SMALL("DV (Digital Video)"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_DVVIDEO,
-    .priv_data_size = sizeof(DVVideoContext),
+const FFCodec ff_dvvideo_decoder = {
+    .p.name         = "dvvideo",
+    CODEC_LONG_NAME("DV (Digital Video)"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_DVVIDEO,
+    .priv_data_size = sizeof(DVDecContext),
     .init           = dvvideo_decode_init,
-    .decode         = dvvideo_decode_frame,
-    .capabilities   = CODEC_CAP_DR1 | CODEC_CAP_SLICE_THREADS,
-    .max_lowres     = 3,
+    FF_CODEC_DECODE_CB(dvvideo_decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_FRAME_THREADS | AV_CODEC_CAP_SLICE_THREADS,
+    .p.max_lowres   = 3,
 };

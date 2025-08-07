@@ -18,9 +18,18 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#ifndef AVCODEC_FRAME_THREAD_ENCODER_H
+#define AVCODEC_FRAME_THREAD_ENCODER_H
+
 #include "avcodec.h"
 
-int ff_frame_thread_encoder_init(AVCodecContext *avctx, AVDictionary *options);
+/**
+ * Initialize frame thread encoder.
+ * @note hardware encoders are not supported
+ */
+int ff_frame_thread_encoder_init(AVCodecContext *avctx);
 void ff_frame_thread_encoder_free(AVCodecContext *avctx);
-int ff_thread_video_encode_frame(AVCodecContext *avctx, AVPacket *pkt, const AVFrame *frame, int *got_packet_ptr);
+int ff_thread_video_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
+                                 AVFrame *frame, int *got_packet_ptr);
 
+#endif /* AVCODEC_FRAME_THREAD_ENCODER_H */

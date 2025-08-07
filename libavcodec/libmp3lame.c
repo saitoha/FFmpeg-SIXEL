@@ -31,10 +31,12 @@
 #include "libavutil/float_dsp.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/log.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "avcodec.h"
 #include "audio_frame_queue.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "encode.h"
 #include "mpegaudio.h"
 #include "mpegaudiodecheader.h"
 
@@ -50,9 +52,12 @@ typedef struct LAMEContext {
     int reservoir;
     int joint_stereo;
     int abr;
+    int delay_sent;
     float *samples_flt[2];
     AudioFrameQueue afq;
     AVFloatDSPContext *fdsp;
+    int copyright;
+    int original;
 } LAMEContext;
 
 
@@ -99,8 +104,9 @@ static av_cold int mp3lame_encode_init(AVCodecContext *avctx)
         return AVERROR(ENOMEM);
 
 
-    lame_set_num_channels(s->gfp, avctx->channels);
-    lame_set_mode(s->gfp, avctx->channels > 1 ? s->joint_stereo ? JOINT_STEREO : STEREO : MONO);
+    lame_set_num_channels(s->gfp, avctx->ch_layout.nb_channels);
+    lame_set_mode(s->gfp, avctx->ch_layout.nb_channels > 1 ?
+                          s->joint_stereo ? JOINT_STEREO : STEREO : MONO);
 
     /* sample rate */
     lame_set_in_samplerate (s->gfp, avctx->sample_rate);
@@ -111,7 +117,7 @@ static av_cold int mp3lame_encode_init(AVCodecContext *avctx)
         lame_set_quality(s->gfp, avctx->compression_level);
 
     /* rate control */
-    if (avctx->flags & CODEC_FLAG_QSCALE) { // VBR
+    if (avctx->flags & AV_CODEC_FLAG_QSCALE) { // VBR
         lame_set_VBR(s->gfp, vbr_default);
         lame_set_VBR_quality(s->gfp, avctx->global_quality / (float)FF_QP2LAMBDA);
     } else {
@@ -124,15 +130,25 @@ static av_cold int mp3lame_encode_init(AVCodecContext *avctx)
         }
     }
 
+    /* lowpass cutoff frequency */
+    if (avctx->cutoff)
+        lame_set_lowpassfreq(s->gfp, avctx->cutoff);
+
     /* do not get a Xing VBR header frame from LAME */
     lame_set_bWriteVbrTag(s->gfp,0);
 
     /* bit reservoir usage */
     lame_set_disable_reservoir(s->gfp, !s->reservoir);
 
+    /* copyright flag */
+    lame_set_copyright(s->gfp, s->copyright);
+
+    /* original flag */
+    lame_set_original(s->gfp, s->original);
+
     /* set specified parameters */
     if (lame_init_params(s->gfp) < 0) {
-        ret = -1;
+        ret = AVERROR_EXTERNAL;
         goto error;
     }
 
@@ -145,7 +161,7 @@ static av_cold int mp3lame_encode_init(AVCodecContext *avctx)
     /* allocate float sample buffers */
     if (avctx->sample_fmt == AV_SAMPLE_FMT_FLTP) {
         int ch;
-        for (ch = 0; ch < avctx->channels; ch++) {
+        for (ch = 0; ch < avctx->ch_layout.nb_channels; ch++) {
             s->samples_flt[ch] = av_malloc_array(avctx->frame_size,
                                            sizeof(*s->samples_flt[ch]));
             if (!s->samples_flt[ch]) {
@@ -159,7 +175,7 @@ static av_cold int mp3lame_encode_init(AVCodecContext *avctx)
     if (ret < 0)
         goto error;
 
-    s->fdsp = avpriv_float_dsp_alloc(avctx->flags & CODEC_FLAG_BITEXACT);
+    s->fdsp = avpriv_float_dsp_alloc(avctx->flags & AV_CODEC_FLAG_BITEXACT);
     if (!s->fdsp) {
         ret = AVERROR(ENOMEM);
         goto error;
@@ -185,7 +201,7 @@ static int mp3lame_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
 {
     LAMEContext *s = avctx->priv_data;
     MPADecodeHeader hdr;
-    int len, ret, ch;
+    int len, ret, ch, discard_padding;
     int lame_result;
     uint32_t h;
 
@@ -202,7 +218,7 @@ static int mp3lame_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
                 av_log(avctx, AV_LOG_ERROR, "inadequate AVFrame plane padding\n");
                 return AVERROR(EINVAL);
             }
-            for (ch = 0; ch < avctx->channels; ch++) {
+            for (ch = 0; ch < avctx->ch_layout.nb_channels; ch++) {
                 s->fdsp->vector_fmul_scalar(s->samples_flt[ch],
                                            (const float *)frame->data[ch],
                                            32768.0f,
@@ -225,7 +241,7 @@ static int mp3lame_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
                    "lame: output buffer too small (buffer index: %d, free bytes: %d)\n",
                    s->buffer_index, s->buffer_size - s->buffer_index);
         }
-        return -1;
+        return AVERROR(ENOMEM);
     }
     s->buffer_index += lame_result;
     ret = realloc_buffer(s);
@@ -246,19 +262,20 @@ static int mp3lame_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
     if (s->buffer_index < 4)
         return 0;
     h = AV_RB32(s->buffer);
-    if (ff_mpa_check_header(h) < 0) {
+
+    ret = avpriv_mpegaudio_decode_header(&hdr, h);
+    if (ret < 0) {
         av_log(avctx, AV_LOG_ERROR, "Invalid mp3 header at start of buffer\n");
         return AVERROR_BUG;
-    }
-    if (avpriv_mpegaudio_decode_header(&hdr, h)) {
+    } else if (ret) {
         av_log(avctx, AV_LOG_ERROR, "free format output not supported\n");
-        return -1;
+        return AVERROR_INVALIDDATA;
     }
     len = hdr.frame_size;
     ff_dlog(avctx, "in:%d packet-len:%d index:%d\n", avctx->frame_size, len,
             s->buffer_index);
     if (len <= s->buffer_index) {
-        if ((ret = ff_alloc_packet2(avctx, avpkt, len)) < 0)
+        if ((ret = ff_get_encode_buffer(avctx, avpkt, len, 0)) < 0)
             return ret;
         memcpy(avpkt->data, s->buffer, len);
         s->buffer_index -= len;
@@ -268,7 +285,25 @@ static int mp3lame_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
         ff_af_queue_remove(&s->afq, avctx->frame_size, &avpkt->pts,
                            &avpkt->duration);
 
-        avpkt->size = len;
+        discard_padding = avctx->frame_size - avpkt->duration;
+        // Check if subtraction resulted in an overflow
+        if ((discard_padding < avctx->frame_size) != (avpkt->duration > 0)) {
+            av_log(avctx, AV_LOG_ERROR, "discard padding overflow\n");
+            return AVERROR(EINVAL);
+        }
+        if ((!s->delay_sent && avctx->initial_padding > 0) || discard_padding > 0) {
+            uint8_t* side_data = av_packet_new_side_data(avpkt,
+                                                         AV_PKT_DATA_SKIP_SAMPLES,
+                                                         10);
+            if (!side_data)
+                return AVERROR(ENOMEM);
+            if (!s->delay_sent) {
+                AV_WL32(side_data, avctx->initial_padding);
+                s->delay_sent = 1;
+            }
+            AV_WL32(side_data + 4, discard_padding);
+        }
+
         *got_packet_ptr = 1;
     }
     return 0;
@@ -277,9 +312,11 @@ static int mp3lame_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
 #define OFFSET(x) offsetof(LAMEContext, x)
 #define AE AV_OPT_FLAG_AUDIO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
 static const AVOption options[] = {
-    { "reservoir",    "use bit reservoir", OFFSET(reservoir),    AV_OPT_TYPE_INT, { .i64 = 1 }, 0, 1, AE },
-    { "joint_stereo", "use joint stereo",  OFFSET(joint_stereo), AV_OPT_TYPE_INT, { .i64 = 1 }, 0, 1, AE },
-    { "abr",          "use ABR",           OFFSET(abr),          AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1, AE },
+    { "reservoir",    "use bit reservoir",  OFFSET(reservoir),    AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, AE },
+    { "joint_stereo", "use joint stereo",   OFFSET(joint_stereo), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, AE },
+    { "abr",          "use ABR",            OFFSET(abr),          AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, AE },
+    { "copyright",    "set copyright flag", OFFSET(copyright),    AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, AE},
+    { "original",     "set original flag",  OFFSET(original),     AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, AE},
     { NULL },
 };
 
@@ -290,7 +327,7 @@ static const AVClass libmp3lame_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-static const AVCodecDefault libmp3lame_defaults[] = {
+static const FFCodecDefault libmp3lame_defaults[] = {
     { "b",          "0" },
     { NULL },
 };
@@ -299,24 +336,22 @@ static const int libmp3lame_sample_rates[] = {
     44100, 48000,  32000, 22050, 24000, 16000, 11025, 12000, 8000, 0
 };
 
-AVCodec ff_libmp3lame_encoder = {
-    .name                  = "libmp3lame",
-    .long_name             = NULL_IF_CONFIG_SMALL("libmp3lame MP3 (MPEG audio layer 3)"),
-    .type                  = AVMEDIA_TYPE_AUDIO,
-    .id                    = AV_CODEC_ID_MP3,
+const FFCodec ff_libmp3lame_encoder = {
+    .p.name                = "libmp3lame",
+    CODEC_LONG_NAME("libmp3lame MP3 (MPEG audio layer 3)"),
+    .p.type                = AVMEDIA_TYPE_AUDIO,
+    .p.id                  = AV_CODEC_ID_MP3,
+    .p.capabilities        = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY |
+                             AV_CODEC_CAP_SMALL_LAST_FRAME,
+    .caps_internal         = FF_CODEC_CAP_NOT_INIT_THREADSAFE,
     .priv_data_size        = sizeof(LAMEContext),
     .init                  = mp3lame_encode_init,
-    .encode2               = mp3lame_encode_frame,
+    FF_CODEC_ENCODE_CB(mp3lame_encode_frame),
     .close                 = mp3lame_encode_close,
-    .capabilities          = CODEC_CAP_DELAY | CODEC_CAP_SMALL_LAST_FRAME,
-    .sample_fmts           = (const enum AVSampleFormat[]) { AV_SAMPLE_FMT_S32P,
-                                                             AV_SAMPLE_FMT_FLTP,
-                                                             AV_SAMPLE_FMT_S16P,
-                                                             AV_SAMPLE_FMT_NONE },
-    .supported_samplerates = libmp3lame_sample_rates,
-    .channel_layouts       = (const uint64_t[]) { AV_CH_LAYOUT_MONO,
-                                                  AV_CH_LAYOUT_STEREO,
-                                                  0 },
-    .priv_class            = &libmp3lame_class,
+    CODEC_SAMPLEFMTS(AV_SAMPLE_FMT_S32P, AV_SAMPLE_FMT_FLTP, AV_SAMPLE_FMT_S16P),
+    CODEC_SAMPLERATES_ARRAY(libmp3lame_sample_rates),
+    CODEC_CH_LAYOUTS(AV_CHANNEL_LAYOUT_MONO, AV_CHANNEL_LAYOUT_STEREO),
+    .p.priv_class          = &libmp3lame_class,
     .defaults              = libmp3lame_defaults,
+    .p.wrapper_name        = "libmp3lame",
 };

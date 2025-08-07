@@ -24,9 +24,11 @@
  * Microsoft Screen 3 (aka Microsoft ATC Screen) decoder
  */
 
+#include "libavutil/mem.h"
 #include "avcodec.h"
 #include "bytestream.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include "mathops.h"
 #include "mss34dsp.h"
 
@@ -91,7 +93,7 @@ typedef struct ImageBlockCoder {
 
 typedef struct DCTBlockCoder {
     int      *prev_dc;
-    int      prev_dc_stride;
+    ptrdiff_t prev_dc_stride;
     int      prev_dc_height;
     int      quality;
     uint16_t qmat[64];
@@ -298,6 +300,10 @@ static void rac_normalise(RangeCoder *c)
             c->got_error = 1;
             c->low = 1;
         }
+        if (c->low > c->range) {
+            c->got_error = 1;
+            c->low = 1;
+        }
         if (c->range >= RAC_BOTTOM)
             return;
     }
@@ -356,8 +362,9 @@ static int rac_get_model2_sym(RangeCoder *c, Model2 *m)
 
 static int rac_get_model_sym(RangeCoder *c, Model *m)
 {
-    int prob, prob2, helper, val;
+    int val;
     int end, end2;
+    unsigned prob, prob2, helper;
 
     prob       = 0;
     prob2      = c->range;
@@ -388,9 +395,10 @@ static int rac_get_model_sym(RangeCoder *c, Model *m)
 
 static int rac_get_model256_sym(RangeCoder *c, Model256 *m)
 {
-    int prob, prob2, helper, val;
+    int val;
     int start, end;
     int ssym;
+    unsigned prob, prob2, helper;
 
     prob2      = c->range;
     c->range >>= MODEL_SCALE;
@@ -450,7 +458,7 @@ static int decode_coeff(RangeCoder *c, Model *m)
 }
 
 static void decode_fill_block(RangeCoder *c, FillBlockCoder *fc,
-                              uint8_t *dst, int stride, int block_size)
+                              uint8_t *dst, ptrdiff_t stride, int block_size)
 {
     int i;
 
@@ -461,7 +469,7 @@ static void decode_fill_block(RangeCoder *c, FillBlockCoder *fc,
 }
 
 static void decode_image_block(RangeCoder *c, ImageBlockCoder *ic,
-                               uint8_t *dst, int stride, int block_size)
+                               uint8_t *dst, ptrdiff_t stride, int block_size)
 {
     int i, j;
     int vec_size;
@@ -557,7 +565,7 @@ static int decode_dct(RangeCoder *c, DCTBlockCoder *bc, int *block,
 }
 
 static void decode_dct_block(RangeCoder *c, DCTBlockCoder *bc,
-                             uint8_t *dst, int stride, int block_size,
+                             uint8_t *dst, ptrdiff_t stride, int block_size,
                              int *block, int mb_x, int mb_y)
 {
     int i, j;
@@ -580,8 +588,8 @@ static void decode_dct_block(RangeCoder *c, DCTBlockCoder *bc,
 }
 
 static void decode_haar_block(RangeCoder *c, HaarBlockCoder *hc,
-                              uint8_t *dst, int stride, int block_size,
-                              int *block)
+                              uint8_t *dst, ptrdiff_t stride,
+                              int block_size, int *block)
 {
     const int hsize = block_size >> 1;
     int A, B, C, D, t1, t2, t3, t4;
@@ -675,8 +683,8 @@ static av_cold void init_coders(MSS3Context *ctx)
     }
 }
 
-static int mss3_decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
-                             AVPacket *avpkt)
+static int mss3_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
+                             int *got_frame, AVPacket *avpkt)
 {
     const uint8_t *buf = avpkt->data;
     int buf_size = avpkt->size;
@@ -731,12 +739,15 @@ static int mss3_decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
         return buf_size;
     c->got_error = 0;
 
-    if ((ret = ff_reget_buffer(avctx, c->pic)) < 0)
+    if ((ret = ff_reget_buffer(avctx, c->pic, 0)) < 0)
         return ret;
-    c->pic->key_frame = keyframe;
+    if (keyframe)
+        c->pic->flags |= AV_FRAME_FLAG_KEY;
+    else
+        c->pic->flags &= ~AV_FRAME_FLAG_KEY;
     c->pic->pict_type = keyframe ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_P;
     if (!bytestream2_get_bytes_left(&gb)) {
-        if ((ret = av_frame_ref(data, c->pic)) < 0)
+        if ((ret = av_frame_ref(rframe, c->pic)) < 0)
             return ret;
         *got_frame      = 1;
 
@@ -795,7 +806,7 @@ static int mss3_decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
         dst[2] += c->pic->linesize[2] * 8;
     }
 
-    if ((ret = av_frame_ref(data, c->pic)) < 0)
+    if ((ret = av_frame_ref(rframe, c->pic)) < 0)
         return ret;
 
     *got_frame      = 1;
@@ -838,20 +849,13 @@ static av_cold int mss3_decode_init(AVCodecContext *avctx)
                                             b_width * b_height);
         if (!c->dct_coder[i].prev_dc) {
             av_log(avctx, AV_LOG_ERROR, "Cannot allocate buffer\n");
-            av_frame_free(&c->pic);
-            while (i >= 0) {
-                av_freep(&c->dct_coder[i].prev_dc);
-                i--;
-            }
             return AVERROR(ENOMEM);
         }
     }
 
     c->pic = av_frame_alloc();
-    if (!c->pic) {
-        mss3_decode_end(avctx);
+    if (!c->pic)
         return AVERROR(ENOMEM);
-    }
 
     avctx->pix_fmt     = AV_PIX_FMT_YUV420P;
 
@@ -860,14 +864,15 @@ static av_cold int mss3_decode_init(AVCodecContext *avctx)
     return 0;
 }
 
-AVCodec ff_msa1_decoder = {
-    .name           = "msa1",
-    .long_name      = NULL_IF_CONFIG_SMALL("MS ATC Screen"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_MSA1,
+const FFCodec ff_msa1_decoder = {
+    .p.name         = "msa1",
+    CODEC_LONG_NAME("MS ATC Screen"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_MSA1,
     .priv_data_size = sizeof(MSS3Context),
     .init           = mss3_decode_init,
     .close          = mss3_decode_end,
-    .decode         = mss3_decode_frame,
-    .capabilities   = CODEC_CAP_DR1,
+    FF_CODEC_DECODE_CB(mss3_decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };

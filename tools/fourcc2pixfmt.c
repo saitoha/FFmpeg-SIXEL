@@ -19,14 +19,15 @@
  */
 
 #include "config.h"
+#include <stdio.h>
 #if HAVE_UNISTD_H
 #include <unistd.h>             /* getopt */
 #endif
 
+#include "libavutil/avutil.h"
 #include "libavutil/pixdesc.h"
-#include "libavcodec/avcodec.h"
-#include "libavutil/common.h"
 #include "libavcodec/raw.h"
+#include "libavcodec/raw_pix_fmt_tags.h"
 
 #undef printf
 #undef fprintf
@@ -51,19 +52,15 @@ static void print_pix_fmt_fourccs(enum AVPixelFormat pix_fmt, const PixelFormatT
 {
     int i;
 
-    for (i = 0; pix_fmt_tags[i].pix_fmt != AV_PIX_FMT_NONE; i++) {
-        if (pix_fmt_tags[i].pix_fmt == pix_fmt) {
-            char buf[32];
-            av_get_codec_tag_string(buf, sizeof(buf), pix_fmt_tags[i].fourcc);
-            printf("%s%c", buf, sep);
-        }
-    }
+    for (i = 0; pix_fmt_tags[i].pix_fmt != AV_PIX_FMT_NONE; i++)
+        if (pix_fmt_tags[i].pix_fmt == pix_fmt)
+            printf("%s%c", av_fourcc2str(pix_fmt_tags[i].fourcc), sep);
 }
 
 int main(int argc, char **argv)
 {
     int i, list_fourcc_pix_fmt = 0, list_pix_fmt_fourccs = 0;
-    const PixelFormatTag *pix_fmt_tags = avpriv_get_raw_pix_fmt_tags();
+    const PixelFormatTag *pix_fmt_tags = raw_pix_fmt_tags;
     const char *pix_fmt_name = NULL;
     char c;
 
@@ -92,13 +89,10 @@ int main(int argc, char **argv)
         }
     }
 
-    if (list_fourcc_pix_fmt) {
-        for (i = 0; pix_fmt_tags[i].pix_fmt != AV_PIX_FMT_NONE; i++) {
-            char buf[32];
-            av_get_codec_tag_string(buf, sizeof(buf), pix_fmt_tags[i].fourcc);
-            printf("%s: %s\n", buf, av_get_pix_fmt_name(pix_fmt_tags[i].pix_fmt));
-        }
-    }
+    if (list_fourcc_pix_fmt)
+        for (i = 0; pix_fmt_tags[i].pix_fmt != AV_PIX_FMT_NONE; i++)
+            printf("%s: %s\n", av_fourcc2str(pix_fmt_tags[i].fourcc),
+                   av_get_pix_fmt_name(pix_fmt_tags[i].pix_fmt));
 
     if (list_pix_fmt_fourccs) {
         for (i = 0; av_pix_fmt_desc_get(i); i++) {

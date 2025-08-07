@@ -25,7 +25,9 @@
  */
 
 #include "libavutil/channel_layout.h"
+#include "libavutil/mem.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
 #define SEQ_FRAME_SIZE         6144
@@ -60,7 +62,7 @@ typedef struct SeqDemuxContext {
 } SeqDemuxContext;
 
 
-static int seq_probe(AVProbeData *p)
+static int seq_probe(const AVProbeData *p)
 {
     int i;
 
@@ -182,6 +184,17 @@ static int seq_parse_frame_data(SeqDemuxContext *seq, AVIOContext *pb)
     return 0;
 }
 
+static int seq_read_close(AVFormatContext *s)
+{
+    int i;
+    SeqDemuxContext *seq = s->priv_data;
+
+    for (i = 0; i < SEQ_NUM_FRAME_BUFFERS; i++)
+        av_freep(&seq->frame_buffers[i].data);
+
+    return 0;
+}
+
 static int seq_read_header(AVFormatContext *s)
 {
     int i, rc;
@@ -191,7 +204,7 @@ static int seq_read_header(AVFormatContext *s)
 
     /* init internal buffers */
     rc = seq_init_frame_buffers(seq, pb);
-    if (rc)
+    if (rc < 0)
         return rc;
 
     seq->current_frame_offs = 0;
@@ -199,7 +212,7 @@ static int seq_read_header(AVFormatContext *s)
     /* preload (no audio data, just buffer operations related data) */
     for (i = 1; i <= 100; i++) {
         rc = seq_parse_frame_data(seq, pb);
-        if (rc)
+        if (rc < 0)
             return rc;
     }
 
@@ -214,11 +227,11 @@ static int seq_read_header(AVFormatContext *s)
 
     avpriv_set_pts_info(st, 32, 1, SEQ_FRAME_RATE);
     seq->video_stream_index = st->index;
-    st->codec->codec_type = AVMEDIA_TYPE_VIDEO;
-    st->codec->codec_id = AV_CODEC_ID_TIERTEXSEQVIDEO;
-    st->codec->codec_tag = 0;  /* no fourcc */
-    st->codec->width = SEQ_FRAME_W;
-    st->codec->height = SEQ_FRAME_H;
+    st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+    st->codecpar->codec_id = AV_CODEC_ID_TIERTEXSEQVIDEO;
+    st->codecpar->codec_tag = 0;  /* no fourcc */
+    st->codecpar->width = SEQ_FRAME_W;
+    st->codecpar->height = SEQ_FRAME_H;
 
     /* initialize the audio decoder stream */
     st = avformat_new_stream(s, NULL);
@@ -228,15 +241,14 @@ static int seq_read_header(AVFormatContext *s)
     st->start_time = 0;
     avpriv_set_pts_info(st, 32, 1, SEQ_SAMPLE_RATE);
     seq->audio_stream_index = st->index;
-    st->codec->codec_type = AVMEDIA_TYPE_AUDIO;
-    st->codec->codec_id = AV_CODEC_ID_PCM_S16BE;
-    st->codec->codec_tag = 0;  /* no tag */
-    st->codec->channels = 1;
-    st->codec->channel_layout = AV_CH_LAYOUT_MONO;
-    st->codec->sample_rate = SEQ_SAMPLE_RATE;
-    st->codec->bits_per_coded_sample = 16;
-    st->codec->bit_rate = st->codec->sample_rate * st->codec->bits_per_coded_sample * st->codec->channels;
-    st->codec->block_align = st->codec->channels * st->codec->bits_per_coded_sample / 8;
+    st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
+    st->codecpar->codec_id = AV_CODEC_ID_PCM_S16BE;
+    st->codecpar->codec_tag = 0;  /* no tag */
+    st->codecpar->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
+    st->codecpar->sample_rate = SEQ_SAMPLE_RATE;
+    st->codecpar->bits_per_coded_sample = 16;
+    st->codecpar->bit_rate = st->codecpar->sample_rate * st->codecpar->bits_per_coded_sample * st->codecpar->ch_layout.nb_channels;
+    st->codecpar->block_align = st->codecpar->ch_layout.nb_channels * st->codecpar->bits_per_coded_sample / 8;
 
     return 0;
 }
@@ -254,8 +266,10 @@ static int seq_read_packet(AVFormatContext *s, AVPacket *pkt)
 
         /* video packet */
         if (seq->current_pal_data_size + seq->current_video_data_size != 0) {
-            if (av_new_packet(pkt, 1 + seq->current_pal_data_size + seq->current_video_data_size))
-                return AVERROR(ENOMEM);
+            rc = av_new_packet(pkt, 1 + seq->current_pal_data_size
+                                      + seq->current_video_data_size);
+            if (rc < 0)
+                return rc;
 
             pkt->data[0] = 0;
             if (seq->current_pal_data_size) {
@@ -295,21 +309,11 @@ static int seq_read_packet(AVFormatContext *s, AVPacket *pkt)
     return 0;
 }
 
-static int seq_read_close(AVFormatContext *s)
-{
-    int i;
-    SeqDemuxContext *seq = s->priv_data;
-
-    for (i = 0; i < SEQ_NUM_FRAME_BUFFERS; i++)
-        av_freep(&seq->frame_buffers[i].data);
-
-    return 0;
-}
-
-AVInputFormat ff_tiertexseq_demuxer = {
-    .name           = "tiertexseq",
-    .long_name      = NULL_IF_CONFIG_SMALL("Tiertex Limited SEQ"),
+const FFInputFormat ff_tiertexseq_demuxer = {
+    .p.name         = "tiertexseq",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Tiertex Limited SEQ"),
     .priv_data_size = sizeof(SeqDemuxContext),
+    .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
     .read_probe     = seq_probe,
     .read_header    = seq_read_header,
     .read_packet    = seq_read_packet,

@@ -23,7 +23,6 @@
 
 #include "libavutil/pixfmt.h"
 #include "libavutil/rational.h"
-#include "avcodec.h"
 
 /* minimum number of bytes to read from a DV stream in order to
  * determine the profile */
@@ -57,15 +56,6 @@ typedef struct AVDVProfile {
                                             /* in each frame in a 5 frames window */
     const uint8_t  (*audio_shuffle)[9];     /* PCM shuffling table */
 } AVDVProfile;
-
-#if FF_API_DV_FRAME_PROFILE
-/**
- * @deprecated use av_dv_frame_profile()
- */
-attribute_deprecated
-const AVDVProfile* avpriv_dv_frame_profile2(AVCodecContext* codec, const AVDVProfile *sys,
-                                            const uint8_t* frame, unsigned buf_size);
-#endif
 
 /**
  * Get a DV profile for the provided compressed frame.

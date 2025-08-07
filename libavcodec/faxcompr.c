@@ -24,6 +24,8 @@
  * CCITT Fax Group 3 and 4 decompression
  * @author Konstantin Shishkov
  */
+#include "libavutil/mem.h"
+#include "libavutil/thread.h"
 #include "avcodec.h"
 #include "get_bits.h"
 #include "put_bits.h"
@@ -94,34 +96,109 @@ static const uint8_t ccitt_group3_2d_lens[11] = {
     4, 3, 7, 6, 3, 1, 3, 6, 7, 7, 9
 };
 
-static VLC ccitt_vlc[2], ccitt_group3_2d_vlc;
+// Also contains the other VLC tables pointed to by ccitt_vlc
+static VLCElem ccitt_group3_2d_vlc[512 + 528 + 648];
+static const VLCElem *ccitt_vlc[2];
+
+static av_cold void ccitt_unpack_init(void)
+{
+    VLCInitState state = VLC_INIT_STATE(ccitt_group3_2d_vlc);
+    int i;
+
+    ff_vlc_init_tables(&state, 9, 11,
+                       ccitt_group3_2d_lens, 1, 1,
+                       ccitt_group3_2d_bits, 1, 1, 0);
+    for (i = 0; i < 2; i++) {
+        ccitt_vlc[i] = ff_vlc_init_tables_sparse(&state, 9, CCITT_SYMS,
+                                                 ccitt_codes_lens[i], 1, 1,
+                                                 ccitt_codes_bits[i], 1, 1,
+                                                 ccitt_syms, 2, 2, 0);
+    }
+}
 
 av_cold void ff_ccitt_unpack_init(void)
 {
-    static VLC_TYPE code_table1[528][2];
-    static VLC_TYPE code_table2[648][2];
-    int i;
-    static int initialized = 0;
-
-    if (initialized)
-        return;
-    ccitt_vlc[0].table = code_table1;
-    ccitt_vlc[0].table_allocated = 528;
-    ccitt_vlc[1].table = code_table2;
-    ccitt_vlc[1].table_allocated = 648;
-    for (i = 0; i < 2; i++) {
-        ff_init_vlc_sparse(&ccitt_vlc[i], 9, CCITT_SYMS,
-                           ccitt_codes_lens[i], 1, 1,
-                           ccitt_codes_bits[i], 1, 1,
-                           ccitt_syms, 2, 2,
-                           INIT_VLC_USE_NEW_STATIC);
-    }
-    INIT_VLC_STATIC(&ccitt_group3_2d_vlc, 9, 11,
-                    ccitt_group3_2d_lens, 1, 1,
-                    ccitt_group3_2d_bits, 1, 1, 512);
-    initialized = 1;
+    static AVOnce init_static_once = AV_ONCE_INIT;
+    ff_thread_once(&init_static_once, ccitt_unpack_init);
 }
 
+static int decode_uncompressed(AVCodecContext *avctx, GetBitContext *gb,
+                               unsigned int *pix_left, int **runs,
+                               const int *runend, int *mode)
+{
+    int eob = 0;
+    int newmode;
+    int saved_run = 0;
+
+    do {
+        int cwi, k;
+        int cw = 0;
+        int codes[2];
+        do {
+            cwi = show_bits(gb, 11);
+            if (!cwi) {
+                av_log(avctx, AV_LOG_ERROR, "Invalid uncompressed codeword\n");
+                return AVERROR_INVALIDDATA;
+            }
+            cwi = 10 - av_log2(cwi);
+            if (get_bits_left(gb) < cwi + 1)
+                return AVERROR_INVALIDDATA;
+            skip_bits(gb, cwi + 1);
+            if (cwi > 5) {
+                newmode = get_bits1(gb);
+                eob = 1;
+                cwi -= 6;
+            }
+            cw += cwi;
+        } while(cwi == 5);
+
+        codes[0] = cw;
+        codes[1] = !eob;
+
+        for (k = 0; k < 2; k++) {
+            if (codes[k]) {
+                if (*mode == !k) {
+                    *(*runs)++ = saved_run;
+                    if (*runs >= runend) {
+                        av_log(avctx, AV_LOG_ERROR, "uncompressed run overrun\n");
+                        return AVERROR_INVALIDDATA;
+                    }
+                    if (*pix_left <= saved_run) {
+                        av_log(avctx, AV_LOG_ERROR, "uncompressed run went out of bounds\n");
+                        return AVERROR_INVALIDDATA;
+                    }
+                    *pix_left -= saved_run;
+                    saved_run = 0;
+                    *mode = !*mode;
+                }
+                saved_run += codes[k];
+            }
+        }
+    } while (!eob);
+    *(*runs)++ = saved_run;
+    if (*runs >= runend) {
+        av_log(avctx, AV_LOG_ERROR, "uncompressed run overrun\n");
+        return AVERROR_INVALIDDATA;
+    }
+    if (*pix_left <= saved_run) {
+        if (*pix_left == saved_run)
+            return 1;
+        av_log(avctx, AV_LOG_ERROR, "uncompressed run went out of boundsE\n");
+        return AVERROR_INVALIDDATA;
+    }
+    *pix_left -= saved_run;
+    saved_run = 0;
+    *mode = !*mode;
+    if (newmode != *mode) { //FIXME CHECK
+        *(*runs)++ = 0;
+        if (*runs >= runend) {
+            av_log(avctx, AV_LOG_ERROR, "uncompressed run overrun\n");
+            return AVERROR_INVALIDDATA;
+        }
+        *mode = newmode;
+    }
+    return 0;
+}
 
 static int decode_group3_1d_line(AVCodecContext *avctx, GetBitContext *gb,
                                  unsigned int pix_left, int *runs,
@@ -131,7 +208,9 @@ static int decode_group3_1d_line(AVCodecContext *avctx, GetBitContext *gb,
     unsigned int run = 0;
     unsigned int t;
     for (;;) {
-        t    = get_vlc2(gb, ccitt_vlc[mode].table, 9, 2);
+        if (get_bits_left(gb) <= 0)
+            return AVERROR_INVALIDDATA;
+        t    = get_vlc2(gb, ccitt_vlc[mode], 9, 2);
         run += t;
         if (t < 64) {
             *runs++ = run;
@@ -149,8 +228,18 @@ static int decode_group3_1d_line(AVCodecContext *avctx, GetBitContext *gb,
             run       = 0;
             mode      = !mode;
         } else if ((int)t == -1) {
-            av_log(avctx, AV_LOG_ERROR, "Incorrect code\n");
-            return AVERROR_INVALIDDATA;
+            if (get_bits_left(gb) > 12 && show_bits(gb, 12) == 15) {
+                int ret;
+                skip_bits(gb, 12);
+                ret = decode_uncompressed(avctx, gb, &pix_left, &runs, runend, &mode);
+                if (ret < 0) {
+                    return ret;
+                } else if (ret)
+                    break;
+            } else {
+                av_log(avctx, AV_LOG_ERROR, "Incorrect code\n");
+                return AVERROR_INVALIDDATA;
+            }
         }
     }
     *runs++ = 0;
@@ -166,7 +255,10 @@ static int decode_group3_2d_line(AVCodecContext *avctx, GetBitContext *gb,
     unsigned int offs = 0, run = 0;
 
     while (offs < width) {
-        int cmode = get_vlc2(gb, ccitt_group3_2d_vlc.table, 9, 1);
+        int cmode;
+        if (get_bits_left(gb) <= 0)
+            return AVERROR_INVALIDDATA;
+        cmode = get_vlc2(gb, ccitt_group3_2d_vlc, 9, 1);
         if (cmode == -1) {
             av_log(avctx, AV_LOG_ERROR, "Incorrect mode VLC\n");
             return AVERROR_INVALIDDATA;
@@ -188,7 +280,9 @@ static int decode_group3_2d_line(AVCodecContext *avctx, GetBitContext *gb,
             for (k = 0; k < 2; k++) {
                 run = 0;
                 for (;;) {
-                    t = get_vlc2(gb, ccitt_vlc[mode].table, 9, 2);
+                    if (get_bits_left(gb) <= 0)
+                        return AVERROR_INVALIDDATA;
+                    t = get_vlc2(gb, ccitt_vlc[mode], 9, 2);
                     if (t == -1) {
                         av_log(avctx, AV_LOG_ERROR, "Incorrect code\n");
                         return AVERROR_INVALIDDATA;
@@ -211,8 +305,28 @@ static int decode_group3_2d_line(AVCodecContext *avctx, GetBitContext *gb,
                 mode = !mode;
             }
         } else if (cmode == 9 || cmode == 10) {
-            avpriv_report_missing_feature(avctx, "Special modes support");
-            return AVERROR_PATCHWELCOME;
+            int xxx;
+            if (get_bits_left(gb) < 3)
+                return AVERROR_INVALIDDATA;
+            xxx = get_bits(gb, 3);
+            if (cmode == 9 && xxx == 7) {
+                int ret;
+                int pix_left = width - offs;
+
+                if (saved_run) {
+                    av_log(avctx, AV_LOG_ERROR, "saved run %d on entering uncompressed mode\n", saved_run);
+                    return AVERROR_INVALIDDATA;
+                }
+                ret = decode_uncompressed(avctx, gb, &pix_left, &runs, runend, &mode);
+                offs = width - pix_left;
+                if (ret < 0) {
+                    return ret;
+                } else if (ret)
+                    break;
+            } else {
+                avpriv_report_missing_feature(avctx, "Special mode %d xxx=%d support", cmode, xxx);
+                return AVERROR_PATCHWELCOME;
+            }
         } else { //vertical mode
             run      = run_off - offs + (cmode - 5);
             run_off -= *--ref;

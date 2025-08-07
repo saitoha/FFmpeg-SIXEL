@@ -22,8 +22,14 @@
 #ifndef AVCODEC_PRORESDEC_H
 #define AVCODEC_PRORESDEC_H
 
+#include <stdint.h>
+
+#include "get_bits.h"
 #include "blockdsp.h"
 #include "proresdsp.h"
+
+#include "libavutil/frame.h"
+#include "libavutil/pixfmt.h"
 
 typedef struct {
     const uint8_t *data;
@@ -50,6 +56,8 @@ typedef struct {
     const uint8_t *scan;
     int first_field;
     int alpha_info;
+    void (*unpack_alpha)(GetBitContext *gb, uint16_t *dst, int num_coeffs, const int num_bits);
+    enum AVPixelFormat pix_fmt;
 } ProresContext;
 
 #endif /* AVCODEC_PRORESDEC_H */

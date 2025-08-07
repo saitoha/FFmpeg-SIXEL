@@ -21,23 +21,19 @@
  */
 
 #include "config.h"
-#if HAVE_ALTIVEC_H
-#include <altivec.h>
-#endif
 
 #include "libavutil/attributes.h"
 #include "libavutil/cpu.h"
 #include "libavutil/ppc/cpu.h"
-#include "libavutil/ppc/types_altivec.h"
 #include "libavutil/ppc/util_altivec.h"
-#include "libavcodec/avcodec.h"
+
 #include "libavcodec/pixblockdsp.h"
 
 #if HAVE_ALTIVEC
 
 #if HAVE_VSX
 static void get_pixels_altivec(int16_t *restrict block, const uint8_t *pixels,
-                               ptrdiff_t line_size)
+                               ptrdiff_t stride)
 {
     int i;
     vector unsigned char perm =
@@ -59,34 +55,32 @@ static void get_pixels_altivec(int16_t *restrict block, const uint8_t *pixels,
         // Save the data to the block, we assume the block is 16-byte aligned.
         vec_vsx_st(shorts, i * 16, (vector signed short *) block);
 
-        pixels += line_size;
+        pixels += stride;
     }
 }
 #else
 static void get_pixels_altivec(int16_t *restrict block, const uint8_t *pixels,
-                               ptrdiff_t line_size)
+                               ptrdiff_t stride)
 {
     int i;
-    vector unsigned char perm = vec_lvsl(0, pixels);
-    const vector unsigned char zero =
-        (const vector unsigned char) vec_splat_u8(0);
+    const vec_u8 zero = (const vec_u8)vec_splat_u8(0);
 
     for (i = 0; i < 8; i++) {
+        vec_u8 perm = vec_lvsl(0, pixels);
         /* Read potentially unaligned pixels.
          * We're reading 16 pixels, and actually only want 8,
          * but we simply ignore the extras. */
-        vector unsigned char pixl = vec_ld(0, pixels);
-        vector unsigned char pixr = vec_ld(7, pixels);
-        vector unsigned char bytes = vec_perm(pixl, pixr, perm);
+        vec_u8 pixl = vec_ld(0, pixels);
+        vec_u8 pixr = vec_ld(7, pixels);
+        vec_u8 bytes = vec_perm(pixl, pixr, perm);
 
         // Convert the bytes into shorts.
-        vector signed short shorts = (vector signed short) vec_mergeh(zero,
-                                                                      bytes);
+        vec_s16 shorts = (vec_s16)vec_mergeh(zero, bytes);
 
         // Save the data to the block, we assume the block is 16-byte aligned.
-        vec_st(shorts, i * 16, (vector signed short *) block);
+        vec_st(shorts, i * 16, (vec_s16 *)block);
 
-        pixels += line_size;
+        pixels += stride;
     }
 }
 
@@ -94,7 +88,7 @@ static void get_pixels_altivec(int16_t *restrict block, const uint8_t *pixels,
 
 #if HAVE_VSX
 static void diff_pixels_altivec(int16_t *restrict block, const uint8_t *s1,
-                                const uint8_t *s2, int stride)
+                                const uint8_t *s2, ptrdiff_t stride)
 {
   int i;
   const vector unsigned char zero =
@@ -156,39 +150,39 @@ static void diff_pixels_altivec(int16_t *restrict block, const uint8_t *s1,
 }
 #else
 static void diff_pixels_altivec(int16_t *restrict block, const uint8_t *s1,
-                                const uint8_t *s2, int stride)
+                                const uint8_t *s2, ptrdiff_t stride)
 {
     int i;
-    vector unsigned char perm1 = vec_lvsl(0, s1);
-    vector unsigned char perm2 = vec_lvsl(0, s2);
-    const vector unsigned char zero =
-        (const vector unsigned char) vec_splat_u8(0);
-    vector signed short shorts1, shorts2;
+    vec_u8 perm;
+    const vec_u8 zero = (const vec_u8)vec_splat_u8(0);
+    vec_s16 shorts1, shorts2;
 
     for (i = 0; i < 4; i++) {
         /* Read potentially unaligned pixels.
          * We're reading 16 pixels, and actually only want 8,
          * but we simply ignore the extras. */
-        vector unsigned char pixl  = vec_ld(0,  s1);
-        vector unsigned char pixr  = vec_ld(15, s1);
-        vector unsigned char bytes = vec_perm(pixl, pixr, perm1);
+        perm = vec_lvsl(0, s1);
+        vec_u8 pixl  = vec_ld(0,  s1);
+        vec_u8 pixr  = vec_ld(15, s1);
+        vec_u8 bytes = vec_perm(pixl, pixr, perm);
 
         // Convert the bytes into shorts.
-        shorts1 = (vector signed short) vec_mergeh(zero, bytes);
+        shorts1 = (vec_s16)vec_mergeh(zero, bytes);
 
         // Do the same for the second block of pixels.
+        perm = vec_lvsl(0, s2);
         pixl  = vec_ld(0,  s2);
         pixr  = vec_ld(15, s2);
-        bytes = vec_perm(pixl, pixr, perm2);
+        bytes = vec_perm(pixl, pixr, perm);
 
         // Convert the bytes into shorts.
-        shorts2 = (vector signed short) vec_mergeh(zero, bytes);
+        shorts2 = (vec_s16)vec_mergeh(zero, bytes);
 
         // Do the subtraction.
         shorts1 = vec_sub(shorts1, shorts2);
 
         // Save the data to the block, we assume the block is 16-byte aligned.
-        vec_st(shorts1, 0, (vector signed short *) block);
+        vec_st(shorts1, 0, (vec_s16 *)block);
 
         s1    += stride;
         s2    += stride;
@@ -200,26 +194,28 @@ static void diff_pixels_altivec(int16_t *restrict block, const uint8_t *s1,
         /* Read potentially unaligned pixels.
          * We're reading 16 pixels, and actually only want 8,
          * but we simply ignore the extras. */
+        perm = vec_lvsl(0, s1);
         pixl  = vec_ld(0,  s1);
         pixr  = vec_ld(15, s1);
-        bytes = vec_perm(pixl, pixr, perm1);
+        bytes = vec_perm(pixl, pixr, perm);
 
         // Convert the bytes into shorts.
-        shorts1 = (vector signed short) vec_mergeh(zero, bytes);
+        shorts1 = (vec_s16)vec_mergeh(zero, bytes);
 
         // Do the same for the second block of pixels.
+        perm = vec_lvsl(0, s2);
         pixl  = vec_ld(0,  s2);
         pixr  = vec_ld(15, s2);
-        bytes = vec_perm(pixl, pixr, perm2);
+        bytes = vec_perm(pixl, pixr, perm);
 
         // Convert the bytes into shorts.
-        shorts2 = (vector signed short) vec_mergeh(zero, bytes);
+        shorts2 = (vec_s16)vec_mergeh(zero, bytes);
 
         // Do the subtraction.
         shorts1 = vec_sub(shorts1, shorts2);
 
         // Save the data to the block, we assume the block is 16-byte aligned.
-        vec_st(shorts1, 0, (vector signed short *) block);
+        vec_st(shorts1, 0, (vec_s16 *)block);
 
         s1    += stride;
         s2    += stride;
@@ -231,8 +227,41 @@ static void diff_pixels_altivec(int16_t *restrict block, const uint8_t *s1,
 
 #endif /* HAVE_ALTIVEC */
 
+#if HAVE_VSX
+static void get_pixels_vsx(int16_t *restrict block, const uint8_t *pixels,
+                           ptrdiff_t stride)
+{
+    int i;
+    for (i = 0; i < 8; i++) {
+        vec_s16 shorts = vsx_ld_u8_s16(0, pixels);
+
+        vec_vsx_st(shorts, i * 16, block);
+
+        pixels += stride;
+    }
+}
+
+static void diff_pixels_vsx(int16_t *restrict block, const uint8_t *s1,
+                            const uint8_t *s2, ptrdiff_t stride)
+{
+    int i;
+    vec_s16 shorts1, shorts2;
+    for (i = 0; i < 8; i++) {
+        shorts1 = vsx_ld_u8_s16(0, s1);
+        shorts2 = vsx_ld_u8_s16(0, s2);
+
+        shorts1 = vec_sub(shorts1, shorts2);
+
+        vec_vsx_st(shorts1, 0, block);
+
+        s1    += stride;
+        s2    += stride;
+        block += 8;
+    }
+}
+#endif /* HAVE_VSX */
+
 av_cold void ff_pixblockdsp_init_ppc(PixblockDSPContext *c,
-                                     AVCodecContext *avctx,
                                      unsigned high_bit_depth)
 {
 #if HAVE_ALTIVEC
@@ -245,4 +274,14 @@ av_cold void ff_pixblockdsp_init_ppc(PixblockDSPContext *c,
         c->get_pixels = get_pixels_altivec;
     }
 #endif /* HAVE_ALTIVEC */
+
+#if HAVE_VSX
+    if (!PPC_VSX(av_get_cpu_flags()))
+        return;
+
+    c->diff_pixels = diff_pixels_vsx;
+
+    if (!high_bit_depth)
+        c->get_pixels = get_pixels_vsx;
+#endif /* HAVE_VSX */
 }

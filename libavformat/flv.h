@@ -35,6 +35,12 @@
 
 #define FLV_VIDEO_FRAMETYPE_OFFSET   4
 
+/* Extended VideoTagHeader
+ * defined in reference link:
+ * https://github.com/veovera/enhanced-rtmp/blob/main/enhanced-rtmp-v1.pdf
+ * */
+#define FLV_IS_EX_HEADER          0x80
+
 /* bitmasks to isolate specific values */
 #define FLV_AUDIO_CHANNEL_MASK    0x01
 #define FLV_AUDIO_SAMPLESIZE_MASK 0x02
@@ -42,7 +48,7 @@
 #define FLV_AUDIO_CODECID_MASK    0xf0
 
 #define FLV_VIDEO_CODECID_MASK    0x0f
-#define FLV_VIDEO_FRAMETYPE_MASK  0xf0
+#define FLV_VIDEO_FRAMETYPE_MASK  0x70
 
 #define AMF_END_OF_OBJECT         0x09
 
@@ -56,7 +62,7 @@ enum {
     FLV_HEADER_FLAG_HASAUDIO = 4,
 };
 
-enum {
+enum FlvTagType {
     FLV_TAG_TYPE_AUDIO = 0x08,
     FLV_TAG_TYPE_VIDEO = 0x09,
     FLV_TAG_TYPE_META  = 0x12,
@@ -65,6 +71,7 @@ enum {
 enum {
     FLV_STREAM_TYPE_VIDEO,
     FLV_STREAM_TYPE_AUDIO,
+    FLV_STREAM_TYPE_SUBTITLE,
     FLV_STREAM_TYPE_DATA,
     FLV_STREAM_TYPE_NB,
 };
@@ -96,6 +103,7 @@ enum {
     FLV_CODECID_NELLYMOSER           = 6 << FLV_AUDIO_CODECID_OFFSET,
     FLV_CODECID_PCM_ALAW             = 7 << FLV_AUDIO_CODECID_OFFSET,
     FLV_CODECID_PCM_MULAW            = 8 << FLV_AUDIO_CODECID_OFFSET,
+    FLV_CODECID_EX_HEADER            = 9 << FLV_AUDIO_CODECID_OFFSET,
     FLV_CODECID_AAC                  = 10<< FLV_AUDIO_CODECID_OFFSET,
     FLV_CODECID_SPEEX                = 11<< FLV_AUDIO_CODECID_OFFSET,
 };
@@ -109,6 +117,43 @@ enum {
     FLV_CODECID_H264    = 7,
     FLV_CODECID_REALH263= 8,
     FLV_CODECID_MPEG4   = 9,
+
+    // non-standard protocol extension that is in use in the wild
+    FLV_CODECID_X_HEVC  = 12,
+};
+
+enum {
+    PacketTypeSequenceStart         = 0,
+    PacketTypeCodedFrames           = 1,
+    PacketTypeSequenceEnd           = 2,
+    PacketTypeCodedFramesX          = 3,
+    PacketTypeMetadata              = 4,
+    PacketTypeMPEG2TSSequenceStart  = 5,
+    PacketTypeMultitrack            = 6,
+    PacketTypeModEx                 = 7,
+};
+
+enum {
+    AudioPacketTypeSequenceStart      = 0,
+    AudioPacketTypeCodedFrames        = 1,
+    AudioPacketTypeMultichannelConfig = 4,
+    AudioPacketTypeMultitrack         = 5,
+};
+
+enum {
+    PacketModExTypeTimestampOffsetNano = 0,
+};
+
+enum {
+    AudioChannelOrderUnspecified = 0,
+    AudioChannelOrderNative      = 1,
+    AudioChannelOrderCustom      = 2,
+};
+
+enum {
+    MultitrackTypeOneTrack             = 0x00,
+    MultitrackTypeManyTracks           = 0x10,
+    MultitrackTypeManyTracksManyCodecs = 0x20,
 };
 
 enum {

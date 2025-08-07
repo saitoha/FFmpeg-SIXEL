@@ -1,6 +1,6 @@
 /*
  * Microsoft Video-1 Decoder
- * Copyright (c) 2003 The FFmpeg Project
+ * Copyright (C) 2003 The FFmpeg project
  *
  * This file is part of FFmpeg.
  *
@@ -24,17 +24,15 @@
  * Microsoft Video-1 Decoder by Mike Melanson (melanson@pcisys.net)
  * For more information about the MS Video-1 format, visit:
  *   http://www.pcisys.net/~melanson/codecs/
- *
  */
 
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include "libavutil/internal.h"
 #include "libavutil/intreadwrite.h"
 #include "avcodec.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 
 #define PALETTE_COUNT 256
 #define CHECK_STREAM_PTR(n) \
@@ -62,6 +60,9 @@ static av_cold int msvideo1_decode_init(AVCodecContext *avctx)
     Msvideo1Context *s = avctx->priv_data;
 
     s->avctx = avctx;
+
+    if (avctx->width < 4 || avctx->height < 4)
+        return AVERROR_INVALIDDATA;
 
     /* figure out the colorspace based on the presence of a palette */
     if (s->avctx->bits_per_coded_sample == 8) {
@@ -290,9 +291,8 @@ static void msvideo1_decode_16bit(Msvideo1Context *s)
     }
 }
 
-static int msvideo1_decode_frame(AVCodecContext *avctx,
-                                void *data, int *got_frame,
-                                AVPacket *avpkt)
+static int msvideo1_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
+                                 int *got_frame, AVPacket *avpkt)
 {
     const uint8_t *buf = avpkt->data;
     int buf_size = avpkt->size;
@@ -302,16 +302,17 @@ static int msvideo1_decode_frame(AVCodecContext *avctx,
     s->buf = buf;
     s->size = buf_size;
 
-    if ((ret = ff_reget_buffer(avctx, s->frame)) < 0)
+    // Discard frame if its smaller than the minimum frame size
+    if (buf_size < (avctx->width/4) * (avctx->height/4) / 512) {
+        av_log(avctx, AV_LOG_ERROR, "Packet is too small\n");
+        return AVERROR_INVALIDDATA;
+    }
+
+    if ((ret = ff_reget_buffer(avctx, s->frame, 0)) < 0)
         return ret;
 
     if (s->mode_8bit) {
-        const uint8_t *pal = av_packet_get_side_data(avpkt, AV_PKT_DATA_PALETTE, NULL);
-
-        if (pal) {
-            memcpy(s->pal, pal, AVPALETTE_SIZE);
-            s->frame->palette_has_changed = 1;
-        }
+        ff_copy_palette(s->pal, avpkt, avctx);
     }
 
     if (s->mode_8bit)
@@ -319,7 +320,7 @@ static int msvideo1_decode_frame(AVCodecContext *avctx,
     else
         msvideo1_decode_16bit(s);
 
-    if ((ret = av_frame_ref(data, s->frame)) < 0)
+    if ((ret = av_frame_ref(rframe, s->frame)) < 0)
         return ret;
 
     *got_frame      = 1;
@@ -337,14 +338,14 @@ static av_cold int msvideo1_decode_end(AVCodecContext *avctx)
     return 0;
 }
 
-AVCodec ff_msvideo1_decoder = {
-    .name           = "msvideo1",
-    .long_name      = NULL_IF_CONFIG_SMALL("Microsoft Video 1"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_MSVIDEO1,
+const FFCodec ff_msvideo1_decoder = {
+    .p.name         = "msvideo1",
+    CODEC_LONG_NAME("Microsoft Video 1"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_MSVIDEO1,
     .priv_data_size = sizeof(Msvideo1Context),
     .init           = msvideo1_decode_init,
     .close          = msvideo1_decode_end,
-    .decode         = msvideo1_decode_frame,
-    .capabilities   = CODEC_CAP_DR1,
+    FF_CODEC_DECODE_CB(msvideo1_decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1,
 };

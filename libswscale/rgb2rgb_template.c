@@ -322,11 +322,47 @@ static inline void shuffle_bytes_2103_c(const uint8_t *src, uint8_t *dst,
     uint8_t *d       = dst - idx;
 
     for (; idx < 15; idx += 4) {
-        register int v        = *(const uint32_t *)&s[idx], g = v & 0xff00ff00;
+        register unsigned v   = *(const uint32_t *)&s[idx], g = v & 0xff00ff00;
         v                    &= 0xff00ff;
         *(uint32_t *)&d[idx]  = (v >> 16) + g + (v << 16);
     }
 }
+
+static inline void shuffle_bytes_0321_c(const uint8_t *src, uint8_t *dst,
+                                        int src_size)
+{
+    int idx          = 15  - src_size;
+    const uint8_t *s = src - idx;
+    uint8_t *d       = dst - idx;
+
+    for (; idx < 15; idx += 4) {
+        register unsigned v   = *(const uint32_t *)&s[idx], g = v & 0x00ff00ff;
+        v                    &= 0xff00ff00;
+        *(uint32_t *)&d[idx]  = (v >> 16) + g + (v << 16);
+    }
+}
+
+#define DEFINE_SHUFFLE_BYTES(name, a, b, c, d)                          \
+static void shuffle_bytes_##name (const uint8_t *src,                   \
+                                        uint8_t *dst, int src_size)     \
+{                                                                       \
+    int i;                                                              \
+                                                                        \
+    for (i = 0; i < src_size; i += 4) {                                 \
+        dst[i + 0] = src[i + a];                                        \
+        dst[i + 1] = src[i + b];                                        \
+        dst[i + 2] = src[i + c];                                        \
+        dst[i + 3] = src[i + d];                                        \
+    }                                                                   \
+}
+
+DEFINE_SHUFFLE_BYTES(1230_c, 1, 2, 3, 0)
+DEFINE_SHUFFLE_BYTES(3012_c, 3, 0, 1, 2)
+DEFINE_SHUFFLE_BYTES(3210_c, 3, 2, 1, 0)
+DEFINE_SHUFFLE_BYTES(3102_c, 3, 1, 0, 2)
+DEFINE_SHUFFLE_BYTES(2013_c, 2, 0, 1, 3)
+DEFINE_SHUFFLE_BYTES(2130_c, 2, 1, 3, 0)
+DEFINE_SHUFFLE_BYTES(1203_c, 1, 2, 0, 3)
 
 static inline void rgb24tobgr24_c(const uint8_t *src, uint8_t *dst, int src_size)
 {
@@ -608,70 +644,69 @@ static inline void uyvytoyv12_c(const uint8_t *src, uint8_t *ydst,
 }
 
 /**
- * Height should be a multiple of 2 and width should be a multiple of 2.
+ * width should be a multiple of 2.
  * (If this is a problem for anyone then tell me, and I will fix it.)
- * Chrominance data is only taken from every second line,
- * others are ignored in the C version.
- * FIXME: Write HQ version.
  */
 void ff_rgb24toyv12_c(const uint8_t *src, uint8_t *ydst, uint8_t *udst,
                    uint8_t *vdst, int width, int height, int lumStride,
-                   int chromStride, int srcStride, int32_t *rgb2yuv)
+                   int chromStride, int srcStride, const int32_t *rgb2yuv)
 {
     int32_t ry = rgb2yuv[RY_IDX], gy = rgb2yuv[GY_IDX], by = rgb2yuv[BY_IDX];
     int32_t ru = rgb2yuv[RU_IDX], gu = rgb2yuv[GU_IDX], bu = rgb2yuv[BU_IDX];
     int32_t rv = rgb2yuv[RV_IDX], gv = rgb2yuv[GV_IDX], bv = rgb2yuv[BV_IDX];
     int y;
     const int chromWidth = width >> 1;
+    const uint8_t *src1 = src;
+    const uint8_t *src2 = src1 + srcStride;
+    uint8_t *ydst1 = ydst;
+    uint8_t *ydst2 = ydst + lumStride;
 
     for (y = 0; y < height; y += 2) {
         int i;
-        for (i = 0; i < chromWidth; i++) {
-            unsigned int b = src[6 * i + 0];
-            unsigned int g = src[6 * i + 1];
-            unsigned int r = src[6 * i + 2];
-
-            unsigned int Y = ((ry * r + gy * g + by * b) >> RGB2YUV_SHIFT) +  16;
-            unsigned int V = ((rv * r + gv * g + bv * b) >> RGB2YUV_SHIFT) + 128;
-            unsigned int U = ((ru * r + gu * g + bu * b) >> RGB2YUV_SHIFT) + 128;
-
-            udst[i]     = U;
-            vdst[i]     = V;
-            ydst[2 * i] = Y;
-
-            b = src[6 * i + 3];
-            g = src[6 * i + 4];
-            r = src[6 * i + 5];
-
-            Y = ((ry * r + gy * g + by * b) >> RGB2YUV_SHIFT) + 16;
-            ydst[2 * i + 1] = Y;
+        if (y + 1 == height) {
+            ydst2 = ydst1;
+            src2  = src1;
         }
-        ydst += lumStride;
-        src  += srcStride;
-
-        if (y+1 == height)
-            break;
 
         for (i = 0; i < chromWidth; i++) {
-            unsigned int b = src[6 * i + 0];
-            unsigned int g = src[6 * i + 1];
-            unsigned int r = src[6 * i + 2];
+            unsigned int b11 = src1[6 * i + 0];
+            unsigned int g11 = src1[6 * i + 1];
+            unsigned int r11 = src1[6 * i + 2];
+            unsigned int b12 = src1[6 * i + 3];
+            unsigned int g12 = src1[6 * i + 4];
+            unsigned int r12 = src1[6 * i + 5];
+            unsigned int b21 = src2[6 * i + 0];
+            unsigned int g21 = src2[6 * i + 1];
+            unsigned int r21 = src2[6 * i + 2];
+            unsigned int b22 = src2[6 * i + 3];
+            unsigned int g22 = src2[6 * i + 4];
+            unsigned int r22 = src2[6 * i + 5];
 
-            unsigned int Y = ((ry * r + gy * g + by * b) >> RGB2YUV_SHIFT) + 16;
+            unsigned int Y11 = ((ry * r11 + gy * g11 + by * b11) >> RGB2YUV_SHIFT) + 16;
+            unsigned int Y12 = ((ry * r12 + gy * g12 + by * b12) >> RGB2YUV_SHIFT) + 16;
+            unsigned int Y21 = ((ry * r21 + gy * g21 + by * b21) >> RGB2YUV_SHIFT) + 16;
+            unsigned int Y22 = ((ry * r22 + gy * g22 + by * b22) >> RGB2YUV_SHIFT) + 16;
 
-            ydst[2 * i] = Y;
+            unsigned int bx = (b11 + b12 + b21 + b22) >> 2;
+            unsigned int gx = (g11 + g12 + g21 + g22) >> 2;
+            unsigned int rx = (r11 + r12 + r21 + r22) >> 2;
 
-            b = src[6 * i + 3];
-            g = src[6 * i + 4];
-            r = src[6 * i + 5];
+            unsigned int U  = ((ru * rx + gu * gx + bu * bx) >> RGB2YUV_SHIFT) + 128;
+            unsigned int V  = ((rv * rx + gv * gx + bv * bx) >> RGB2YUV_SHIFT) + 128;
 
-            Y = ((ry * r + gy * g + by * b) >> RGB2YUV_SHIFT) + 16;
-            ydst[2 * i + 1] = Y;
+            ydst1[2 * i + 0] = Y11;
+            ydst1[2 * i + 1] = Y12;
+            ydst2[2 * i + 0] = Y21;
+            ydst2[2 * i + 1] = Y22;
+            udst[i]          = U;
+            vdst[i]          = V;
         }
-        udst += chromStride;
-        vdst += chromStride;
-        ydst += lumStride;
-        src  += srcStride;
+        src1  += srcStride * 2;
+        src2  += srcStride * 2;
+        ydst1 += lumStride * 2;
+        ydst2 += lumStride * 2;
+        udst  += chromStride;
+        vdst  += chromStride;
     }
 }
 
@@ -841,7 +876,7 @@ static void yuyvtoyuv420_c(uint8_t *ydst, uint8_t *udst, uint8_t *vdst,
                            int lumStride, int chromStride, int srcStride)
 {
     int y;
-    const int chromWidth = FF_CEIL_RSHIFT(width, 1);
+    const int chromWidth = AV_CEIL_RSHIFT(width, 1);
 
     for (y = 0; y < height; y++) {
         extract_even_c(src, ydst, width);
@@ -861,7 +896,7 @@ static void yuyvtoyuv422_c(uint8_t *ydst, uint8_t *udst, uint8_t *vdst,
                            int lumStride, int chromStride, int srcStride)
 {
     int y;
-    const int chromWidth = FF_CEIL_RSHIFT(width, 1);
+    const int chromWidth = AV_CEIL_RSHIFT(width, 1);
 
     for (y = 0; y < height; y++) {
         extract_even_c(src, ydst, width);
@@ -879,7 +914,7 @@ static void uyvytoyuv420_c(uint8_t *ydst, uint8_t *udst, uint8_t *vdst,
                            int lumStride, int chromStride, int srcStride)
 {
     int y;
-    const int chromWidth = FF_CEIL_RSHIFT(width, 1);
+    const int chromWidth = AV_CEIL_RSHIFT(width, 1);
 
     for (y = 0; y < height; y++) {
         extract_even_c(src + 1, ydst, width);
@@ -899,7 +934,7 @@ static void uyvytoyuv422_c(uint8_t *ydst, uint8_t *udst, uint8_t *vdst,
                            int lumStride, int chromStride, int srcStride)
 {
     int y;
-    const int chromWidth = FF_CEIL_RSHIFT(width, 1);
+    const int chromWidth = AV_CEIL_RSHIFT(width, 1);
 
     for (y = 0; y < height; y++) {
         extract_even_c(src + 1, ydst, width);
@@ -929,7 +964,20 @@ static av_cold void rgb2rgb_init_c(void)
     rgb24to15          = rgb24to15_c;
     rgb24to16          = rgb24to16_c;
     rgb24tobgr24       = rgb24tobgr24_c;
+#if HAVE_BIGENDIAN
+    shuffle_bytes_0321 = shuffle_bytes_2103_c;
+    shuffle_bytes_2103 = shuffle_bytes_0321_c;
+#else
+    shuffle_bytes_0321 = shuffle_bytes_0321_c;
     shuffle_bytes_2103 = shuffle_bytes_2103_c;
+#endif
+    shuffle_bytes_1230 = shuffle_bytes_1230_c;
+    shuffle_bytes_3012 = shuffle_bytes_3012_c;
+    shuffle_bytes_3210 = shuffle_bytes_3210_c;
+    shuffle_bytes_3102 = shuffle_bytes_3102_c;
+    shuffle_bytes_2013 = shuffle_bytes_2013_c;
+    shuffle_bytes_2130 = shuffle_bytes_2130_c;
+    shuffle_bytes_1203 = shuffle_bytes_1203_c;
     rgb32tobgr16       = rgb32tobgr16_c;
     rgb32tobgr15       = rgb32tobgr15_c;
     yv12toyuy2         = yv12toyuy2_c;

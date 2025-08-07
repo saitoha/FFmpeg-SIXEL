@@ -41,7 +41,7 @@
  * MODIFIED to calculate coeffs from currently selected color space.
  * MODIFIED core to be a macro where you specify the output format.
  * ADDED UYVY conversion which is never called due to some thing in swscale.
- * CORRECTED algorithim selection to be strict on input formats.
+ * CORRECTED algorithm selection to be strict on input formats.
  * ADDED runtime detection of AltiVec.
  *
  * ADDED altivec_yuv2packedX vertical scl + RGB converter
@@ -89,7 +89,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
-#include <assert.h>
 
 #include "config.h"
 #include "libswscale/rgb2rgb.h"
@@ -97,6 +96,7 @@
 #include "libswscale/swscale_internal.h"
 #include "libavutil/attributes.h"
 #include "libavutil/cpu.h"
+#include "libavutil/mem_internal.h"
 #include "libavutil/pixdesc.h"
 #include "yuv2rgb_altivec.h"
 
@@ -142,7 +142,6 @@ typedef signed char   sbyte;
  *           brgb|rgbr|gbrg|brgb
  *           1001 0010 0100 1001
  *           a67b 89cA BdCD eEFf
- *
  */
 static const vector unsigned char
     perm_rgb_0 = { 0x00, 0x01, 0x10, 0x02, 0x03, 0x11, 0x04, 0x05,
@@ -222,6 +221,7 @@ static const vector unsigned char
  * optimized for JPEG decoding.
  */
 
+#if HAVE_BIGENDIAN
 #define vec_unh(x)                                                      \
     (vector signed short)                                               \
         vec_perm(x, (__typeof__(x)) { 0 },                              \
@@ -235,6 +235,10 @@ static const vector unsigned char
                  ((vector unsigned char) {                              \
                      0x10, 0x08, 0x10, 0x09, 0x10, 0x0A, 0x10, 0x0B,    \
                      0x10, 0x0C, 0x10, 0x0D, 0x10, 0x0E, 0x10, 0x0F }))
+#else
+#define vec_unh(x)(vector signed short) vec_mergeh(x,(__typeof__(x)) { 0 })
+#define vec_unl(x)(vector signed short) vec_mergel(x,(__typeof__(x)) { 0 })
+#endif
 
 #define vec_clip_s16(x)                                                 \
     vec_max(vec_min(x, ((vector signed short) {                         \
@@ -248,7 +252,7 @@ static const vector unsigned char
                   (vector unsigned short)                               \
                       vec_max(y, ((vector signed short) { 0 })))
 
-static inline void cvtyuvtoRGB(SwsContext *c, vector signed short Y,
+static inline void cvtyuvtoRGB(SwsInternal *c, vector signed short Y,
                                vector signed short U, vector signed short V,
                                vector signed short *R, vector signed short *G,
                                vector signed short *B)
@@ -280,12 +284,22 @@ static inline void cvtyuvtoRGB(SwsContext *c, vector signed short Y,
  * ------------------------------------------------------------------------------
  */
 
+#if !HAVE_VEC_XL
+static inline vector unsigned char vec_xl(signed long long offset, const ubyte *addr)
+{
+    const vector unsigned char *v_addr = (const vector unsigned char *) (addr + offset);
+    vector unsigned char align_perm = vec_lvsl(offset, addr);
+
+    return (vector unsigned char) vec_perm(v_addr[0], v_addr[1], align_perm);
+}
+#endif /* !HAVE_VEC_XL */
+
 #define DEFCSP420_CVT(name, out_pixels)                                       \
-static int altivec_ ## name(SwsContext *c, const unsigned char **in,          \
-                            int *instrides, int srcSliceY, int srcSliceH,     \
-                            unsigned char **oplanes, int *outstrides)         \
+static int altivec_ ## name(SwsInternal *c, const unsigned char *const *in,   \
+                            const int *instrides, int srcSliceY, int srcSliceH,   \
+                            unsigned char *const *oplanes, const int *outstrides) \
 {                                                                             \
-    int w = c->srcW;                                                          \
+    int w = c->opts.src_w;                                                    \
     int h = srcSliceH;                                                        \
     int i, j;                                                                 \
     int instrides_scl[3];                                                     \
@@ -301,9 +315,6 @@ static int altivec_ ## name(SwsContext *c, const unsigned char **in,          \
     vector signed short R0, G0, B0;                                           \
     vector signed short R1, G1, B1;                                           \
     vector unsigned char R, G, B;                                             \
-                                                                              \
-    const vector unsigned char *y1ivP, *y2ivP, *uivP, *vivP;                  \
-    vector unsigned char align_perm;                                          \
                                                                               \
     vector signed short lCY       = c->CY;                                    \
     vector signed short lOY       = c->OY;                                    \
@@ -335,26 +346,13 @@ static int altivec_ ## name(SwsContext *c, const unsigned char **in,          \
         vec_dstst(oute, (0x02000002 | (((w * 3 + 32) / 32) << 16)), 1);       \
                                                                               \
         for (j = 0; j < w / 16; j++) {                                        \
-            y1ivP = (const vector unsigned char *) y1i;                       \
-            y2ivP = (const vector unsigned char *) y2i;                       \
-            uivP  = (const vector unsigned char *) ui;                        \
-            vivP  = (const vector unsigned char *) vi;                        \
+            y0 = vec_xl(0, y1i);                                              \
                                                                               \
-            align_perm = vec_lvsl(0, y1i);                                    \
-            y0 = (vector unsigned char)                                       \
-                     vec_perm(y1ivP[0], y1ivP[1], align_perm);                \
+            y1 = vec_xl(0, y2i);                                              \
                                                                               \
-            align_perm = vec_lvsl(0, y2i);                                    \
-            y1 = (vector unsigned char)                                       \
-                     vec_perm(y2ivP[0], y2ivP[1], align_perm);                \
+            u = (vector signed char) vec_xl(0, ui);                           \
                                                                               \
-            align_perm = vec_lvsl(0, ui);                                     \
-            u = (vector signed char)                                          \
-                    vec_perm(uivP[0], uivP[1], align_perm);                   \
-                                                                              \
-            align_perm = vec_lvsl(0, vi);                                     \
-            v = (vector signed char)                                          \
-                    vec_perm(vivP[0], vivP[1], align_perm);                   \
+            v = (vector signed char) vec_xl(0, vi);                           \
                                                                               \
             u = (vector signed char)                                          \
                     vec_sub(u,                                                \
@@ -437,13 +435,13 @@ static int altivec_ ## name(SwsContext *c, const unsigned char **in,          \
 }
 
 #define out_abgr(a, b, c, ptr)                                          \
-    vec_mstrgb32(__typeof__(a), ((__typeof__(a)) { 255 }), c, b, a, ptr)
+    vec_mstrgb32(__typeof__(a), ((__typeof__(a)) vec_splat((__typeof__(a)){ 255 }, 0)), c, b, a, ptr)
 #define out_bgra(a, b, c, ptr)                                          \
-    vec_mstrgb32(__typeof__(a), c, b, a, ((__typeof__(a)) { 255 }), ptr)
+    vec_mstrgb32(__typeof__(a), c, b, a, ((__typeof__(a)) vec_splat((__typeof__(a)){ 255 }, 0)), ptr)
 #define out_rgba(a, b, c, ptr)                                          \
-    vec_mstrgb32(__typeof__(a), a, b, c, ((__typeof__(a)) { 255 }), ptr)
+    vec_mstrgb32(__typeof__(a), a, b, c, ((__typeof__(a)) vec_splat((__typeof__(a)){ 255 }, 0)), ptr)
 #define out_argb(a, b, c, ptr)                                          \
-    vec_mstrgb32(__typeof__(a), ((__typeof__(a)) { 255 }), a, b, c, ptr)
+    vec_mstrgb32(__typeof__(a), ((__typeof__(a)) vec_splat((__typeof__(a)){ 255 }, 0)), a, b, c, ptr)
 #define out_rgb24(a, b, c, ptr) vec_mstrgb24(a, b, c, ptr)
 #define out_bgr24(a, b, c, ptr) vec_mstbgr24(a, b, c, ptr)
 
@@ -473,11 +471,11 @@ static const vector unsigned char
 /*
  * this is so I can play live CCIR raw video
  */
-static int altivec_uyvy_rgb32(SwsContext *c, const unsigned char **in,
-                              int *instrides, int srcSliceY, int srcSliceH,
-                              unsigned char **oplanes, int *outstrides)
+static int altivec_uyvy_rgb32(SwsInternal *c, const unsigned char *const *in,
+                              const int *instrides, int srcSliceY, int srcSliceH,
+                              unsigned char *const *oplanes, const int *outstrides)
 {
-    int w = c->srcW;
+    int w = c->opts.src_w;
     int h = srcSliceH;
     int i, j;
     vector unsigned char uyvy;
@@ -534,7 +532,7 @@ static int altivec_uyvy_rgb32(SwsContext *c, const unsigned char **in,
  *
  * So we just fall back to the C codes for this.
  */
-av_cold SwsFunc ff_yuv2rgb_init_ppc(SwsContext *c)
+av_cold SwsFunc ff_yuv2rgb_init_ppc(SwsInternal *c)
 {
 #if HAVE_ALTIVEC
     if (!(av_get_cpu_flags() & AV_CPU_FLAG_ALTIVEC))
@@ -547,20 +545,27 @@ av_cold SwsFunc ff_yuv2rgb_init_ppc(SwsContext *c)
      * boom with X11 bad match.
      *
      */
-    if ((c->srcW & 0xf) != 0)
+    if ((c->opts.src_w & 0xf) != 0)
         return NULL;
 
-    switch (c->srcFormat) {
+    switch (c->opts.src_format) {
     case AV_PIX_FMT_YUV410P:
     case AV_PIX_FMT_YUV420P:
     /*case IMGFMT_CLPL:        ??? */
     case AV_PIX_FMT_GRAY8:
     case AV_PIX_FMT_NV12:
     case AV_PIX_FMT_NV21:
-        if ((c->srcH & 0x1) != 0)
+        if ((c->opts.src_h & 0x1) != 0)
             return NULL;
 
-        switch (c->dstFormat) {
+/*
+ * The below accelerations for YUV2RGB are known broken.
+ * See: 'fate-checkasm-sw_yuv2rgb' with --enable-altivec
+ * They are disabled for the moment, until such time as
+ * they can be repaired.
+ */
+#if 0
+        switch (c->opts.dst_format) {
         case AV_PIX_FMT_RGB24:
             av_log(c, AV_LOG_WARNING, "ALTIVEC: Color Space RGB24\n");
             return altivec_yuv2_rgb24;
@@ -581,10 +586,11 @@ av_cold SwsFunc ff_yuv2rgb_init_ppc(SwsContext *c)
             return altivec_yuv2_bgra;
         default: return NULL;
         }
+#endif /* disabled YUV2RGB acceleration */
         break;
 
     case AV_PIX_FMT_UYVY422:
-        switch (c->dstFormat) {
+        switch (c->opts.dst_format) {
         case AV_PIX_FMT_BGR32:
             av_log(c, AV_LOG_WARNING, "ALTIVEC: Color Space UYVY -> RGB32\n");
             return altivec_uyvy_rgb32;
@@ -597,7 +603,7 @@ av_cold SwsFunc ff_yuv2rgb_init_ppc(SwsContext *c)
     return NULL;
 }
 
-av_cold void ff_yuv2rgb_init_tables_ppc(SwsContext *c,
+av_cold void ff_yuv2rgb_init_tables_ppc(SwsInternal *c,
                                         const int inv_table[4],
                                         int brightness,
                                         int contrast,
@@ -632,7 +638,7 @@ av_cold void ff_yuv2rgb_init_tables_ppc(SwsContext *c,
 
 #if HAVE_ALTIVEC
 
-static av_always_inline void yuv2packedX_altivec(SwsContext *c,
+static av_always_inline void yuv2packedX_altivec(SwsInternal *c,
                                                  const int16_t *lumFilter,
                                                  const int16_t **lumSrc,
                                                  int lumFilterSize,
@@ -744,7 +750,7 @@ static av_always_inline void yuv2packedX_altivec(SwsContext *c,
             if (!printed_error_message) {
                 av_log(c, AV_LOG_ERROR,
                        "altivec_yuv2packedX doesn't support %s output\n",
-                       av_get_pix_fmt_name(c->dstFormat));
+                       av_get_pix_fmt_name(c->opts.dst_format));
                 printed_error_message = 1;
             }
             return;
@@ -832,7 +838,7 @@ static av_always_inline void yuv2packedX_altivec(SwsContext *c,
             /* Unreachable, I think. */
             av_log(c, AV_LOG_ERROR,
                    "altivec_yuv2packedX doesn't support %s output\n",
-                   av_get_pix_fmt_name(c->dstFormat));
+                   av_get_pix_fmt_name(c->opts.dst_format));
             return;
         }
 
@@ -841,7 +847,7 @@ static av_always_inline void yuv2packedX_altivec(SwsContext *c,
 }
 
 #define YUV2PACKEDX_WRAPPER(suffix, pixfmt)                             \
-void ff_yuv2 ## suffix ## _X_altivec(SwsContext *c,                     \
+void ff_yuv2 ## suffix ## _X_altivec(SwsInternal *c,                    \
                                      const int16_t *lumFilter,          \
                                      const int16_t **lumSrc,            \
                                      int lumFilterSize,                 \

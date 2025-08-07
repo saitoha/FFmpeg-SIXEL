@@ -35,7 +35,7 @@ pb_interleave8:  db 0, 4, 1, 5, 2, 6, 3, 7
 
 cextern pw_8192
 
-SECTION_TEXT
+SECTION .text
 
 ; void ff_put_pixels8_x2(uint8_t *block, const uint8_t *pixels, ptrdiff_t line_size, int h)
 %macro PUT_PIXELS8_X2 0
@@ -78,12 +78,10 @@ cglobal put_pixels8_x2, 4,5
     add          r0, r4
     sub         r3d, 4
     jne .loop
-    REP_RET
+    RET
 %endmacro
 
 INIT_MMX mmxext
-PUT_PIXELS8_X2
-INIT_MMX 3dnow
 PUT_PIXELS8_X2
 
 
@@ -122,12 +120,10 @@ cglobal put_pixels16_x2, 4,5
     add          r0, r4
     sub         r3d, 4
     jne .loop
-    REP_RET
+    RET
 %endmacro
 
 INIT_MMX mmxext
-PUT_PIXELS_16
-INIT_MMX 3dnow
 PUT_PIXELS_16
 ; The 8_X2 macro can easily be used here
 INIT_XMM sse2
@@ -135,7 +131,7 @@ PUT_PIXELS8_X2
 
 
 ; void ff_put_no_rnd_pixels8_x2(uint8_t *block, const uint8_t *pixels, ptrdiff_t line_size, int h)
-%macro PUT_NO_RND_PIXELS8_X2 0
+INIT_MMX mmxext
 cglobal put_no_rnd_pixels8_x2, 4,5
     mova         m6, [pb_1]
     lea          r4, [r2*2]
@@ -166,17 +162,11 @@ cglobal put_no_rnd_pixels8_x2, 4,5
     add          r0, r4
     sub         r3d, 4
     jne .loop
-    REP_RET
-%endmacro
-
-INIT_MMX mmxext
-PUT_NO_RND_PIXELS8_X2
-INIT_MMX 3dnow
-PUT_NO_RND_PIXELS8_X2
+    RET
 
 
 ; void ff_put_no_rnd_pixels8_x2_exact(uint8_t *block, const uint8_t *pixels, ptrdiff_t line_size, int h)
-%macro PUT_NO_RND_PIXELS8_X2_EXACT 0
+INIT_MMX mmxext
 cglobal put_no_rnd_pixels8_x2_exact, 4,5
     lea          r4, [r2*3]
     pcmpeqb      m6, m6
@@ -213,13 +203,7 @@ cglobal put_no_rnd_pixels8_x2_exact, 4,5
     lea          r0, [r0+r2*4]
     sub         r3d, 4
     jg .loop
-    REP_RET
-%endmacro
-
-INIT_MMX mmxext
-PUT_NO_RND_PIXELS8_X2_EXACT
-INIT_MMX 3dnow
-PUT_NO_RND_PIXELS8_X2_EXACT
+    RET
 
 
 ; void ff_put_pixels8_y2(uint8_t *block, const uint8_t *pixels, ptrdiff_t line_size, int h)
@@ -251,12 +235,10 @@ cglobal put_pixels8_y2, 4,5
     add          r0, r4
     sub         r3d, 4
     jne .loop
-    REP_RET
+    RET
 %endmacro
 
 INIT_MMX mmxext
-PUT_PIXELS8_Y2
-INIT_MMX 3dnow
 PUT_PIXELS8_Y2
 ; actually, put_pixels16_y2_sse2
 INIT_XMM sse2
@@ -264,7 +246,7 @@ PUT_PIXELS8_Y2
 
 
 ; void ff_put_no_rnd_pixels8_y2(uint8_t *block, const uint8_t *pixels, ptrdiff_t line_size, int h)
-%macro PUT_NO_RND_PIXELS8_Y2 0
+INIT_MMX mmxext
 cglobal put_no_rnd_pixels8_y2, 4,5
     mova         m6, [pb_1]
     lea          r4, [r2+r2]
@@ -291,17 +273,11 @@ cglobal put_no_rnd_pixels8_y2, 4,5
     add          r0, r4
     sub         r3d, 4
     jne .loop
-    REP_RET
-%endmacro
-
-INIT_MMX mmxext
-PUT_NO_RND_PIXELS8_Y2
-INIT_MMX 3dnow
-PUT_NO_RND_PIXELS8_Y2
+    RET
 
 
 ; void ff_put_no_rnd_pixels8_y2_exact(uint8_t *block, const uint8_t *pixels, ptrdiff_t line_size, int h)
-%macro PUT_NO_RND_PIXELS8_Y2_EXACT 0
+INIT_MMX mmxext
 cglobal put_no_rnd_pixels8_y2_exact, 4,5
     lea          r4, [r2*3]
     mova         m0, [r1]
@@ -333,43 +309,7 @@ cglobal put_no_rnd_pixels8_y2_exact, 4,5
     lea          r0, [r0+r2*4]
     sub         r3d, 4
     jg .loop
-    REP_RET
-%endmacro
-
-INIT_MMX mmxext
-PUT_NO_RND_PIXELS8_Y2_EXACT
-INIT_MMX 3dnow
-PUT_NO_RND_PIXELS8_Y2_EXACT
-
-
-; void ff_avg_pixels8(uint8_t *block, const uint8_t *pixels, ptrdiff_t line_size, int h)
-%macro AVG_PIXELS8 0
-cglobal avg_pixels8, 4,5
-    lea          r4, [r2*2]
-.loop:
-    mova         m0, [r0]
-    mova         m1, [r0+r2]
-    PAVGB        m0, [r1]
-    PAVGB        m1, [r1+r2]
-    mova       [r0], m0
-    mova    [r0+r2], m1
-    add          r1, r4
-    add          r0, r4
-    mova         m0, [r0]
-    mova         m1, [r0+r2]
-    PAVGB        m0, [r1]
-    PAVGB        m1, [r1+r2]
-    add          r1, r4
-    mova       [r0], m0
-    mova    [r0+r2], m1
-    add          r0, r4
-    sub         r3d, 4
-    jne .loop
-    REP_RET
-%endmacro
-
-INIT_MMX 3dnow
-AVG_PIXELS8
+    RET
 
 
 ; void ff_avg_pixels8_x2(uint8_t *block, const uint8_t *pixels, ptrdiff_t line_size, int h)
@@ -380,10 +320,6 @@ cglobal avg_pixels16_x2, 4,5,4
 cglobal avg_pixels8_x2, 4,5
 %endif
     lea          r4, [r2*2]
-%if notcpuflag(mmxext)
-    pcmpeqd      m5, m5
-    paddb        m5, m5
-%endif
 .loop:
     movu         m0, [r1]
     movu         m2, [r1+r2]
@@ -421,14 +357,10 @@ cglobal avg_pixels8_x2, 4,5
     add          r0, r4
     sub         r3d, 4
     jne .loop
-    REP_RET
+    RET
 %endmacro
 
-INIT_MMX mmx
-AVG_PIXELS8_X2
 INIT_MMX mmxext
-AVG_PIXELS8_X2
-INIT_MMX 3dnow
 AVG_PIXELS8_X2
 ; actually avg_pixels16_x2
 INIT_XMM sse2
@@ -468,12 +400,10 @@ cglobal avg_pixels8_y2, 4,5
     add          r0, r4
     sub         r3d, 4
     jne .loop
-    REP_RET
+    RET
 %endmacro
 
 INIT_MMX mmxext
-AVG_PIXELS8_Y2
-INIT_MMX 3dnow
 AVG_PIXELS8_Y2
 ; actually avg_pixels16_y2
 INIT_XMM sse2
@@ -483,7 +413,7 @@ AVG_PIXELS8_Y2
 ; void ff_avg_pixels8_xy2(uint8_t *block, const uint8_t *pixels, ptrdiff_t line_size, int h)
 ; Note this is not correctly rounded, and is therefore used for
 ; not-bitexact output
-%macro AVG_APPROX_PIXELS8_XY2 0
+INIT_MMX mmxext
 cglobal avg_approx_pixels8_xy2, 4,5
     mova         m6, [pb_1]
     lea          r4, [r2*2]
@@ -517,13 +447,7 @@ cglobal avg_approx_pixels8_xy2, 4,5
     add          r0, r4
     sub         r3d, 4
     jne .loop
-    REP_RET
-%endmacro
-
-INIT_MMX mmxext
-AVG_APPROX_PIXELS8_XY2
-INIT_MMX 3dnow
-AVG_APPROX_PIXELS8_XY2
+    RET
 
 
 ; void ff_avg_pixels16_xy2(uint8_t *block, const uint8_t *pixels, ptrdiff_t line_size, int h)
@@ -601,12 +525,10 @@ cglobal %1_pixels8_xy2, 4,5
     add         r4, r2
     sub        r3d, 2
     jnz .loop
-    REP_RET
+    RET
 %endmacro
 
 INIT_MMX mmxext
-SET_PIXELS_XY2 avg
-INIT_MMX 3dnow
 SET_PIXELS_XY2 avg
 INIT_XMM sse2
 SET_PIXELS_XY2 put
@@ -669,7 +591,7 @@ cglobal %1_pixels8_xy2, 4,5
     add         r4, r2
     sub        r3d, 2
     jnz .loop
-    REP_RET
+    RET
 %endmacro
 
 INIT_MMX ssse3

@@ -28,12 +28,12 @@
 #include <float.h>
 #include "libavutil/eval.h"
 #include "libavutil/imgutils.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 
 #include "avfilter.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
 #include "video.h"
 
 #define SAT_MIN_VAL -10
@@ -57,7 +57,7 @@ enum var_name {
     VAR_NB
 };
 
-typedef struct {
+typedef struct HueContext {
     const    AVClass *class;
     float    hue_deg; /* hue expressed in degrees */
     float    hue; /* hue expressed in radians */
@@ -80,10 +80,13 @@ typedef struct {
     uint8_t  lut_l[256];
     uint8_t  lut_u[256][256];
     uint8_t  lut_v[256][256];
+    uint16_t  lut_l16[65536];
+    uint16_t  lut_u10[1024][1024];
+    uint16_t  lut_v10[1024][1024];
 } HueContext;
 
 #define OFFSET(x) offsetof(HueContext, x)
-#define FLAGS AV_OPT_FLAG_VIDEO_PARAM|AV_OPT_FLAG_FILTERING_PARAM
+#define FLAGS AV_OPT_FLAG_VIDEO_PARAM|AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_RUNTIME_PARAM
 static const AVOption hue_options[] = {
     { "h", "set the hue angle degrees expression", OFFSET(hue_deg_expr), AV_OPT_TYPE_STRING,
       { .str = NULL }, .flags = FLAGS },
@@ -105,8 +108,8 @@ static inline void compute_sin_and_cos(HueContext *hue)
      * the saturation.
      * This will be useful in the apply_lut function.
      */
-    hue->hue_sin = rint(sin(hue->hue) * (1 << 16) * hue->saturation);
-    hue->hue_cos = rint(cos(hue->hue) * (1 << 16) * hue->saturation);
+    hue->hue_sin = lrint(sin(hue->hue) * (1 << 16) * hue->saturation);
+    hue->hue_cos = lrint(cos(hue->hue) * (1 << 16) * hue->saturation);
 }
 
 static inline void create_luma_lut(HueContext *h)
@@ -116,6 +119,9 @@ static inline void create_luma_lut(HueContext *h)
 
     for (i = 0; i < 256; i++) {
         h->lut_l[i] = av_clip_uint8(i + b * 25.5);
+    }
+    for (i = 0; i < 65536; i++) {
+        h->lut_l16[i] = av_clip_uintp2(i + b * 102.4, 10);
     }
 }
 
@@ -130,7 +136,7 @@ static inline void create_chrominance_lut(HueContext *h, const int32_t c,
      */
     for (i = 0; i < 256; i++) {
         for (j = 0; j < 256; j++) {
-            /* Normalize the components from range [16;140] to [-112;112] */
+            /* Normalize the components from range [16;240] to [-112;112] */
             u = i - 128;
             v = j - 128;
             /*
@@ -146,6 +152,25 @@ static inline void create_chrominance_lut(HueContext *h, const int32_t c,
             /* Prevent a potential overflow */
             h->lut_u[i][j] = av_clip_uint8(new_u);
             h->lut_v[i][j] = av_clip_uint8(new_v);
+        }
+    }
+    for (i = 0; i < 1024; i++) {
+        for (j = 0; j < 1024; j++) {
+            u = i - 512;
+            v = j - 512;
+            /*
+             * Apply the rotation of the vector : (c * u) - (s * v)
+             *                                    (s * u) + (c * v)
+             * De-normalize the components (without forgetting to scale 512
+             * by << 16)
+             * Finally scale back the result by >> 16
+             */
+            new_u = ((c * u) - (s * v) + (1 << 15) + (512 << 16)) >> 16;
+            new_v = ((s * u) + (c * v) + (1 << 15) + (512 << 16)) >> 16;
+
+            /* Prevent a potential overflow */
+            h->lut_u10[i][j] = av_clip_uintp2(new_u, 10);
+            h->lut_v10[i][j] = av_clip_uintp2(new_v, 10);
         }
     }
 }
@@ -223,25 +248,24 @@ static av_cold void uninit(AVFilterContext *ctx)
     av_expr_free(hue->saturation_pexpr);
 }
 
-static int query_formats(AVFilterContext *ctx)
-{
-    static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_YUV444P,      AV_PIX_FMT_YUV422P,
-        AV_PIX_FMT_YUV420P,      AV_PIX_FMT_YUV411P,
-        AV_PIX_FMT_YUV410P,      AV_PIX_FMT_YUV440P,
-        AV_PIX_FMT_YUVA444P,     AV_PIX_FMT_YUVA422P,
-        AV_PIX_FMT_YUVA420P,
-        AV_PIX_FMT_NONE
-    };
-    AVFilterFormats *fmts_list = ff_make_format_list(pix_fmts);
-    if (!fmts_list)
-        return AVERROR(ENOMEM);
-    return ff_set_common_formats(ctx, fmts_list);
-}
+static const enum AVPixelFormat pix_fmts[] = {
+    AV_PIX_FMT_YUV444P,      AV_PIX_FMT_YUV422P,
+    AV_PIX_FMT_YUV420P,      AV_PIX_FMT_YUV411P,
+    AV_PIX_FMT_YUV410P,      AV_PIX_FMT_YUV440P,
+    AV_PIX_FMT_YUVA444P,     AV_PIX_FMT_YUVA422P,
+    AV_PIX_FMT_YUVA420P,
+    AV_PIX_FMT_YUV444P10,      AV_PIX_FMT_YUV422P10,
+    AV_PIX_FMT_YUV420P10,
+    AV_PIX_FMT_YUV440P10,
+    AV_PIX_FMT_YUVA444P10,     AV_PIX_FMT_YUVA422P10,
+    AV_PIX_FMT_YUVA420P10,
+    AV_PIX_FMT_NONE
+};
 
 static int config_props(AVFilterLink *inlink)
 {
     HueContext *hue = inlink->dst->priv;
+    FilterLink   *l = ff_filter_link(inlink);
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(inlink->format);
 
     hue->hsub = desc->log2_chroma_w;
@@ -249,8 +273,8 @@ static int config_props(AVFilterLink *inlink)
 
     hue->var_values[VAR_N]  = 0;
     hue->var_values[VAR_TB] = av_q2d(inlink->time_base);
-    hue->var_values[VAR_R]  = inlink->frame_rate.num == 0 || inlink->frame_rate.den == 0 ?
-        NAN : av_q2d(inlink->frame_rate);
+    hue->var_values[VAR_R]  = l->frame_rate.num == 0 || l->frame_rate.den == 0 ?
+        NAN : av_q2d(l->frame_rate);
 
     return 0;
 }
@@ -265,6 +289,22 @@ static void apply_luma_lut(HueContext *s,
     while (h--) {
         for (i = 0; i < w; i++)
             ldst[i] = s->lut_l[lsrc[i]];
+
+        lsrc += src_linesize;
+        ldst += dst_linesize;
+    }
+}
+
+static void apply_luma_lut10(HueContext *s,
+                             uint16_t *ldst, const int dst_linesize,
+                             uint16_t *lsrc, const int src_linesize,
+                             int w, int h)
+{
+    int i;
+
+    while (h--) {
+        for (i = 0; i < w; i++)
+            ldst[i] = s->lut_l16[lsrc[i]];
 
         lsrc += src_linesize;
         ldst += dst_linesize;
@@ -294,17 +334,40 @@ static void apply_lut(HueContext *s,
     }
 }
 
-#define TS2D(ts) ((ts) == AV_NOPTS_VALUE ? NAN : (double)(ts))
-#define TS2T(ts, tb) ((ts) == AV_NOPTS_VALUE ? NAN : (double)(ts) * av_q2d(tb))
+static void apply_lut10(HueContext *s,
+                      uint16_t *udst, uint16_t *vdst, const int dst_linesize,
+                      uint16_t *usrc, uint16_t *vsrc, const int src_linesize,
+                      int w, int h)
+{
+    int i;
+
+    while (h--) {
+        for (i = 0; i < w; i++) {
+            const int u = av_clip_uintp2(usrc[i], 10);
+            const int v = av_clip_uintp2(vsrc[i], 10);
+
+            udst[i] = s->lut_u10[u][v];
+            vdst[i] = s->lut_v10[u][v];
+        }
+
+        usrc += src_linesize;
+        vsrc += src_linesize;
+        udst += dst_linesize;
+        vdst += dst_linesize;
+    }
+}
 
 static int filter_frame(AVFilterLink *inlink, AVFrame *inpic)
 {
+    FilterLink *inl = ff_filter_link(inlink);
     HueContext *hue = inlink->dst->priv;
     AVFilterLink *outlink = inlink->dst->outputs[0];
     AVFrame *outpic;
     const int32_t old_hue_sin = hue->hue_sin, old_hue_cos = hue->hue_cos;
     const float old_brightness = hue->brightness;
     int direct = 0;
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(inlink->format);
+    const int bps = desc->comp[0].depth > 8 ? 2 : 1;
 
     if (av_frame_is_writable(inpic)) {
         direct = 1;
@@ -318,7 +381,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *inpic)
         av_frame_copy_props(outpic, inpic);
     }
 
-    hue->var_values[VAR_N]   = inlink->frame_count;
+    hue->var_values[VAR_N]   = inl->frame_count_out;
     hue->var_values[VAR_T]   = TS2T(inpic->pts, inlink->time_base);
     hue->var_values[VAR_PTS] = TS2D(inpic->pts);
 
@@ -367,21 +430,31 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *inpic)
     if (!direct) {
         if (!hue->brightness)
             av_image_copy_plane(outpic->data[0], outpic->linesize[0],
-                                inpic->data[0],  inpic->linesize[0],
-                                inlink->w, inlink->h);
+                                inpic->data[0],   inpic->linesize[0],
+                                inlink->w * bps, inlink->h);
         if (inpic->data[3])
             av_image_copy_plane(outpic->data[3], outpic->linesize[3],
-                                inpic->data[3],  inpic->linesize[3],
-                                inlink->w, inlink->h);
+                                inpic->data[3],   inpic->linesize[3],
+                                inlink->w * bps, inlink->h);
     }
 
-    apply_lut(hue, outpic->data[1], outpic->data[2], outpic->linesize[1],
-              inpic->data[1],  inpic->data[2],  inpic->linesize[1],
-              FF_CEIL_RSHIFT(inlink->w, hue->hsub),
-              FF_CEIL_RSHIFT(inlink->h, hue->vsub));
-    if (hue->brightness)
-        apply_luma_lut(hue, outpic->data[0], outpic->linesize[0],
-                       inpic->data[0], inpic->linesize[0], inlink->w, inlink->h);
+    if (bps > 1) {
+        apply_lut10(hue, (uint16_t*)outpic->data[1], (uint16_t*)outpic->data[2], outpic->linesize[1]/2,
+                         (uint16_t*) inpic->data[1], (uint16_t*) inpic->data[2],  inpic->linesize[1]/2,
+                    AV_CEIL_RSHIFT(inlink->w, hue->hsub),
+                    AV_CEIL_RSHIFT(inlink->h, hue->vsub));
+        if (hue->brightness)
+            apply_luma_lut10(hue, (uint16_t*)outpic->data[0], outpic->linesize[0]/2,
+                                  (uint16_t*) inpic->data[0],  inpic->linesize[0]/2, inlink->w, inlink->h);
+    } else {
+        apply_lut(hue, outpic->data[1], outpic->data[2], outpic->linesize[1],
+                       inpic->data[1],   inpic->data[2],  inpic->linesize[1],
+                  AV_CEIL_RSHIFT(inlink->w, hue->hsub),
+                  AV_CEIL_RSHIFT(inlink->h, hue->vsub));
+        if (hue->brightness)
+            apply_luma_lut(hue, outpic->data[0], outpic->linesize[0],
+                                inpic->data[0],  inpic->linesize[0], inlink->w, inlink->h);
+    }
 
     if (!direct)
         av_frame_free(&inpic);
@@ -427,27 +500,18 @@ static const AVFilterPad hue_inputs[] = {
         .filter_frame = filter_frame,
         .config_props = config_props,
     },
-    { NULL }
 };
 
-static const AVFilterPad hue_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-    { NULL }
-};
-
-AVFilter ff_vf_hue = {
-    .name            = "hue",
-    .description     = NULL_IF_CONFIG_SMALL("Adjust the hue and saturation of the input video."),
+const FFFilter ff_vf_hue = {
+    .p.name          = "hue",
+    .p.description   = NULL_IF_CONFIG_SMALL("Adjust the hue and saturation of the input video."),
+    .p.priv_class    = &hue_class,
+    .p.flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
     .priv_size       = sizeof(HueContext),
     .init            = init,
     .uninit          = uninit,
-    .query_formats   = query_formats,
     .process_command = process_command,
-    .inputs          = hue_inputs,
-    .outputs         = hue_outputs,
-    .priv_class      = &hue_class,
-    .flags           = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
+    FILTER_INPUTS(hue_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_PIXFMTS_ARRAY(pix_fmts),
 };

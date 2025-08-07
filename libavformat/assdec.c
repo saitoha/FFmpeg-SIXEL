@@ -23,9 +23,9 @@
 #include <stdint.h>
 
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 #include "subtitles.h"
-#include "libavcodec/internal.h"
 #include "libavutil/bprint.h"
 
 typedef struct ASSContext {
@@ -33,24 +33,20 @@ typedef struct ASSContext {
     unsigned readorder;
 } ASSContext;
 
-static int ass_probe(AVProbeData *p)
+static int ass_probe(const AVProbeData *p)
 {
     char buf[13];
     FFTextReader tr;
     ff_text_init_buf(&tr, p->buf, p->buf_size);
+
+    while (ff_text_peek_r8(&tr) == '\r' || ff_text_peek_r8(&tr) == '\n')
+        ff_text_r8(&tr);
 
     ff_text_read(&tr, buf, sizeof(buf));
 
     if (!memcmp(buf, "[Script Info]", 13))
         return AVPROBE_SCORE_MAX;
 
-    return 0;
-}
-
-static int ass_read_close(AVFormatContext *s)
-{
-    ASSContext *ass = s->priv_data;
-    ff_subtitles_queue_clean(&ass->q);
     return 0;
 }
 
@@ -78,6 +74,8 @@ static int read_dialogue(ASSContext *ass, AVBPrint *dst, const uint8_t *p,
 
         av_bprint_clear(dst);
         av_bprintf(dst, "%u,%d,%s", ass->readorder++, layer, p + pos);
+        if (!av_bprint_is_complete(dst))
+            return AVERROR(ENOMEM);
 
         /* right strip the buffer */
         while (dst->len > 0 &&
@@ -118,12 +116,14 @@ static int ass_read_header(AVFormatContext *s)
     if (!st)
         return AVERROR(ENOMEM);
     avpriv_set_pts_info(st, 64, 1, 100);
-    st->codec->codec_type = AVMEDIA_TYPE_SUBTITLE;
-    st->codec->codec_id   = AV_CODEC_ID_ASS;
+    st->codecpar->codec_type = AVMEDIA_TYPE_SUBTITLE;
+    st->codecpar->codec_id   = AV_CODEC_ID_ASS;
 
     av_bprint_init(&header, 0, AV_BPRINT_SIZE_UNLIMITED);
     av_bprint_init(&line,   0, AV_BPRINT_SIZE_UNLIMITED);
     av_bprint_init(&rline,  0, AV_BPRINT_SIZE_UNLIMITED);
+
+    ass->q.keep_duplicates = 1;
 
     for (;;) {
         int64_t pos = get_line(&line, &tr);
@@ -138,7 +138,7 @@ static int ass_read_header(AVFormatContext *s)
             av_bprintf(&header, "%s", line.str);
             continue;
         }
-        sub = ff_subtitles_queue_insert(&ass->q, rline.str, rline.len, 0);
+        sub = ff_subtitles_queue_insert_bprint(&ass->q, &rline, 0);
         if (!sub) {
             res = AVERROR(ENOMEM);
             goto end;
@@ -148,11 +148,11 @@ static int ass_read_header(AVFormatContext *s)
         sub->duration = duration;
     }
 
-    res = avpriv_bprint_to_extradata(st->codec, &header);
+    res = ff_bprint_to_codecpar_extradata(st->codecpar, &header);
     if (res < 0)
         goto end;
 
-    ff_subtitles_queue_finalize(&ass->q);
+    ff_subtitles_queue_finalize(s, &ass->q);
 
 end:
     av_bprint_finalize(&header, NULL);
@@ -161,27 +161,14 @@ end:
     return res;
 }
 
-static int ass_read_packet(AVFormatContext *s, AVPacket *pkt)
-{
-    ASSContext *ass = s->priv_data;
-    return ff_subtitles_queue_read_packet(&ass->q, pkt);
-}
-
-static int ass_read_seek(AVFormatContext *s, int stream_index,
-                         int64_t min_ts, int64_t ts, int64_t max_ts, int flags)
-{
-    ASSContext *ass = s->priv_data;
-    return ff_subtitles_queue_seek(&ass->q, s, stream_index,
-                                   min_ts, ts, max_ts, flags);
-}
-
-AVInputFormat ff_ass_demuxer = {
-    .name           = "ass",
-    .long_name      = NULL_IF_CONFIG_SMALL("SSA (SubStation Alpha) subtitle"),
+const FFInputFormat ff_ass_demuxer = {
+    .p.name         = "ass",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("SSA (SubStation Alpha) subtitle"),
+    .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
     .priv_data_size = sizeof(ASSContext),
     .read_probe     = ass_probe,
     .read_header    = ass_read_header,
-    .read_packet    = ass_read_packet,
-    .read_close     = ass_read_close,
-    .read_seek2     = ass_read_seek,
+    .read_packet    = ff_subtitles_read_packet,
+    .read_close     = ff_subtitles_read_close,
+    .read_seek2     = ff_subtitles_read_seek,
 };

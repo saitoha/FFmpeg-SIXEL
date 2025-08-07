@@ -23,12 +23,14 @@
 #include "libavutil/dict.h"
 #include "libavutil/mathematics.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
 typedef struct R3DContext {
     unsigned video_offsets_count;
-    unsigned *video_offsets;
     unsigned rdvo_offset;
+
+    int audio_channels;
 } R3DContext;
 
 typedef struct Atom {
@@ -52,15 +54,17 @@ static int read_atom(AVFormatContext *s, Atom *atom)
 static int r3d_read_red1(AVFormatContext *s)
 {
     AVStream *st = avformat_new_stream(s, NULL);
+    R3DContext *r3d = s->priv_data;
     char filename[258];
     int tmp;
+    int ret;
     int av_unused tmp2;
     AVRational framerate;
 
     if (!st)
         return AVERROR(ENOMEM);
-    st->codec->codec_type = AVMEDIA_TYPE_VIDEO;
-    st->codec->codec_id = AV_CODEC_ID_JPEG2000;
+    st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+    st->codecpar->codec_id = AV_CODEC_ID_JPEG2000;
 
     tmp  = avio_r8(s->pb); // major version
     tmp2 = avio_r8(s->pb); // minor version
@@ -77,8 +81,8 @@ static int r3d_read_red1(AVFormatContext *s)
 
     avio_skip(s->pb, 32); // unknown
 
-    st->codec->width  = avio_rb32(s->pb);
-    st->codec->height = avio_rb32(s->pb);
+    st->codecpar->width  = avio_rb32(s->pb);
+    st->codecpar->height = avio_rb32(s->pb);
 
     tmp = avio_rb16(s->pb); // unknown
     av_log(s, AV_LOG_TRACE, "unknown2 %d\n", tmp);
@@ -92,24 +96,17 @@ static int r3d_read_red1(AVFormatContext *s)
         st->avg_frame_rate = framerate;
     }
 
-    tmp = avio_r8(s->pb); // audio channels
+    r3d->audio_channels = avio_r8(s->pb); // audio channels
     av_log(s, AV_LOG_TRACE, "audio channels %d\n", tmp);
-    if (tmp > 0) {
-        AVStream *ast = avformat_new_stream(s, NULL);
-        if (!ast)
-            return AVERROR(ENOMEM);
-        ast->codec->codec_type = AVMEDIA_TYPE_AUDIO;
-        ast->codec->codec_id = AV_CODEC_ID_PCM_S32BE;
-        ast->codec->channels = tmp;
-        avpriv_set_pts_info(ast, 32, 1, st->time_base.den);
-    }
 
-    avio_read(s->pb, filename, 257);
+    ret = avio_read(s->pb, filename, 257);
+    if (ret < 257)
+        return ret < 0 ? ret : AVERROR_EOF;
     filename[sizeof(filename)-1] = 0;
     av_dict_set(&st->metadata, "filename", filename, 0);
 
     av_log(s, AV_LOG_TRACE, "filename %s\n", filename);
-    av_log(s, AV_LOG_TRACE, "resolution %dx%d\n", st->codec->width, st->codec->height);
+    av_log(s, AV_LOG_TRACE, "resolution %dx%d\n", st->codecpar->width, st->codecpar->height);
     av_log(s, AV_LOG_TRACE, "timescale %d\n", st->time_base.den);
     av_log(s, AV_LOG_TRACE, "frame rate %d/%d\n",
             framerate.num, framerate.den);
@@ -124,17 +121,14 @@ static int r3d_read_rdvo(AVFormatContext *s, Atom *atom)
     int i;
 
     r3d->video_offsets_count = (atom->size - 8) / 4;
-    r3d->video_offsets = av_malloc(atom->size);
-    if (!r3d->video_offsets)
-        return AVERROR(ENOMEM);
 
     for (i = 0; i < r3d->video_offsets_count; i++) {
-        r3d->video_offsets[i] = avio_rb32(s->pb);
-        if (!r3d->video_offsets[i]) {
+        unsigned video_offset = avio_rb32(s->pb);
+        if (!video_offset) {
             r3d->video_offsets_count = i;
             break;
         }
-        av_log(s, AV_LOG_TRACE, "video offset %d: %#x\n", i, r3d->video_offsets[i]);
+        av_log(s, AV_LOG_TRACE, "video offset %d: %#x\n", i, video_offset);
     }
 
     if (st->avg_frame_rate.num)
@@ -167,6 +161,7 @@ static void r3d_read_reos(AVFormatContext *s)
 
 static int r3d_read_header(AVFormatContext *s)
 {
+    FFFormatContext *const si = ffformatcontext(s);
     R3DContext *r3d = s->priv_data;
     Atom atom;
     int ret;
@@ -185,9 +180,14 @@ static int r3d_read_header(AVFormatContext *s)
         return -1;
     }
 
-    s->internal->data_offset = avio_tell(s->pb);
-    av_log(s, AV_LOG_TRACE, "data offset %#"PRIx64"\n", s->internal->data_offset);
-    if (!s->pb->seekable)
+    /* we cannot create the audio stream now because we do not know the
+     * sample rate */
+    if (r3d->audio_channels)
+        s->ctx_flags |= AVFMTCTX_NOHEADER;
+
+    si->data_offset = avio_tell(s->pb);
+    av_log(s, AV_LOG_TRACE, "data offset %#"PRIx64"\n", si->data_offset);
+    if (!(s->pb->seekable & AVIO_SEEKABLE_NORMAL))
         return 0;
     // find REOB/REOF/REOS to load index
     avio_seek(s->pb, avio_size(s->pb)-48-8, SEEK_SET);
@@ -212,7 +212,7 @@ static int r3d_read_header(AVFormatContext *s)
     }
 
  out:
-    avio_seek(s->pb, s->internal->data_offset, SEEK_SET);
+    avio_seek(s->pb, si->data_offset, SEEK_SET);
     return 0;
 }
 
@@ -266,24 +266,37 @@ static int r3d_read_redv(AVFormatContext *s, AVPacket *pkt, Atom *atom)
     if (st->avg_frame_rate.num)
         pkt->duration = (uint64_t)st->time_base.den*
             st->avg_frame_rate.den/st->avg_frame_rate.num;
-    av_log(s, AV_LOG_TRACE, "pkt dts %"PRId64" duration %d\n", pkt->dts, pkt->duration);
+    av_log(s, AV_LOG_TRACE, "pkt dts %"PRId64" duration %"PRId64"\n", pkt->dts, pkt->duration);
 
     return 0;
 }
 
 static int r3d_read_reda(AVFormatContext *s, AVPacket *pkt, Atom *atom)
 {
-    AVStream *st = s->streams[1];
+    R3DContext *r3d = s->priv_data;
+    AVStream *st;
     int av_unused tmp, tmp2;
     int samples, size;
     int64_t pos = avio_tell(s->pb);
     unsigned dts;
     int ret;
 
+    if (s->nb_streams < 2) {
+        st = avformat_new_stream(s, NULL);
+        if (!st)
+            return AVERROR(ENOMEM);
+        st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
+        st->codecpar->codec_id = AV_CODEC_ID_PCM_S32BE;
+        st->codecpar->ch_layout.nb_channels = r3d->audio_channels;
+        avpriv_set_pts_info(st, 32, 1, s->streams[0]->time_base.den);
+    } else {
+        st = s->streams[1];
+    }
+
     dts = avio_rb32(s->pb);
 
-    st->codec->sample_rate = avio_rb32(s->pb);
-    if (st->codec->sample_rate <= 0) {
+    st->codecpar->sample_rate = avio_rb32(s->pb);
+    if (st->codecpar->sample_rate <= 0) {
         av_log(s, AV_LOG_ERROR, "Bad sample rate\n");
         return AVERROR_INVALIDDATA;
     }
@@ -314,16 +327,18 @@ static int r3d_read_reda(AVFormatContext *s, AVPacket *pkt, Atom *atom)
 
     pkt->stream_index = 1;
     pkt->dts = dts;
-    if (st->codec->sample_rate)
-        pkt->duration = av_rescale(samples, st->time_base.den, st->codec->sample_rate);
-    av_log(s, AV_LOG_TRACE, "pkt dts %"PRId64" duration %d samples %d sample rate %d\n",
-            pkt->dts, pkt->duration, samples, st->codec->sample_rate);
+
+    if (st->codecpar->sample_rate && samples > 0)
+        pkt->duration = av_rescale(samples, st->time_base.den, st->codecpar->sample_rate);
+    av_log(s, AV_LOG_TRACE, "pkt dts %"PRId64" duration %"PRId64" samples %d sample rate %d\n",
+            pkt->dts, pkt->duration, samples, st->codecpar->sample_rate);
 
     return 0;
 }
 
 static int r3d_read_packet(AVFormatContext *s, AVPacket *pkt)
 {
+    R3DContext *r3d = s->priv_data;
     Atom atom;
     int err = 0;
 
@@ -340,9 +355,9 @@ static int r3d_read_packet(AVFormatContext *s, AVPacket *pkt)
                 return 0;
             break;
         case MKTAG('R','E','D','A'):
-            if (s->nb_streams < 2)
+            if (!r3d->audio_channels)
                 return -1;
-            if (s->streams[1]->discard == AVDISCARD_ALL)
+            if (s->nb_streams >= 2 && s->streams[1]->discard == AVDISCARD_ALL)
                 goto skip;
             if (!(err = r3d_read_reda(s, pkt, &atom)))
                 return 0;
@@ -355,7 +370,7 @@ static int r3d_read_packet(AVFormatContext *s, AVPacket *pkt)
     return err;
 }
 
-static int r3d_probe(AVProbeData *p)
+static int r3d_probe(const AVProbeData *p)
 {
     if (AV_RL32(p->buf + 4) == MKTAG('R','E','D','1'))
         return AVPROBE_SCORE_MAX;
@@ -387,22 +402,12 @@ static int r3d_seek(AVFormatContext *s, int stream_index, int64_t sample_time, i
     return 0;
 }
 
-static int r3d_close(AVFormatContext *s)
-{
-    R3DContext *r3d = s->priv_data;
-
-    av_freep(&r3d->video_offsets);
-
-    return 0;
-}
-
-AVInputFormat ff_r3d_demuxer = {
-    .name           = "r3d",
-    .long_name      = NULL_IF_CONFIG_SMALL("REDCODE R3D"),
+const FFInputFormat ff_r3d_demuxer = {
+    .p.name         = "r3d",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("REDCODE R3D"),
     .priv_data_size = sizeof(R3DContext),
     .read_probe     = r3d_probe,
     .read_header    = r3d_read_header,
     .read_packet    = r3d_read_packet,
-    .read_close     = r3d_close,
     .read_seek      = r3d_seek,
 };

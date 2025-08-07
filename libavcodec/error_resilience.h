@@ -1,5 +1,4 @@
 /*
- *
  * This file is part of FFmpeg.
  *
  * FFmpeg is free software; you can redistribute it and/or
@@ -21,12 +20,11 @@
 #define AVCODEC_ERROR_RESILIENCE_H
 
 #include <stdint.h>
+#include <stdatomic.h>
 
 #include "avcodec.h"
-#include "me_cmp.h"
-#include "thread.h"
 
-///< current MB is the first after a resync marker
+/// current MB is the first after a resync marker
 #define VP_START               1
 #define ER_AC_ERROR            2
 #define ER_DC_ERROR            4
@@ -38,11 +36,14 @@
 #define ER_MB_ERROR (ER_AC_ERROR|ER_DC_ERROR|ER_MV_ERROR)
 #define ER_MB_END   (ER_AC_END|ER_DC_END|ER_MV_END)
 
+typedef struct MPVEncContext MPVEncContext;
+
 typedef struct ERPicture {
     AVFrame *f;
-    ThreadFrame *tf;
+    const struct ThreadFrame *tf;
+    const struct ThreadProgress *progress;
 
-    // it's the caller's responsibility to allocate these buffers
+    // it is the caller's responsibility to allocate these buffers
     int16_t (*motion_val[2])[2];
     int8_t *ref_index[2];
 
@@ -52,16 +53,18 @@ typedef struct ERPicture {
 
 typedef struct ERContext {
     AVCodecContext *avctx;
-    MECmpContext mecc;
+
+    int (*sad)(MPVEncContext *unused, const uint8_t *blk1,
+               const uint8_t *blk2, ptrdiff_t stride, int h);
     int mecc_inited;
 
     int *mb_index2xy;
     int mb_num;
     int mb_width, mb_height;
-    int mb_stride;
-    int b8_stride;
+    ptrdiff_t mb_stride;
+    ptrdiff_t b8_stride;
 
-    volatile int error_count;
+    atomic_int error_count;
     int error_occurred;
     uint8_t *error_status_table;
     uint8_t *er_temp_buffer;
@@ -74,14 +77,13 @@ typedef struct ERContext {
     ERPicture last_pic;
     ERPicture next_pic;
 
-    AVBufferRef *ref_index_buf[2];
-    AVBufferRef *motion_val_buf[2];
+    int8_t *ref_index[2];
+    int16_t (*motion_val_base[2])[2];
 
     uint16_t pp_time;
     uint16_t pb_time;
     int quarter_sample;
     int partitioned_frame;
-    int ref_count;
 
     void (*decode_mb)(void *opaque, int ref, int mv_dir, int mv_type,
                       int (*mv)[2][4][2],
@@ -90,7 +92,17 @@ typedef struct ERContext {
 } ERContext;
 
 void ff_er_frame_start(ERContext *s);
-void ff_er_frame_end(ERContext *s);
+
+/**
+ * Indicate that a frame has finished decoding and perform error concealment
+ * in case it has been enabled and is necessary and supported.
+ *
+ * @param s                  ERContext in use
+ * @param decode_error_flags pointer where updated decode_error_flags are written
+ *                           if supplied; if not, the new flags are directly
+ *                           applied to the AVFrame whose errors are concealed
+ */
+void ff_er_frame_end(ERContext *s, int *decode_error_flags);
 void ff_er_add_slice(ERContext *s, int startx, int starty, int endx, int endy,
                      int status);
 

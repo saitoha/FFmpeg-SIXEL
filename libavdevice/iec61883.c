@@ -23,13 +23,17 @@
  * libiec61883 interface
  */
 
-#include <sys/poll.h>
+#include "config_components.h"
+
+#include <poll.h>
 #include <libraw1394/raw1394.h>
 #include <libavc1394/avc1394.h>
 #include <libavc1394/rom1394.h>
 #include <libiec61883/iec61883.h>
+#include "libavformat/demux.h"
 #include "libavformat/dv.h"
 #include "libavformat/mpegts.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "avdevice.h"
 
@@ -118,14 +122,16 @@ static int iec61883_callback(unsigned char *data, int length,
         goto exit;
     }
 
-    packet->buf = av_malloc(length);
+    packet->buf = av_malloc(length + AV_INPUT_BUFFER_PADDING_SIZE);
     if (!packet->buf) {
+        av_free(packet);
         ret = -1;
         goto exit;
     }
     packet->len = length;
 
     memcpy(packet->buf, data, length);
+    memset(packet->buf + length, 0, AV_INPUT_BUFFER_PADDING_SIZE);
 
     if (dv->queue_first) {
         dv->queue_last->next = packet;
@@ -198,19 +204,27 @@ static int iec61883_parse_queue_dv(struct iec61883_data *dv, AVPacket *pkt)
 
     size = avpriv_dv_produce_packet(dv->dv_demux, pkt,
                                     packet->buf, packet->len, -1);
-    pkt->destruct = av_destruct_packet;
     dv->queue_first = packet->next;
+    if (size < 0)
+        av_free(packet->buf);
     av_free(packet);
     dv->packets--;
 
-    if (size > 0)
-        return size;
+    if (size < 0)
+        return -1;
 
-    return -1;
+    if (av_packet_from_data(pkt, pkt->data, pkt->size) < 0) {
+        av_freep(&pkt->data);
+        av_packet_unref(pkt);
+        return -1;
+    }
+
+    return size;
 }
 
 static int iec61883_parse_queue_hdv(struct iec61883_data *dv, AVPacket *pkt)
 {
+#if CONFIG_MPEGTS_DEMUXER
     DVPacket *packet;
     int size;
 
@@ -226,7 +240,7 @@ static int iec61883_parse_queue_hdv(struct iec61883_data *dv, AVPacket *pkt)
         if (size > 0)
             return size;
     }
-
+#endif
     return -1;
 }
 
@@ -259,19 +273,19 @@ static int iec61883_read_header(AVFormatContext *context)
         goto fail;
     }
 
-    inport = strtol(context->filename, &endptr, 10);
-    if (endptr != context->filename && *endptr == '\0') {
+    inport = strtol(context->url, &endptr, 10);
+    if (endptr != context->url && *endptr == '\0') {
         av_log(context, AV_LOG_INFO, "Selecting IEEE1394 port: %d\n", inport);
         j = inport;
         nb_ports = inport + 1;
-    } else if (strcmp(context->filename, "auto")) {
+    } else if (strcmp(context->url, "auto")) {
         av_log(context, AV_LOG_ERROR, "Invalid input \"%s\", you should specify "
-               "\"auto\" for auto-detection, or the port number.\n", context->filename);
+               "\"auto\" for auto-detection, or the port number.\n", context->url);
         goto fail;
     }
 
     if (dv->device_guid) {
-        if (sscanf(dv->device_guid, "%llx", (long long unsigned int *)&guid) != 1) {
+        if (sscanf(dv->device_guid, "%"SCNu64, &guid) != 1) {
             av_log(context, AV_LOG_INFO, "Invalid dvguid parameter: %s\n",
                    dv->device_guid);
             goto fail;
@@ -392,9 +406,12 @@ static int iec61883_read_header(AVFormatContext *context)
 
 #if THREADS
     dv->thread_loop = 1;
-    pthread_mutex_init(&dv->mutex, NULL);
-    pthread_cond_init(&dv->cond, NULL);
-    pthread_create(&dv->receive_task_thread, NULL, iec61883_receive_task, dv);
+    if (pthread_mutex_init(&dv->mutex, NULL))
+        goto fail;
+    if (pthread_cond_init(&dv->cond, NULL))
+        goto fail;
+    if (pthread_create(&dv->receive_task_thread, NULL, iec61883_receive_task, dv))
+        goto fail;
 #endif
 
     return 0;
@@ -451,6 +468,7 @@ static int iec61883_close(AVFormatContext *context)
     } else {
         iec61883_dv_fb_stop(dv->iec61883_dv);
         iec61883_dv_fb_close(dv->iec61883_dv);
+        av_freep(&dv->dv_demux);
     }
     while (dv->queue_first) {
         DVPacket *packet = dv->queue_first;
@@ -469,10 +487,10 @@ static int iec61883_close(AVFormatContext *context)
 }
 
 static const AVOption options[] = {
-    { "dvtype", "override autodetection of DV/HDV", offsetof(struct iec61883_data, type), AV_OPT_TYPE_INT, {.i64 = IEC61883_AUTO}, IEC61883_AUTO, IEC61883_HDV, AV_OPT_FLAG_DECODING_PARAM, "dvtype" },
-    { "auto",   "auto detect DV/HDV", 0, AV_OPT_TYPE_CONST, {.i64 = IEC61883_AUTO}, 0, 0, AV_OPT_FLAG_DECODING_PARAM, "dvtype" },
-    { "dv",     "force device being treated as DV device", 0, AV_OPT_TYPE_CONST, {.i64 = IEC61883_DV},   0, 0, AV_OPT_FLAG_DECODING_PARAM, "dvtype" },
-    { "hdv" ,   "force device being treated as HDV device", 0, AV_OPT_TYPE_CONST, {.i64 = IEC61883_HDV},  0, 0, AV_OPT_FLAG_DECODING_PARAM, "dvtype" },
+    { "dvtype", "override autodetection of DV/HDV", offsetof(struct iec61883_data, type), AV_OPT_TYPE_INT, {.i64 = IEC61883_AUTO}, IEC61883_AUTO, IEC61883_HDV, AV_OPT_FLAG_DECODING_PARAM, .unit = "dvtype" },
+    { "auto",   "auto detect DV/HDV", 0, AV_OPT_TYPE_CONST, {.i64 = IEC61883_AUTO}, 0, 0, AV_OPT_FLAG_DECODING_PARAM, .unit = "dvtype" },
+    { "dv",     "force device being treated as DV device", 0, AV_OPT_TYPE_CONST, {.i64 = IEC61883_DV},   0, 0, AV_OPT_FLAG_DECODING_PARAM, .unit = "dvtype" },
+    { "hdv" ,   "force device being treated as HDV device", 0, AV_OPT_TYPE_CONST, {.i64 = IEC61883_HDV},  0, 0, AV_OPT_FLAG_DECODING_PARAM, .unit = "dvtype" },
     { "dvbuffer", "set queue buffer size (in packets)", offsetof(struct iec61883_data, max_packets), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, AV_OPT_FLAG_DECODING_PARAM },
     { "dvguid", "select one of multiple DV devices by its GUID", offsetof(struct iec61883_data, device_guid), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_DECODING_PARAM },
     { NULL },
@@ -486,13 +504,13 @@ static const AVClass iec61883_class = {
     .category   = AV_CLASS_CATEGORY_DEVICE_VIDEO_INPUT,
 };
 
-AVInputFormat ff_iec61883_demuxer = {
-    .name           = "iec61883",
-    .long_name      = NULL_IF_CONFIG_SMALL("libiec61883 (new DV1394) A/V input device"),
+const FFInputFormat ff_iec61883_demuxer = {
+    .p.name         = "iec61883",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("libiec61883 (new DV1394) A/V input device"),
+    .p.flags        = AVFMT_NOFILE,
+    .p.priv_class   = &iec61883_class,
     .priv_data_size = sizeof(struct iec61883_data),
     .read_header    = iec61883_read_header,
     .read_packet    = iec61883_read_packet,
     .read_close     = iec61883_close,
-    .flags          = AVFMT_NOFILE,
-    .priv_class     = &iec61883_class,
 };

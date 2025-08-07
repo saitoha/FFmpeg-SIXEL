@@ -23,25 +23,13 @@
 #define AVFILTER_AUDIO_H
 
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
 
-static const enum AVSampleFormat ff_packed_sample_fmts_array[] = {
-    AV_SAMPLE_FMT_U8,
-    AV_SAMPLE_FMT_S16,
-    AV_SAMPLE_FMT_S32,
-    AV_SAMPLE_FMT_FLT,
-    AV_SAMPLE_FMT_DBL,
-    AV_SAMPLE_FMT_NONE
-};
-
-static const enum AVSampleFormat ff_planar_sample_fmts_array[] = {
-    AV_SAMPLE_FMT_U8P,
-    AV_SAMPLE_FMT_S16P,
-    AV_SAMPLE_FMT_S32P,
-    AV_SAMPLE_FMT_FLTP,
-    AV_SAMPLE_FMT_DBLP,
-    AV_SAMPLE_FMT_NONE
-};
+/**
+ * An AVFilterPad array whose only entry has name "default"
+ * and is of type AVMEDIA_TYPE_AUDIO.
+ */
+extern const AVFilterPad ff_audio_default_filterpad[1];
 
 /** default handler for get_audio_buffer() for audio inputs */
 AVFrame *ff_default_get_audio_buffer(AVFilterLink *link, int nb_samples);
@@ -55,29 +43,33 @@ AVFrame *ff_null_get_audio_buffer(AVFilterLink *link, int nb_samples);
  * @param link           the output link to the filter from which the buffer will
  *                       be requested
  * @param nb_samples     the number of samples per channel
- * @return               A reference to the samples. This must be unreferenced with
- *                       avfilter_unref_buffer when you are finished with it.
+ * @return               on success an AVFrame owned by the caller, NULL on error
  */
 AVFrame *ff_get_audio_buffer(AVFilterLink *link, int nb_samples);
 
 /**
- * Send a buffer of audio samples to the next filter.
+ * Parse a sample rate.
  *
- * @param link       the output link over which the audio samples are being sent
- * @param samplesref a reference to the buffer of audio samples being sent. The
- *                   receiving filter will free this reference when it no longer
- *                   needs it or pass it on to the next filter.
- *
- * @return >= 0 on success, a negative AVERROR on error. The receiving filter
- * is responsible for unreferencing samplesref in case of error.
+ * @param ret unsigned integer pointer to where the value should be written
+ * @param arg string to parse
+ * @param log_ctx log context
+ * @return >= 0 in case of success, a negative AVERROR code on error
  */
-int ff_filter_samples(AVFilterLink *link, AVFilterBufferRef *samplesref);
+av_warn_unused_result
+int ff_parse_sample_rate(int *ret, const char *arg, void *log_ctx);
 
 /**
- * Send a buffer of audio samples to the next link, without checking
- * min_samples.
+ * Parse a channel layout or a corresponding integer representation.
+ *
+ * @param ret 64bit integer pointer to where the value should be written.
+ * @param nret integer pointer to the number of channels;
+ *             if not NULL, then unknown channel layouts are accepted
+ * @param arg string to parse
+ * @param log_ctx log context
+ * @return >= 0 in case of success, a negative AVERROR code on error
  */
-int ff_filter_samples_framed(AVFilterLink *link,
-                             AVFilterBufferRef *samplesref);
+av_warn_unused_result
+int ff_parse_channel_layout(AVChannelLayout *ret, int *nret, const char *arg,
+                            void *log_ctx);
 
 #endif /* AVFILTER_AUDIO_H */

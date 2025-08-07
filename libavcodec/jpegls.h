@@ -28,13 +28,10 @@
 #ifndef AVCODEC_JPEGLS_H
 #define AVCODEC_JPEGLS_H
 
+#include <limits.h>
 #include "libavutil/common.h"
-#include "avcodec.h"
-#include "internal.h"
 
-typedef struct JpeglsContext {
-    AVCodecContext *avctx;
-} JpeglsContext;
+#undef near /* This file uses struct member 'near' which in windows.h is defined as empty. */
 
 typedef struct JLSState {
     int T1, T2, T3;
@@ -97,7 +94,7 @@ static inline void ff_jpegls_downscale_state(JLSState *state, int Q)
 static inline int ff_jpegls_update_state_regular(JLSState *state,
                                                  int Q, int err)
 {
-    if(FFABS(err) > 0xFFFF)
+    if(FFABS(err) > 0xFFFF || FFABS(err) > INT_MAX - state->A[Q])
         return -0x10000;
     state->A[Q] += FFABS(err);
     err         *= state->twonear;

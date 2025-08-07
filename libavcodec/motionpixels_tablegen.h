@@ -1,5 +1,5 @@
 /*
- * Header file for hardcoded motionpixels RGB to YUV table
+ * Header file for hardcoded motion pixels RGB to YUV table
  *
  * Copyright (c) 2009 Reimar Döffinger <Reimar.Doeffinger@gmx.de>
  *
@@ -84,8 +84,7 @@ static av_cold void mp_build_rgb_yuv_table(YuvPixel *p)
 
 static av_cold void motionpixels_tableinit(void)
 {
-    if (!mp_rgb_yuv_table[0].u)
-        mp_build_rgb_yuv_table(mp_rgb_yuv_table);
+    mp_build_rgb_yuv_table(mp_rgb_yuv_table);
 }
 #endif /* CONFIG_HARDCODED_TABLES */
 
