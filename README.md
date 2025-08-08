@@ -78,11 +78,11 @@ $ ./xterm  # launch
 ```
 $ git clone https://github.com/saitoha/libsixel
 $ cd libsixel
-$ ./configure && make install
+$ ./configure && make && make install
 $ cd ..
 $ git clone https://github.com/saitoha/FFmpeg-SIXEL
 $ cd FFmpeg-SIXEL
-$ ./configure --enable-libquvi --enable-libsixel
+$ ./configure --enable-libsixel
 $ make
 $ ./ffmpeg -i a.webm -f sixel -pix_fmt rgb24 -reqcolors 256 -s 600x360 -loglevel panic -
 ```
