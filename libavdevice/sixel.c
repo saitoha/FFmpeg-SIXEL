@@ -22,6 +22,7 @@
 #include <unistd.h>
 #include <sys/signal.h>
 #include <termios.h>
+#include <time.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
 #include <sixel.h>
